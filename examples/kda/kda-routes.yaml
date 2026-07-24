@@ -2,8 +2,40 @@ version: 1
 
 # Deployment template only. Replace every /absolute/path/to/... root with a
 # reference-owned export directory containing sglang_entry.py before enabling
-# this profile. SGLang does not ship a GLM-5.2 candidate implementation.
+# a profile. Remove any operator entry that has no exported adapter yet.
+# SGLang does not ship candidate implementations.
 profiles:
+  deepseek_v4_best:
+    architecture: DeepseekV4ForCausalLM
+    operators:
+      # The current exported DeepSeek V4 bundle has Linear, C4 query
+      # quantization, and paged-MQA candidates. Add the other supported slots
+      # only after their reference directories contain sglang_entry.py.
+      deepseek_v4.fp8_gemm_nt:
+        operator_id: deepseek_v4_fp8_gemm_nt
+        root: /absolute/path/to/deepseek_v4/fp8_gemm_nt
+        entrypoint: sglang_entry.py:run
+        targets:
+          - model.layers.*.self_attn.wqkv_a
+          - model.layers.*.self_attn.indexer.wq_b
+
+      deepseek_v4.indexer_fp8_quant:
+        operator_id: deepseek_v4_indexer_fp8_quant
+        root: /absolute/path/to/deepseek_v4/indexer_fp8_quant
+        entrypoint: sglang_entry.py:run
+
+      deepseek_v4.paged_mqa_logits:
+        operator_id: deepseek_v4_fp8_paged_mqa_logits
+        root: /absolute/path/to/deepseek_v4/paged_mqa_logits
+        entrypoint: sglang_entry.py:run
+
+      # Other supported slots:
+      # deepseek_v4.topk_transform
+      # deepseek_v4.sparse_prefill_attention
+      # deepseek_v4.sparse_decode_attention
+      # deepseek_v4.dense_swa_attention
+      # deepseek_v4.moe
+
   glm52_best:
     architecture: GlmMoeDsaForCausalLM
     operators:

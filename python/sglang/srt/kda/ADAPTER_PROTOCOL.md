@@ -10,6 +10,27 @@ Profiles must use the exact architecture named by each section. GLM-5.2 routes
 are never inherited by `GlmMoeDsaForCausalLMNextN`, GLM-4, or another
 DeepSeekV2-derived model.
 
+## Common Linear adapter
+
+The following slots use the static Linear boundary:
+
+- `deepseek_v4.fp8_gemm_nt`
+- `glm52.dsa_projection`
+- `glm52.dsa_indexer`
+
+```python
+def run(*, layer, x, bias=None):
+    ...
+```
+
+The adapter may inspect `layer.prefix`, `layer.weight`, and the layer's scale
+attributes. It owns all activation, weight, scale-layout, output-allocation,
+and candidate-specific adaptation, and returns exactly the value expected from
+the original quant method. For DeepSeek V4 the deployment template currently
+targets `model.layers.*.self_attn.wqkv_a` and
+`model.layers.*.self_attn.indexer.wq_b`; deployments should list only prefixes
+covered by their exported candidate.
+
 ## `deepseek_v4.indexer_fp8_quant`
 
 This slot replaces only the FP8 branch. The FP4 branch remains native.
