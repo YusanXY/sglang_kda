@@ -58,6 +58,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.kda import GLM52_ARCHITECTURE, get_kda_operator_for_architecture
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
@@ -1650,6 +1651,15 @@ class DeepseekV2AttentionMLA(
         self.next_skip_topk = None
         if self.use_dsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+            architectures = getattr(config, "architectures", ())
+            kda_architecture = (
+                architectures[0]
+                if not is_nextn
+                and isinstance(architectures, (list, tuple))
+                and architectures
+                and architectures[0] == GLM52_ARCHITECTURE
+                else None
+            )
             self.indexer = Indexer(
                 hidden_size=hidden_size,
                 index_n_heads=get_dsa_index_n_heads(config),
@@ -1668,6 +1678,9 @@ class DeepseekV2AttentionMLA(
                 layer_id=layer_id,
                 alt_stream=alt_stream,
                 config=config,
+                kda_index_score_operator=get_kda_operator_for_architecture(
+                    "glm52.dsa_index_score", kda_architecture
+                ),
             )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.

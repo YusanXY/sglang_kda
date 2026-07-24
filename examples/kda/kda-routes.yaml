@@ -1,0 +1,45 @@
+version: 1
+
+# Deployment template only. Replace every /absolute/path/to/... root with a
+# reference-owned export directory containing sglang_entry.py before enabling
+# this profile. SGLang does not ship a GLM-5.2 candidate implementation.
+profiles:
+  glm52_best:
+    architecture: GlmMoeDsaForCausalLM
+    operators:
+      glm52.dsa_projection:
+        operator_id: glm5_dsa_projection
+        root: /absolute/path/to/glm52/dsa_projection
+        entrypoint: sglang_entry.py:run
+        targets:
+          - model.layers.*.self_attn.fused_qkv_a_proj_with_mqa
+          - model.layers.*.self_attn.q_b_proj
+          - model.layers.*.self_attn.q_proj
+          - model.layers.*.self_attn.kv_a_proj_with_mqa
+          - model.layers.*.self_attn.kv_b_proj
+          - model.layers.*.self_attn.o_proj
+
+      glm52.dsa_indexer:
+        operator_id: glm5_dsa_indexer
+        root: /absolute/path/to/glm52/dsa_indexer
+        entrypoint: sglang_entry.py:run
+        targets:
+          - model.layers.*.self_attn.indexer.wq_b
+          - model.layers.*.self_attn.indexer.wk_weights_proj
+          - model.layers.*.self_attn.indexer.wk
+          - model.layers.*.self_attn.indexer.weights_proj
+
+      glm52.dsa_index_score:
+        operator_id: glm5_dsa_index_score
+        root: /absolute/path/to/glm52/dsa_index_score
+        entrypoint: sglang_entry.py:run
+
+      glm52.dsa_sparse_attention:
+        operator_id: glm5_dsa_unified_sparse_attention
+        root: /absolute/path/to/glm52/dsa_sparse_attention
+        entrypoint: sglang_entry.py:run
+
+      glm52.moe_masked_grouped_gemm:
+        operator_id: glm5_moe_masked_grouped_gemm
+        root: /absolute/path/to/glm52/moe_masked_grouped_gemm
+        entrypoint: sglang_entry.py:run

@@ -30,6 +30,7 @@ from sglang.kernels.ops.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kda import GLM52_ARCHITECTURE, get_kda_operator_for_architecture
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
@@ -354,6 +355,20 @@ class DeepseekSparseAttnBackend(
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        architectures = getattr(
+            model_runner.model_config.hf_config, "architectures", ()
+        )
+        kda_architecture = (
+            architectures[0]
+            if not model_runner.is_draft_worker
+            and isinstance(architectures, (list, tuple))
+            and architectures
+            and architectures[0] == GLM52_ARCHITECTURE
+            else None
+        )
+        self.kda_sparse_attention_operator = get_kda_operator_for_architecture(
+            "glm52.dsa_sparse_attention", kda_architecture
+        )
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -2278,13 +2293,22 @@ class DeepseekSparseAttnBackend(
         # indices shape must be (s_q, h_kv=1, topk), keep h_kv=1 unchanged
         indices_input = page_table_1.unsqueeze(1)
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_input,
-            kv=kv_cache,
-            indices=indices_input,
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-        )
+        if self.kda_sparse_attention_operator is not None:
+            o = self.kda_sparse_attention_operator(
+                query=q_input,
+                cache=kv_cache,
+                indices=indices_input,
+                softmax_scale=sm_scale,
+                value_dim=v_head_dim,
+            )
+        else:
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=indices_input,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+            )
 
         # Trim output back to original num_heads if we padded
         if need_padding:

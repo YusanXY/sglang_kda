@@ -17,12 +17,21 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
+GLM52_ARCHITECTURE = "GlmMoeDsaForCausalLM"
+
 _OFF_PROFILE = "off"
 _CONFIG_VERSION = 1
 _MOE_SLOT_BY_ARCHITECTURE = MappingProxyType(
     {
         "DeepseekV4ForCausalLM": "deepseek_v4.moe",
-        "GlmMoeDsaForCausalLM": "glm52.moe_masked_grouped_gemm",
+        GLM52_ARCHITECTURE: "glm52.moe_masked_grouped_gemm",
+    }
+)
+_LINEAR_SLOT_ARCHITECTURE = MappingProxyType(
+    {
+        "deepseek_v4.fp8_gemm_nt": "DeepseekV4ForCausalLM",
+        "glm52.dsa_projection": GLM52_ARCHITECTURE,
+        "glm52.dsa_indexer": GLM52_ARCHITECTURE,
     }
 )
 
@@ -231,6 +240,16 @@ def get_kda_operator(slot: str) -> Callable[..., Any] | None:
     return None if route is None else route.callable
 
 
+def get_kda_operator_for_architecture(
+    slot: str, architecture: str | None
+) -> Callable[..., Any] | None:
+    """Return ``slot`` only when the initialized model architecture is exact."""
+
+    if architecture is None or _state.architecture != architecture:
+        return None
+    return get_kda_operator(slot)
+
+
 def get_kda_moe_operator() -> Callable[..., Any] | None:
     """Return the architecture-selected MoE callable, or ``None``."""
 
@@ -243,7 +262,13 @@ def bind_kda_linear_operators(model: Any) -> None:
     if not kda_enabled():
         return
 
-    linear_routes = tuple(route for route in _state.routes.values() if route.targets)
+    linear_routes = tuple(
+        route
+        for route in _state.routes.values()
+        if route.targets
+        and _LINEAR_SLOT_ARCHITECTURE.get(route.slot, _state.architecture)
+        == _state.architecture
+    )
     if not linear_routes:
         return
 

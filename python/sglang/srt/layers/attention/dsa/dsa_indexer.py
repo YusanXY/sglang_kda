@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -381,6 +382,7 @@ class Indexer(MultiPlatformOp):
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
         config=None,
+        kda_index_score_operator: Callable[..., Any] | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -390,6 +392,7 @@ class Indexer(MultiPlatformOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
+        self.kda_index_score_operator = kda_index_score_operator
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
@@ -974,7 +977,21 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if self.paged_mqa_logits_backend.is_aiter():
+        if self.kda_index_score_operator is not None:
+            logits = self.kda_index_score_operator(
+                phase=forward_batch.forward_mode,
+                query=q_fp8,
+                cache=kv_cache_fp8,
+                cache_scale=None,
+                weights=weights,
+                lengths_start=seqlens_32_2d,
+                lengths_end=None,
+                block_tables=block_tables,
+                schedule=schedule_metadata,
+                max_context=max_seq_len,
+                q_offset=q_offset,
+            )
+        elif self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
