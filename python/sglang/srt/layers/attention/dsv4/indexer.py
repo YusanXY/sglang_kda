@@ -15,6 +15,7 @@ from sglang.jit_kernel.dsv4 import (
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.kda import get_kda_operator
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -605,32 +606,42 @@ class C4IndexerBackendMixin:
             assert len(q_indexer.shape) == 3
             q = q_indexer.unsqueeze(1)
 
+        kda_paged_mqa_logits = (
+            None
+            if use_fp4_indexer
+            else get_kda_operator("deepseek_v4.paged_mqa_logits")
+        )
+        if kda_paged_mqa_logits is None:
+            if use_fp4_indexer:
+                if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                    raise RuntimeError(
+                        "DeepSeek V4 FP4 indexer requires DeepGEMM indexer."
+                    )
+                from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+            elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+                from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+                    tilelang_fp8_paged_mqa_logits as fn,
+                )
+            elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
+                fn = _aiter_fp8_paged_mqa_logits
+            elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+                if is_sm120_supported():
+                    fn = fp8_paged_mqa_logits_torch_sm120
+                else:
+                    fn = fp8_paged_mqa_logits_torch
+            elif is_xpu():
+                from sgl_kernel import fp8_paged_mqa_logits_triton
+
+                # TODO: switch from triton to SYCL when OOM is resolved
+
+                fn = fp8_paged_mqa_logits_triton
+            else:
+                from deep_gemm import fp8_paged_mqa_logits as fn
+
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         if use_fp4_indexer:
             weights = weights.float()
-            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-                raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
-        elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
-                tilelang_fp8_paged_mqa_logits as fn,
-            )
-        elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
-            fn = _aiter_fp8_paged_mqa_logits
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            if is_sm120_supported():
-                fn = fp8_paged_mqa_logits_torch_sm120
-            else:
-                fn = fp8_paged_mqa_logits_torch
-        elif is_xpu():
-            from sgl_kernel import fp8_paged_mqa_logits_triton
-
-            # TODO: switch from triton to SYCL when OOM is resolved
-
-            fn = fp8_paged_mqa_logits_triton
-        else:
-            from deep_gemm import fp8_paged_mqa_logits as fn
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 
@@ -680,16 +691,28 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
+            if kda_paged_mqa_logits is not None:
+                logits = kda_paged_mqa_logits(
+                    q=q,
+                    kv_cache=c4_indexer_kv_cache,
+                    weights=weights,
+                    seq_lens=_c4sl,
+                    page_table=page_table,
+                    schedule=indexer_metadata.deep_gemm_metadata,
+                    max_context=indexer_metadata.max_c4_seq_len,
+                    q_offset=query_rows,
+                )
+            else:
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    _c4sl,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
@@ -713,7 +736,18 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+        kda_topk_transform = get_kda_operator("deepseek_v4.topk_transform")
+        if kda_topk_transform is not None:
+            kda_topk_transform(
+                scores=logits,
+                seq_lens=c4_seq_lens,
+                page_tables=page_table,
+                output=c4_sparse_page_indices,
+                page_size=indexer_metadata.c4_page_size,
+                metadata=indexer_metadata.topk_metadata,
+                raw_indices=raw_indices,
+            )
+        elif envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
             topk_transform_512_pytorch_vectorized(
                 logits,
                 c4_seq_lens,
@@ -835,6 +869,17 @@ class C4Indexer(nn.Module):
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+            )
+        kda_indexer_fp8_quant = get_kda_operator(
+            "deepseek_v4.indexer_fp8_quant"
+        )
+        if kda_indexer_fp8_quant is not None:
+            return kda_indexer_fp8_quant(
+                q=q,
+                weight=weight,
+                weight_scale=self.weight_scale,
+                freqs_cis=self.freqs_cis,
+                positions=positions,
             )
         return fused_q_indexer_rope_hadamard_quant(
             q, weight, self.weight_scale, self.freqs_cis, positions

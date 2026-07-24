@@ -29,6 +29,7 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kda import get_kda_operator
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
@@ -1686,7 +1687,33 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            kda_attention = get_kda_operator(
+                "deepseek_v4.dense_swa_attention"
+                if compress_ratio == 0
+                else "deepseek_v4.sparse_decode_attention"
+            )
+            if kda_attention is not None and compress_ratio == 0:
+                o = kda_attention(
+                    q=q,
+                    cache=swa_k_cache,
+                    indices=swa_page_indices,
+                    lengths=swa_topk_lengths,
+                    attention_sink=attn_sink,
+                    scheduler=flashmla_metadata,
+                )
+            elif kda_attention is not None:
+                o = kda_attention(
+                    q=q,
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_page_indices,
+                    swa_lengths=swa_topk_lengths,
+                    extra_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_lengths=extra_topk_lengths,
+                    attention_sink=attn_sink,
+                    scheduler=flashmla_metadata,
+                )
+            elif _is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
@@ -1749,8 +1776,6 @@ class DeepseekV4AttnBackend(
         indices. Chunk-invariant scaffolding lives in
         ``self.forward_metadata.sparse_prefill_cache``.
         """
-        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
@@ -1827,15 +1852,31 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_flat,
-            kv=kv,
-            indices=combined_indices.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            d_v=self.head_dim_v,
-            attn_sink=attn_sink,
-            topk_length=combined_lens,
+        kda_sparse_prefill = get_kda_operator(
+            "deepseek_v4.sparse_prefill_attention"
         )
+        if kda_sparse_prefill is not None:
+            o = kda_sparse_prefill(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                softmax_scale=self.softmax_scale,
+                value_dim=self.head_dim_v,
+                attention_sink=attn_sink,
+                topk_length=combined_lens,
+            )
+        else:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                d_v=self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+            )
         return o
 
     def expand_prefill_casually(
