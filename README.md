@@ -1,3 +1,136 @@
+# SGLang KDA
+
+SGLang KDA 是一个基于原生 SGLang 的轻量算子路由扩展。它允许在不重写模型、
+benchmark 或全局 kernel wrapper 的前提下，通过两个命令行参数和一份 YAML
+配置，把 DeepSeek V4 与 GLM-5.2 的指定算子替换为外部
+`reference/candidate` 目录提供的实现。
+
+本项目基于 SGLang `dc60f6566123c26d9b781e3d84e0973d01a75364`
+开发。KDA 只负责启动期路由、静态绑定和调用协议；算子的 tensor/layout/scale
+适配、shape 分派、实现选择及验证仍由算子目录中的 `sglang_entry.py` 和
+llm_flops 负责。
+
+## 设计目标
+
+- **最小侵入**：不修改 SGLang benchmark 业务流程，不 monkey patch Torch，
+  不替换全局 DeepGEMM wrapper。
+- **配置驱动**：使用 `--kda-kernel-config` 和
+  `--kda-kernel-profile` 选择一组算子。
+- **启动期冻结**：YAML 解析、adapter 导入、architecture 校验和 Linear
+  glob 匹配都在模型运行前完成。
+- **原生默认**：profile 默认为 `off`；未配置的 slot 继续使用原生 SGLang
+  路径。
+- **失败透明**：已配置 adapter 的导入或执行失败会直接抛错，不重试、不回退，
+  也不静默切换候选。
+- **复用原 benchmark**：`one_batch`、`offline_throughput` 和
+  `launch_server` 自动继承 KDA 参数；serving benchmark 客户端保持不变。
+
+## 当前支持范围
+
+| 模型 | 精确 architecture | 路由范围 | 状态 |
+|---|---|---|---|
+| DeepSeek V4 | `DeepseekV4ForCausalLM` | FP8 Linear、C4/indexer、paged MQA logits、top-k transform、稀疏 prefill/decode、dense SWA、MoE | 接入点完整；按实际导出的 adapter 配置 slot |
+| GLM-5.2 | `GlmMoeDsaForCausalLM` | DSA projection/indexer Linear、paged index score、统一稀疏 attention、MoE | 接入点和协议完整；等待 reference 团队提供真实 candidate adapter |
+
+GLM-4、`GlmMoeDsaForCausalLMNextN`、draft worker 和其他
+DeepSeekV2 派生模型不会自动继承 GLM-5.2 路由。
+
+## 工作方式
+
+```text
+原生 CLI / benchmark
+        │
+        ▼
+ServerArgs 中的 KDA 参数
+        │
+        ▼
+启动期读取 YAML、校验 architecture、导入 sglang_entry.py
+        │
+        ├── 模型加载后按完整 prefix 静态绑定 Linear
+        └── 为 C4 / DSA / MoE 固定 callable
+                │
+                ▼
+        推理热路径只做一次 None 判断
+                │
+                ├── slot 未配置：原生 SGLang kernel
+                └── slot 已配置：外部 adapter；异常直接上抛
+```
+
+每个外部算子目录建议保持自包含：
+
+```text
+operator_export/
+├── implementation.py   # llm_flops 正式实现
+├── sglang_entry.py     # SGLang 参数适配与 shape/candidate 分派
+└── ...                 # implementation 的其他依赖
+```
+
+## 快速开始
+
+1. 准备部署配置：
+
+   ```bash
+   cp examples/kda/kda-routes.yaml /absolute/path/kda-routes.yaml
+   ```
+
+2. 把 YAML 中的 `/absolute/path/to/...` 替换为真实 adapter 目录，并删除尚未
+   导出 `sglang_entry.py` 的 operator 条目。不要直接启用仍含占位目录的
+   profile。
+
+3. 启动原生 SGLang server：
+
+   ```bash
+   python -m sglang.launch_server \
+     --model-path /path/to/model \
+     --kda-kernel-config /absolute/path/kda-routes.yaml \
+     --kda-kernel-profile deepseek_v4_best \
+     <其他原生 SGLang 参数>
+   ```
+
+4. 使用原 benchmark：
+
+   ```bash
+   python -m sglang.benchmark.one_batch \
+     --model-path /path/to/model \
+     --kda-kernel-config /absolute/path/kda-routes.yaml \
+     --kda-kernel-profile deepseek_v4_best \
+     <其他 benchmark 参数>
+
+   python -m sglang.benchmark.offline_throughput \
+     --model-path /path/to/model \
+     --kda-kernel-config /absolute/path/kda-routes.yaml \
+     --kda-kernel-profile deepseek_v4_best \
+     <其他 benchmark 参数>
+   ```
+
+5. 对照原生路径时使用默认值或显式指定：
+
+   ```bash
+   --kda-kernel-profile off
+   ```
+
+`off` 不读取 YAML，也不会导入 adapter。切换 profile 需要重启 worker/server。
+
+## 文档导航
+
+- [KDA 文档索引](docs/README.md)
+- [实现结构与接入逻辑](docs/kda-architecture-and-integration.md)
+- [部署与 benchmark 示例](examples/kda/README.md)
+- [Adapter 关键字协议](python/sglang/srt/kda/ADAPTER_PROTOCOL.md)
+- [YAML 配置模板](examples/kda/kda-routes.yaml)
+
+## 验证边界
+
+仓库内单元测试覆盖路由、architecture 限定、静态绑定、参数传递、异常传播和
+CLI 接线。SGLang KDA 不负责算子数值正确性、容差或性能判定；这些验证仍应在
+llm_flops 中完成。示例 YAML 和测试 fake adapter 不能作为正式 candidate。
+
+---
+
+## Upstream SGLang
+
+以下内容保留上游 SGLang 的项目介绍、安装入口和社区信息。
+
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 
