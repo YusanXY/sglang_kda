@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 
 _OFF_PROFILE = "off"
 _CONFIG_VERSION = 1
+_MOE_SLOT_BY_ARCHITECTURE = MappingProxyType(
+    {
+        "DeepseekV4ForCausalLM": "deepseek_v4.moe",
+        "GlmMoeDsaForCausalLM": "glm52.moe_masked_grouped_gemm",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -38,12 +44,14 @@ class _KdaRouterState:
     profile: str
     architecture: str | None
     routes: Mapping[str, KdaOperatorRoute]
+    moe_operator: Callable[..., Any] | None
 
 
 _DISABLED_STATE = _KdaRouterState(
     profile=_OFF_PROFILE,
     architecture=None,
     routes=MappingProxyType({}),
+    moe_operator=None,
 )
 _state = _DISABLED_STATE
 
@@ -194,10 +202,13 @@ def initialize_kda_router(server_args: Any, model_config: Any) -> None:
         )
 
     routes = MappingProxyType(loaded_routes)
+    moe_slot = _MOE_SLOT_BY_ARCHITECTURE.get(actual_architecture)
+    moe_route = None if moe_slot is None else routes.get(moe_slot)
     _state = _KdaRouterState(
         profile=profile,
         architecture=actual_architecture,
         routes=routes,
+        moe_operator=None if moe_route is None else moe_route.callable,
     )
     logger.info(
         "KDA kernel routing enabled: profile=%s architecture=%s",
@@ -218,6 +229,12 @@ def get_kda_operator(slot: str) -> Callable[..., Any] | None:
 
     route = _state.routes.get(slot)
     return None if route is None else route.callable
+
+
+def get_kda_moe_operator() -> Callable[..., Any] | None:
+    """Return the architecture-selected MoE callable, or ``None``."""
+
+    return _state.moe_operator
 
 
 def bind_kda_linear_operators(model: Any) -> None:

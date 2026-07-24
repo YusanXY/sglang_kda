@@ -1,4 +1,4 @@
-# DeepSeek V4 KDA adapter protocol
+# KDA adapter protocol
 
 This document fixes the keyword-only call boundary between SGLang and
 `sglang_entry.py` for the non-Linear DeepSeek V4 routes. The adapter owns all
@@ -128,3 +128,53 @@ def run(
 
 Return the unsqueezed primary attention output. SGLang applies the same final
 `squeeze(1)` as on its native path.
+
+# Model-scoped masked MoE
+
+The router fixes the active MoE slot once from the profile's exact model
+architecture:
+
+| Architecture | Slot |
+| --- | --- |
+| `DeepseekV4ForCausalLM` | `deepseek_v4.moe` |
+| `GlmMoeDsaForCausalLM` | `glm52.moe_masked_grouped_gemm` |
+
+The `DeepGemmRunnerCore` captures that callable during construction. Both
+slots use the same keyword-only boundary and replace only the two FP8 masked
+grouped GEMMs. BF16 and contiguous GEMMs remain native.
+
+```python
+def run(
+    *,
+    stage,
+    lhs,
+    rhs,
+    out,
+    routing,
+    expected_m,
+    recipe_a,
+    recipe_b,
+    overlap_args=None,
+    max_block_n=256,
+):
+    ...
+```
+
+`stage` is exactly `"gate_up"` for the first grouped GEMM and `"down"` for the
+second. `lhs` and `rhs` are `(tensor, scale)` pairs; `out` is the existing
+SGLang output buffer; `routing` is the native masked-M tensor.
+
+The gate/up call supplies `recipe_a` and `recipe_b`. The down call supplies
+the same recipe keywords and, when native overlap is active, also supplies
+`overlap_args` and `max_block_n`. Adapters must write into `out`; SGLang keeps
+that buffer as the stage result instead of replacing it with the adapter
+return value.
+
+The gate/up adapter return value is ignored, matching the native call. The
+down adapter return value has the native DeepGEMM semantics: return
+`(block_m, threshold)` when overlap metadata is produced, otherwise return
+`None`. SGLang copies the tuple into its existing `meta_overlap_args` mapping.
+
+SGLang does not validate shapes, routing capacity, tensor layout, scales, or
+adapter output. It does not catch adapter exceptions and never retries the
+native kernel after an adapter failure.

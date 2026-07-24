@@ -12,6 +12,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kda import get_kda_moe_operator
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -148,6 +149,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
             assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
             self.use_swizzle = True
+        self.kda_moe_operator = get_kda_moe_operator()
 
     def run(
         self,
@@ -448,15 +450,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (hidden_states, hidden_states_scale),
-            (w13_weight, w13_scale),
-            gateup_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a,
-            recipe_b=recipe_b,
-        )
+        if self.kda_moe_operator is not None:
+            self.kda_moe_operator(
+                stage="gate_up",
+                lhs=(hidden_states, hidden_states_scale),
+                rhs=(w13_weight, w13_scale),
+                out=gateup_output,
+                routing=masked_m,
+                expected_m=expected_m,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                (hidden_states, hidden_states_scale),
+                (w13_weight, w13_scale),
+                gateup_output,
+                masked_m,
+                expected_m,
+                recipe_a=recipe_a,
+                recipe_b=recipe_b,
+            )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -557,16 +571,31 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-            (down_input, down_input_scale),
-            (w2_weight, w2_scale),
-            down_output,
-            masked_m,
-            expected_m,
-            recipe_a=recipe_a_down,
-            recipe_b=recipe_b,
-            **gemm_overlap_args_dict,
-        )
+        if self.kda_moe_operator is not None:
+            deep_gemm_return_value = self.kda_moe_operator(
+                stage="down",
+                lhs=(down_input, down_input_scale),
+                rhs=(w2_weight, w2_scale),
+                out=down_output,
+                routing=masked_m,
+                expected_m=expected_m,
+                recipe_a=recipe_a_down,
+                recipe_b=recipe_b,
+                **gemm_overlap_args_dict,
+            )
+        else:
+            deep_gemm_return_value = (
+                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+                    (down_input, down_input_scale),
+                    (w2_weight, w2_scale),
+                    down_output,
+                    masked_m,
+                    expected_m,
+                    recipe_a=recipe_a_down,
+                    recipe_b=recipe_b,
+                    **gemm_overlap_args_dict,
+                )
+            )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         # Returns (block_m, threshold) only with down-gemm overlap, else None;
         # meta_overlap_args may be set without overlap, so guard the unpack.
