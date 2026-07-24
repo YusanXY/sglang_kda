@@ -62,6 +62,10 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.kda import (
+    bind_kda_linear_operators,
+    initialize_kda_router,
+)
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
@@ -483,7 +487,9 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        initialize_kda_router(self.server_args, self.model_config)
         self.load_model()
+        bind_kda_linear_operators(self.model)
         prepare_moe_topk(
             model=self.model,
             model_config=self.model_config,

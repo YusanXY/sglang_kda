@@ -184,6 +184,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        kda_apply = getattr(layer, "_kda_apply", None)
+        if kda_apply is not None:
+            return kda_apply(layer=layer, x=x, bias=bias)
+
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
             if len(x_shapes) == 3:

@@ -897,6 +897,10 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        kda_apply = getattr(layer, "_kda_apply", None)
+        if kda_apply is not None:
+            return kda_apply(layer=layer, x=x, bias=bias)
+
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,

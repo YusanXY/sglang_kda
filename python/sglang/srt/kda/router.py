@@ -8,6 +8,7 @@ import logging
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -217,6 +218,35 @@ def get_kda_operator(slot: str) -> Callable[..., Any] | None:
 
     route = _state.routes.get(slot)
     return None if route is None else route.callable
+
+
+def bind_kda_linear_operators(model: Any) -> None:
+    """Bind configured Linear routes to matching modules once after model load."""
+
+    if not kda_enabled():
+        return
+
+    linear_routes = tuple(route for route in _state.routes.values() if route.targets)
+    if not linear_routes:
+        return
+
+    bound_count = 0
+    for module in model.modules():
+        prefix = getattr(module, "prefix", None)
+        if not isinstance(prefix, str):
+            continue
+
+        for route in linear_routes:
+            if any(fnmatchcase(prefix, target) for target in route.targets):
+                module._kda_apply = route.callable
+                bound_count += 1
+                break
+
+    logger.info(
+        "KDA Linear operators bound: profile=%s modules=%d",
+        _state.profile,
+        bound_count,
+    )
 
 
 def kda_enabled() -> bool:
