@@ -1489,6 +1489,18 @@ class ServerArgs:
     ] = "triton"
 
     # -------------------------------------------------------------------------
+    # KDA kernel routing
+    # -------------------------------------------------------------------------
+    kda_kernel_config: A[
+        Optional[str],
+        "Absolute path to the KDA kernel routing YAML.",
+    ] = None
+    kda_kernel_profile: A[
+        str,
+        "KDA profile name. Use 'off' to keep all native SGLang kernels.",
+    ] = "off"
+
+    # -------------------------------------------------------------------------
     # Cuda graphs
     # -------------------------------------------------------------------------
     cuda_graph_config: A[
