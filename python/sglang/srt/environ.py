@@ -859,6 +859,10 @@ class Envs:
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(False)
     SGLANG_CRASH_ON_NUMA_BIND_FAILURE = EnvBool(False)
+    # Bind worker allocations strictly to the selected NUMA node. This is
+    # useful on MI300X hosts where automatic NUMA page migration can cause
+    # GPU memory access faults. The policy is applied before model loading.
+    SGLANG_STRICT_NUMA_MEMBIND = EnvBool(False)
 
     # Metrics
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)

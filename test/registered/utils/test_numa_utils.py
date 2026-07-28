@@ -5,9 +5,11 @@ from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.utils.numa_utils import (
+    _Bitmask,
     _handle_numa_bind_failure,
     _is_numa_available,
     _node_cpus,
+    _numa_set_membind,
     _numactl_cpu_mem_args,
     _probe_numactl_args,
     _query_numa_node_for_gpu,
@@ -341,6 +343,41 @@ class TestNumaBindIntersection(unittest.TestCase):
         mock_setaff.assert_called_once_with(0, {0} | set(range(21, 72)))
         lib.numa_set_preferred.assert_called_once()
         lib.numa_run_on_node.assert_not_called()
+
+    @patch.dict(os.environ, {"SGLANG_STRICT_NUMA_MEMBIND": "1"})
+    @patch("os.sched_setaffinity")
+    @patch("os.sched_getaffinity", return_value=set(range(72)))
+    @patch("sglang.srt.utils.numa_utils._node_cpus", return_value=set(range(72)))
+    @patch("sglang.srt.utils.numa_utils._numa_set_membind")
+    @patch("sglang.srt.utils.numa_utils.get_libnuma")
+    def test_numa_bind_to_node_strict_membind(
+        self, mock_libnuma, mock_membind, _cpus, _aff, _setaff
+    ):
+        lib = MagicMock()
+        lib.numa_available.return_value = 0
+        mock_libnuma.return_value = lib
+
+        numa_bind_to_node(1)
+
+        mock_membind.assert_called_once_with(lib, 1)
+        lib.numa_set_preferred.assert_not_called()
+
+    def test_numa_set_membind_builds_single_node_mask(self):
+        lib = MagicMock()
+        mask_storage = (ctypes.c_ulong * 1)()
+        mask = _Bitmask(size=64, maskp=mask_storage)
+        mask_ptr = ctypes.pointer(mask)
+        lib.numa_allocate_nodemask.return_value = mask_ptr
+
+        _numa_set_membind(lib, 1)
+
+        lib.numa_bitmask_clearall.assert_called_once_with(mask_ptr)
+        lib.numa_bitmask_setbit.assert_called_once()
+        self.assertEqual(lib.numa_bitmask_setbit.call_args.args[1].value, 1)
+        lib.numa_set_bind_policy.assert_called_once()
+        self.assertEqual(lib.numa_set_bind_policy.call_args.args[0].value, 1)
+        lib.numa_set_membind.assert_called_once_with(mask_ptr)
+        lib.numa_bitmask_free.assert_called_once_with(mask_ptr)
 
     @patch.dict(os.environ, {"SGLANG_CRASH_ON_NUMA_BIND_FAILURE": "0"})
     @patch("os.sched_setaffinity")

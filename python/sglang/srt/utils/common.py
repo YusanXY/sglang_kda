@@ -560,36 +560,41 @@ def get_device_module():
 
 
 def get_amdgpu_memory_capacity():
-    try:
-        # Run rocm-smi and capture the output
-        result = subprocess.run(
-            [
-                "rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
-
-        # Parse the output to extract memory values in MiB
-        memory_values = [
-            float(mem.split("(")[0].strip()) / 1024
-            for mem in result.stdout.strip().split("\n")
-        ]
-
-        if not memory_values:
-            raise ValueError("No GPU memory values found.")
-
-        # Return the minimum memory value
-        return min(memory_values)
-
-    except FileNotFoundError:
+    rocm_smi = shutil.which("rocm-smi")
+    if rocm_smi is None and Path("/opt/rocm/bin/rocm-smi").is_file():
+        rocm_smi = "/opt/rocm/bin/rocm-smi"
+    if rocm_smi is None:
         raise RuntimeError(
             "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
         )
+
+    result = subprocess.run(
+        [rocm_smi, "--showmeminfo", "vram", "--json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
+
+    try:
+        device_info = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("rocm-smi returned invalid JSON") from error
+
+    memory_values = []
+    for card_info in device_info.values():
+        if not isinstance(card_info, dict):
+            continue
+        total_bytes = card_info.get("VRAM Total Memory (B)")
+        if total_bytes is None:
+            continue
+        memory_values.append(float(total_bytes) / (1 << 20))
+
+    if not memory_values:
+        raise ValueError("No GPU memory values found.")
+
+    return min(memory_values)
 
 
 def get_device_sm():

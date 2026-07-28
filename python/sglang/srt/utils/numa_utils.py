@@ -174,11 +174,41 @@ def numa_bind_to_node(node: int):
         os.sched_setaffinity(0, target_cpus)
     else:
         libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_preferred(ctypes.c_int(node))
+    if envs.SGLANG_STRICT_NUMA_MEMBIND.get():
+        _numa_set_membind(libnuma, node)
+        logger.info("Strictly bound worker memory allocations to NUMA node %d", node)
+    else:
+        libnuma.numa_set_preferred(ctypes.c_int(node))
 
 
 class _Bitmask(ctypes.Structure):
     _fields_ = [("size", ctypes.c_ulong), ("maskp", ctypes.POINTER(ctypes.c_ulong))]
+
+
+def _numa_set_membind(libnuma, node: int):
+    """Apply a strict process memory policy for allocations made after this call."""
+    libnuma.numa_allocate_nodemask.restype = ctypes.POINTER(_Bitmask)
+    libnuma.numa_bitmask_clearall.argtypes = [ctypes.POINTER(_Bitmask)]
+    libnuma.numa_bitmask_clearall.restype = ctypes.POINTER(_Bitmask)
+    libnuma.numa_bitmask_setbit.argtypes = [
+        ctypes.POINTER(_Bitmask),
+        ctypes.c_uint,
+    ]
+    libnuma.numa_bitmask_setbit.restype = ctypes.POINTER(_Bitmask)
+    libnuma.numa_set_bind_policy.argtypes = [ctypes.c_int]
+    libnuma.numa_set_membind.argtypes = [ctypes.POINTER(_Bitmask)]
+    libnuma.numa_bitmask_free.argtypes = [ctypes.POINTER(_Bitmask)]
+
+    nodemask = libnuma.numa_allocate_nodemask()
+    if not nodemask:
+        raise RuntimeError("libnuma failed to allocate a NUMA node mask")
+    try:
+        libnuma.numa_bitmask_clearall(nodemask)
+        libnuma.numa_bitmask_setbit(nodemask, ctypes.c_uint(node))
+        libnuma.numa_set_bind_policy(ctypes.c_int(1))
+        libnuma.numa_set_membind(nodemask)
+    finally:
+        libnuma.numa_bitmask_free(nodemask)
 
 
 def _node_cpus(node: int) -> set:

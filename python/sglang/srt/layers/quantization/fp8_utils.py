@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
+    is_gfx942_supported,
     is_gfx95_supported,
     is_hip,
     is_musa,
@@ -60,6 +61,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_gfx942_supported = is_gfx942_supported()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
@@ -920,6 +922,10 @@ def aiter_w8a8_block_fp8_linear(
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k) or (
             _ck_safe_m is not None and input_2d.shape[0] > _ck_safe_m
         )
+    elif _is_gfx942_supported:
+        # TritonAMDGPUCanonicalizePointers fails for common DSV4 decode shapes
+        # with ROCm 7.0 on gfx942. Aiter CK supports the FNUZ block-FP8 ABI.
+        use_triton = False
     else:
         use_triton = True
 
