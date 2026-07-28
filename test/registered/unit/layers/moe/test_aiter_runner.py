@@ -115,5 +115,38 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     assert output.hidden_states.shape == (0, 2, 4)
 
 
+def test_kda_aiter_moe_replaces_native_fused_moe(monkeypatch):
+    captured = {}
+
+    def kda_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"] + 1
+
+    monkeypatch.setattr(
+        aiter_runner, "get_kda_aiter_moe_operator", lambda: kda_moe
+    )
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+    output = runner.run(_runner_input(), _quant_info(), running_state={})
+
+    assert torch.equal(output.hidden_states, torch.ones((1, 4)))
+    assert captured["quant_type"] == "per_1x32"
+    assert captured["activation"] == "silu"
+    assert captured["topk_ids"].dtype == torch.int32
+    assert captured["no_combine"] is False
+
+
+def test_kda_aiter_moe_error_propagates_without_native_retry(monkeypatch):
+    def kda_moe(**_):
+        raise RuntimeError("kda aiter moe failed")
+
+    monkeypatch.setattr(
+        aiter_runner, "get_kda_aiter_moe_operator", lambda: kda_moe
+    )
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    with pytest.raises(RuntimeError, match="kda aiter moe failed"):
+        runner.run(_runner_input(), _quant_info(), running_state={})
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

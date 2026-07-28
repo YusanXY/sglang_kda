@@ -32,6 +32,19 @@ llm_flops 负责。
 | DeepSeek V4 | `DeepseekV4ForCausalLM` | FP8 Linear、C4/indexer、paged MQA logits、top-k transform、稀疏 prefill/decode、dense SWA、MoE | 接入点完整；按实际导出的 adapter 配置 slot |
 | GLM-5.2 | `GlmMoeDsaForCausalLM` | DSA projection/indexer Linear、paged index score、统一稀疏 attention、MoE | 接入点和协议完整；等待 reference 团队提供真实 candidate adapter |
 
+`feature/kda-routing-dsv4-glm52-MI300X` 进一步支持 ROCm/gfx942：
+
+- profile 可用 `platform: rocm` 和 `device_arch: gfx942` 防止误加载到 CUDA 或
+  其他 AMD 架构；
+- DeepSeek V4 HIP Radix attention 使用
+  `deepseek_v4.hip_paged_attention`；
+- Aiter full-MoE 使用 `deepseek_v4.aiter_moe` 或 `glm52.aiter_moe`；
+- GLM-5.2 Aiter DSA attention 使用
+  `glm52.aiter_dsa_sparse_attention`。
+
+这些 slot 只增加直接 adapter 分支。未配置时仍执行 SGLang 原生 HIP/Aiter
+路径；配置后 adapter 异常直接上抛。
+
 GLM-4、`GlmMoeDsaForCausalLMNextN`、draft worker 和其他
 DeepSeekV2 派生模型不会自动继承 GLM-5.2 路由。
 

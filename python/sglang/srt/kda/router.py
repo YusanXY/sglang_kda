@@ -27,6 +27,12 @@ _MOE_SLOT_BY_ARCHITECTURE = MappingProxyType(
         GLM52_ARCHITECTURE: "glm52.moe_masked_grouped_gemm",
     }
 )
+_AITER_MOE_SLOT_BY_ARCHITECTURE = MappingProxyType(
+    {
+        "DeepseekV4ForCausalLM": "deepseek_v4.aiter_moe",
+        GLM52_ARCHITECTURE: "glm52.aiter_moe",
+    }
+)
 _LINEAR_SLOT_ARCHITECTURE = MappingProxyType(
     {
         "deepseek_v4.fp8_gemm_nt": "DeepseekV4ForCausalLM",
@@ -54,6 +60,7 @@ class _KdaRouterState:
     architecture: str | None
     routes: Mapping[str, KdaOperatorRoute]
     moe_operator: Callable[..., Any] | None
+    aiter_moe_operator: Callable[..., Any] | None
 
 
 _DISABLED_STATE = _KdaRouterState(
@@ -61,6 +68,7 @@ _DISABLED_STATE = _KdaRouterState(
     architecture=None,
     routes=MappingProxyType({}),
     moe_operator=None,
+    aiter_moe_operator=None,
 )
 _state = _DISABLED_STATE
 
@@ -85,6 +93,32 @@ def _model_architecture(model_config: Any) -> str:
     return _require_nonempty_string(
         architectures[0], "model_config.hf_config.architectures[0]"
     )
+
+
+def _runtime_platform_and_arch() -> tuple[str, str | None]:
+    """Return the active accelerator platform and its stable architecture name."""
+
+    import torch
+
+    if torch.version.hip is not None:
+        platform = "rocm"
+    elif torch.version.cuda is not None:
+        platform = "cuda"
+    else:
+        platform = "cpu"
+
+    if not torch.cuda.is_available():
+        return platform, None
+
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    gcn_arch = getattr(properties, "gcnArchName", None)
+    if isinstance(gcn_arch, str) and gcn_arch:
+        return platform, gcn_arch.split(":", 1)[0]
+    major = getattr(properties, "major", None)
+    minor = getattr(properties, "minor", None)
+    if isinstance(major, int) and isinstance(minor, int):
+        return platform, f"sm{major}{minor}"
+    return platform, None
 
 
 def _parse_targets(value: Any, name: str) -> tuple[str, ...]:
@@ -184,6 +218,38 @@ def initialize_kda_router(server_args: Any, model_config: Any) -> None:
             f"profile={expected_architecture}, model={actual_architecture}"
         )
 
+    expected_platform_value = selected_profile.get("platform")
+    expected_device_arch_value = selected_profile.get("device_arch")
+    if expected_platform_value is not None or expected_device_arch_value is not None:
+        expected_platform = (
+            None
+            if expected_platform_value is None
+            else _require_nonempty_string(
+                expected_platform_value, f"profiles.{profile}.platform"
+            )
+        )
+        expected_device_arch = (
+            None
+            if expected_device_arch_value is None
+            else _require_nonempty_string(
+                expected_device_arch_value, f"profiles.{profile}.device_arch"
+            )
+        )
+        actual_platform, actual_device_arch = _runtime_platform_and_arch()
+        if expected_platform is not None and actual_platform != expected_platform:
+            raise RuntimeError(
+                "KDA profile platform mismatch: "
+                f"profile={expected_platform}, runtime={actual_platform}"
+            )
+        if (
+            expected_device_arch is not None
+            and actual_device_arch != expected_device_arch
+        ):
+            raise RuntimeError(
+                "KDA profile device architecture mismatch: "
+                f"profile={expected_device_arch}, runtime={actual_device_arch}"
+            )
+
     operator_configs = _require_mapping(
         selected_profile.get("operators"), f"profiles.{profile}.operators"
     )
@@ -213,11 +279,18 @@ def initialize_kda_router(server_args: Any, model_config: Any) -> None:
     routes = MappingProxyType(loaded_routes)
     moe_slot = _MOE_SLOT_BY_ARCHITECTURE.get(actual_architecture)
     moe_route = None if moe_slot is None else routes.get(moe_slot)
+    aiter_moe_slot = _AITER_MOE_SLOT_BY_ARCHITECTURE.get(actual_architecture)
+    aiter_moe_route = (
+        None if aiter_moe_slot is None else routes.get(aiter_moe_slot)
+    )
     _state = _KdaRouterState(
         profile=profile,
         architecture=actual_architecture,
         routes=routes,
         moe_operator=None if moe_route is None else moe_route.callable,
+        aiter_moe_operator=(
+            None if aiter_moe_route is None else aiter_moe_route.callable
+        ),
     )
     logger.info(
         "KDA kernel routing enabled: profile=%s architecture=%s",
@@ -254,6 +327,12 @@ def get_kda_moe_operator() -> Callable[..., Any] | None:
     """Return the architecture-selected MoE callable, or ``None``."""
 
     return _state.moe_operator
+
+
+def get_kda_aiter_moe_operator() -> Callable[..., Any] | None:
+    """Return the architecture-selected full Aiter MoE callable, or ``None``."""
+
+    return _state.aiter_moe_operator
 
 
 def bind_kda_linear_operators(model: Any) -> None:

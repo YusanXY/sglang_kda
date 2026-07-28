@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 
+from sglang.srt.kda import get_kda_aiter_moe_operator
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -120,6 +121,10 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
 
 
 class AiterRunnerCore(MoeRunnerCore):
+    def __init__(self, config: MoeRunnerConfig):
+        super().__init__(config)
+        self.kda_moe_operator = get_kda_aiter_moe_operator()
+
     def run(
         self,
         runner_input: AiterRunnerInput,
@@ -127,7 +132,11 @@ class AiterRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> AiterRunnerOutput:
-        if self.config.no_combine and not _aiter_fused_moe_supports_no_combine():
+        if (
+            self.kda_moe_operator is None
+            and self.config.no_combine
+            and not _aiter_fused_moe_supports_no_combine()
+        ):
             raise NotImplementedError(
                 "no_combine=True requested but the installed aiter.fused_moe does "
                 "not accept a `no_combine` kwarg. Install an aiter build that "
@@ -145,15 +154,42 @@ class AiterRunnerCore(MoeRunnerCore):
                 )
             return AiterRunnerOutput(hidden_states=runner_input.hidden_states)
 
-        from aiter.fused_moe import fused_moe
-
-        from sglang.srt.environ import envs
-
         a1_scale = (
             runner_input.a1_scale
             if runner_input.a1_scale is not None
             else quant_info.a13_scale
         )
+
+        if self.kda_moe_operator is not None:
+            output = self.kda_moe_operator(
+                hidden_states=runner_input.hidden_states,
+                w1=quant_info.w13_weight,
+                w2=quant_info.w2_weight,
+                topk_weight=runner_input.topk_weights,
+                topk_ids=runner_input.topk_ids,
+                quant_type=runner_input.quant_type.value,
+                activation=self.config.activation,
+                w1_scale=quant_info.w13_scale,
+                w2_scale=quant_info.w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=quant_info.a2_scale,
+                bias1=quant_info.b13,
+                bias2=quant_info.b2,
+                expert_mask=quant_info.expert_mask,
+                doweight_stage1=quant_info.doweight_stage1,
+                hidden_pad=quant_info.hidden_pad,
+                intermediate_pad=quant_info.intermediate_pad,
+                no_combine=self.config.no_combine,
+                num_local_tokens=runner_input.num_local_tokens,
+                output_dtype=runner_input.output_dtype,
+                swiglu_limit=quant_info.swiglu_limit,
+                fused_moe_kwargs=quant_info.fused_moe_kwargs,
+            )
+            return AiterRunnerOutput(hidden_states=output)
+
+        from aiter.fused_moe import fused_moe
+
+        from sglang.srt.environ import envs
 
         extra: dict = {}
         if quant_info.fused_moe_kwargs:

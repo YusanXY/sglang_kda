@@ -75,3 +75,35 @@ profiles:
         operator_id: glm5_moe_masked_grouped_gemm
         root: /absolute/path/to/glm52/moe_masked_grouped_gemm
         entrypoint: sglang_entry.py:run
+
+  # MI300X/gfx942 deployment templates. Shared Linear/indexer slots from the
+  # profiles above may also be listed here when their adapters support ROCm.
+  deepseek_v4_mi300x:
+    architecture: DeepseekV4ForCausalLM
+    platform: rocm
+    device_arch: gfx942
+    operators:
+      deepseek_v4.hip_paged_attention:
+        operator_id: deepseek_v4_hip_paged_attention_mi300x
+        root: /absolute/path/to/deepseek_v4/hip_paged_attention
+        entrypoint: sglang_entry.py:run
+
+      deepseek_v4.aiter_moe:
+        operator_id: deepseek_v4_aiter_moe_mi300x
+        root: /absolute/path/to/deepseek_v4/aiter_moe
+        entrypoint: sglang_entry.py:run
+
+  glm52_mi300x:
+    architecture: GlmMoeDsaForCausalLM
+    platform: rocm
+    device_arch: gfx942
+    operators:
+      glm52.aiter_dsa_sparse_attention:
+        operator_id: glm52_aiter_dsa_sparse_attention_mi300x
+        root: /absolute/path/to/glm52/aiter_dsa_sparse_attention
+        entrypoint: sglang_entry.py:run
+
+      glm52.aiter_moe:
+        operator_id: glm52_aiter_moe_mi300x
+        root: /absolute/path/to/glm52/aiter_moe
+        entrypoint: sglang_entry.py:run

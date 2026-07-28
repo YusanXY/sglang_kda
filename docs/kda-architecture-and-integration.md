@@ -38,9 +38,11 @@ KDA 不负责：
 | `python/sglang/srt/layers/quantization/unquant.py` | BF16/unquantized Linear 的 `_kda_apply` 直接分支 |
 | `python/sglang/srt/layers/attention/dsv4/` | DeepSeek V4 C4/indexer 固定调用点 |
 | `python/sglang/srt/layers/attention/deepseek_v4_backend.py` | DeepSeek V4 稀疏 attention 和 SWA 调用点 |
+| `python/sglang/srt/layers/attention/deepseek_v4_backend_hip_radix.py` | MI300X DeepSeek V4 HIP paged attention 调用点 |
 | `python/sglang/srt/layers/attention/dsa/dsa_indexer.py` | GLM-5.2 paged DSA index score 调用点 |
-| `python/sglang/srt/layers/attention/dsa_backend.py` | GLM-5.2 稀疏 attention 调用点 |
+| `python/sglang/srt/layers/attention/dsa_backend.py` | GLM-5.2 CUDA 与 Aiter 稀疏 attention 调用点 |
 | `python/sglang/srt/layers/moe/moe_runner/deep_gemm.py` | 模型限定的两阶段 masked grouped GEMM |
+| `python/sglang/srt/layers/moe/moe_runner/aiter.py` | MI300X Aiter full-MoE 调用点 |
 | `python/sglang/srt/kda/ADAPTER_PROTOCOL.md` | 每个 slot 的精确关键字 ABI |
 | `examples/kda/` | YAML、启动和 benchmark 示例 |
 | `test/registered/unit/kda/` | CPU 可运行的路由、AST、协议和 CLI 测试 |
@@ -141,12 +143,25 @@ profiles:
           - model.layers.*.self_attn.wqkv_a
 ```
 
+MI300X profile 可以增加两个精确运行时约束：
+
+```yaml
+profiles:
+  deepseek_v4_mi300x:
+    architecture: DeepseekV4ForCausalLM
+    platform: rocm
+    device_arch: gfx942
+    operators: {}
+```
+
 字段：
 
 | 字段 | 说明 |
 |---|---|
 | `version` | 当前固定为 `1` |
 | `profiles.<name>.architecture` | 必须与 `hf_config.architectures[0]` 精确相等 |
+| `profiles.<name>.platform` | 可选；设置后必须与运行时 `rocm`/`cuda` 精确相等 |
+| `profiles.<name>.device_arch` | 可选；设置后必须与 `gfx942`/`sm100` 等运行时架构精确相等 |
 | `operators.<slot>` | SGLang 固定调用点的稳定标识 |
 | `operator_id` | 外部算子 ID，仅用于日志和追踪 |
 | `root` | 含 adapter 的绝对目录，必须存在 |
@@ -177,6 +192,7 @@ bind_kda_linear_operators(model)
 get_kda_operator(slot)
 get_kda_operator_for_architecture(slot, architecture)
 get_kda_moe_operator()
+get_kda_aiter_moe_operator()
 kda_enabled()
 ```
 
@@ -188,6 +204,14 @@ MoE slot 则在 router 初始化时由 architecture 固定：
 |---|---|
 | `DeepseekV4ForCausalLM` | `deepseek_v4.moe` |
 | `GlmMoeDsaForCausalLM` | `glm52.moe_masked_grouped_gemm` |
+
+Aiter runner 使用独立的 full-MoE slot，避免把 DeepGEMM 两阶段 masked
+grouped-GEMM ABI 套到 Aiter：
+
+| architecture | Aiter MoE slot |
+|---|---|
+| `DeepseekV4ForCausalLM` | `deepseek_v4.aiter_moe` |
+| `GlmMoeDsaForCausalLM` | `glm52.aiter_moe` |
 
 ## 7. Linear 静态绑定
 
@@ -243,6 +267,8 @@ DeepSeek V4 调用点位于模型专用 C4/indexer 和 attention backend 内，�
 | `deepseek_v4.sparse_decode_attention` | `deepseek_v4_backend.py` decode 分支 |
 | `deepseek_v4.dense_swa_attention` | `deepseek_v4_backend.py` SWA 分支 |
 | `deepseek_v4.moe` | `moe_runner/deep_gemm.py` |
+| `deepseek_v4.hip_paged_attention` | `deepseek_v4_backend_hip_radix.py` |
+| `deepseek_v4.aiter_moe` | `moe_runner/aiter.py` |
 
 FP4 paged indexer 保持原生；`deepseek_v4.paged_mqa_logits` 只替换 FP8 paged
 路径。所有 adapter 调用使用关键字参数，且没有 `try/except` fallback。
@@ -265,6 +291,8 @@ GLM-5.2 的模型入口是 `GlmMoeDsaForCausalLM`，attention 实现复用
 | `glm52.dsa_index_score` | `Indexer._get_topk_paged` |
 | `glm52.dsa_sparse_attention` | `DeepseekSparseAttnBackend._forward_flashmla_sparse` |
 | `glm52.moe_masked_grouped_gemm` | `moe_runner/deep_gemm.py` |
+| `glm52.aiter_dsa_sparse_attention` | `dsa_backend.py` 的 Aiter decode/extend |
+| `glm52.aiter_moe` | `moe_runner/aiter.py` |
 
 `dsa_index_score` 把原生 `forward_batch.forward_mode` 对象作为 `phase`
 传给 adapter；如何映射成 llm_flops 的 prefill/decode 约定由
@@ -292,6 +320,11 @@ else:
 
 原生分支保留原参数、输出 buffer、overlap options 和返回值处理。adapter
 分支失败时不会进入 `else`。
+
+MI300X 上 Aiter 使用单次 `fused_moe` 风格的完整 MoE ABI，而不是两次
+DeepGEMM。`AiterRunnerCore` 构造时静态捕获 `*.aiter_moe` callable；已配置时
+直接把 hidden states、两组权重/scale、top-k、quant type、activation 和
+no-combine 等原生语义传给 adapter。未配置时原有 Aiter 代码保持不变。
 
 ## 9. Adapter 接入
 
@@ -413,4 +446,3 @@ git diff --check
 
 这些测试只证明接入兼容性。正式算子的 correctness、容差、性能、CV、ranking、
 SOL/MFU 等仍由 llm_flops 负责。
-

@@ -311,3 +311,108 @@ down adapter return value has the native DeepGEMM semantics: return
 SGLang does not validate shapes, routing capacity, tensor layout, scales, or
 adapter output. It does not catch adapter exceptions and never retries the
 native kernel after an adapter failure.
+
+# ROCm / MI300X (`gfx942`)
+
+MI300X deployment profiles should set both:
+
+```yaml
+platform: rocm
+device_arch: gfx942
+```
+
+The checks run once before entrypoint import. An MI300X profile therefore
+fails at startup on CUDA or a different AMD GCN architecture.
+
+## `deepseek_v4.hip_paged_attention`
+
+This slot replaces the primary `flash_mla_with_kvcache_entrypoint` call in
+`DeepseekV4HipRadixBackend`. It covers the backend-native HIP paged path;
+unified-KV Triton remains a separate native path.
+
+```python
+def run(
+    *,
+    q,
+    k_cache,
+    head_dim_v,
+    softmax_scale,
+    indices,
+    topk_length,
+    attention_sink,
+    extra_k_cache,
+    extra_indices,
+    extra_topk_length,
+    scheduler,
+    compress_ratio,
+    forward_mode,
+):
+    ...
+```
+
+Return the primary unsqueezed attention output. SGLang retains the native
+`squeeze(1)`. `extra_*` is `None` for dense SWA (`compress_ratio == 0`).
+The adapter owns any Aiter/HIP backend selection and layout conversion.
+
+## `glm52.aiter_dsa_sparse_attention`
+
+This slot is queried only for exact `GlmMoeDsaForCausalLM` and only inside the
+Aiter DSA decode/extend methods.
+
+```python
+def run(
+    *,
+    query,
+    cache,
+    indices,
+    softmax_scale,
+    value_dim,
+    logit_cap,
+):
+    ...
+```
+
+`query` has the head padding already required by the native Aiter path and
+`indices` is `(query_tokens, 1, topk)`. Return a three-dimensional output with
+the same padded head count. SGLang retains the native head trim and final
+reshape.
+
+## Aiter full-MoE
+
+| Architecture | Slot |
+| --- | --- |
+| `DeepseekV4ForCausalLM` | `deepseek_v4.aiter_moe` |
+| `GlmMoeDsaForCausalLM` | `glm52.aiter_moe` |
+
+```python
+def run(
+    *,
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    quant_type,
+    activation,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    a2_scale,
+    bias1,
+    bias2,
+    expert_mask,
+    doweight_stage1,
+    hidden_pad,
+    intermediate_pad,
+    no_combine,
+    num_local_tokens,
+    output_dtype,
+    swiglu_limit,
+    fused_moe_kwargs,
+):
+    ...
+```
+
+Return the full MoE output tensor. This is intentionally distinct from the
+two-stage DeepGEMM masked-grouped-GEMM protocol. A configured adapter bypasses
+the native Aiter import and execution; exceptions propagate without retry.

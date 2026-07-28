@@ -369,6 +369,11 @@ class DeepseekSparseAttnBackend(
         self.kda_sparse_attention_operator = get_kda_operator_for_architecture(
             "glm52.dsa_sparse_attention", kda_architecture
         )
+        self.kda_aiter_sparse_attention_operator = (
+            get_kda_operator_for_architecture(
+                "glm52.aiter_dsa_sparse_attention", kda_architecture
+            )
+        )
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -2491,6 +2496,19 @@ class DeepseekSparseAttnBackend(
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        if self.kda_aiter_sparse_attention_operator is not None:
+            o_kernel = self.kda_aiter_sparse_attention_operator(
+                query=q_kernel,
+                cache=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                softmax_scale=layer.scaling,
+                value_dim=layer.v_head_dim,
+                logit_cap=layer.logit_cap,
+            )
+            if self.need_pad_heads:
+                return o_kernel[:, :: self.head_repeat_factor, :]
+            return o_kernel.reshape_as(o)
+
         q_scale = None
         kv_scale = None
         aiter_persistent_kwargs = {}
@@ -2568,6 +2586,19 @@ class DeepseekSparseAttnBackend(
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        if self.kda_aiter_sparse_attention_operator is not None:
+            o_kernel = self.kda_aiter_sparse_attention_operator(
+                query=q_kernel,
+                cache=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                softmax_scale=layer.scaling,
+                value_dim=layer.v_head_dim,
+                logit_cap=layer.logit_cap,
+            )
+            if self.need_pad_heads:
+                return o_kernel[:, :: self.head_repeat_factor, :]
+            return o_kernel.reshape_as(o)
 
         q_scale = None
         kv_scale = None

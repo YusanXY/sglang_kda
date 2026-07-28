@@ -25,6 +25,7 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kda import get_kda_operator
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     CompressorBackendMixin,
@@ -450,6 +451,9 @@ class DeepseekV4HipRadixBackend(
         )
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
+        )
+        self.kda_hip_paged_attention = get_kda_operator(
+            "deepseek_v4.hip_paged_attention"
         )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -1513,7 +1517,26 @@ class DeepseekV4HipRadixBackend(
                 extra_indices_in_kvcache=extra_indices,
                 extra_topk_length=extra_topk_lengths,
             )
-            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
+            if self.kda_hip_paged_attention is not None:
+                o = self.kda_hip_paged_attention(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attention_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                    scheduler=flashmla_metadata,
+                    compress_ratio=compress_ratio,
+                    forward_mode=forward_batch.forward_mode,
+                )
+            else:
+                o = flash_mla_with_kvcache_entrypoint(
+                    **input_dict, backend=backend
+                )[0]
 
             o = o.squeeze(1)
             return o
