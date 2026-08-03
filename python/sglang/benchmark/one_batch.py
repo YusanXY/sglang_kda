@@ -55,6 +55,7 @@ import json
 import logging
 import multiprocessing
 import os
+import tempfile
 import time
 from array import array
 from types import SimpleNamespace
@@ -201,6 +202,7 @@ class BenchArgs:
     prompt_filename: str = ""
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
+    correctness_output_file: str = ""
     # This is only used for correctness test
     cut_len: int = 4
     log_decode_step: int = 0
@@ -231,6 +233,15 @@ class BenchArgs:
             "--result-filename", type=str, default=BenchArgs.result_filename
         )
         parser.add_argument("--correctness-test", action="store_true")
+        parser.add_argument(
+            "--correctness-output-file",
+            type=str,
+            default=BenchArgs.correctness_output_file,
+            help=(
+                "Optional .pt output for correctness mode. TP0 atomically saves "
+                "the final next_token_ids and CPU float32 next_token_logits."
+            ),
+        )
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
         parser.add_argument(
             "--log-decode-step",
@@ -389,6 +400,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
             "Today is a sunny day and I like",
         ]
     )
+    prompts = prompts[: bench_args.batch_size[0]]
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
@@ -668,6 +680,44 @@ def _save_profile_trace_results(profiler, profile_activities, filename):
     print(profiler.key_averages(group_by_input_shape=True).table(sort_by=sort_by))
 
 
+def validate_correctness_output_args(bench_args) -> None:
+    output_file = bench_args.correctness_output_file
+    if not output_file:
+        return
+    if not bench_args.correctness_test:
+        raise ValueError(
+            "--correctness-output-file requires --correctness-test"
+        )
+    if not output_file.lower().endswith(".pt"):
+        raise ValueError("--correctness-output-file must end in .pt")
+
+
+def _save_correctness_output(output_file, next_token_ids, next_token_logits) -> None:
+    if next_token_logits is None:
+        raise ValueError("correctness output requires final next-token logits")
+    output_file = os.path.abspath(output_file)
+    output_dir = os.path.dirname(output_file)
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temporary_file = tempfile.mkstemp(
+        prefix=f".{os.path.basename(output_file)}.",
+        suffix=".tmp",
+        dir=output_dir,
+    )
+    os.close(fd)
+    payload = {
+        "next_token_ids": next_token_ids.detach().to(device="cpu"),
+        "next_token_logits": next_token_logits.detach().to(
+            device="cpu", dtype=torch.float32
+        ),
+    }
+    try:
+        torch.save(payload, temporary_file)
+        os.replace(temporary_file, output_file)
+    finally:
+        if os.path.exists(temporary_file):
+            os.unlink(temporary_file)
+
+
 def correctness_test(
     server_args,
     port_args,
@@ -703,6 +753,12 @@ def correctness_test(
     # Extend (prefill w/ KV cache)
     next_token_ids, next_token_logits, batch = model_runner.extend(reqs)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
+    if tp_rank == 0 and bench_args.correctness_output_file:
+        _save_correctness_output(
+            bench_args.correctness_output_file,
+            next_token_ids,
+            next_token_logits,
+        )
 
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
@@ -983,6 +1039,7 @@ def latency_test(
 
 
 def main(server_args, bench_args):
+    validate_correctness_output_args(bench_args)
     if server_args.dsv4_worker_backend == "huge_kernel":
         from sglang.srt.model_executor.dsv4_huge_kernel_model_runner import (
             validate_dsv4_huge_kernel_bench_args,

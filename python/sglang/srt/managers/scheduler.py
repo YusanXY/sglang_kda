@@ -770,6 +770,10 @@ class Scheduler(
             from sglang.srt.managers.tp_worker import TpModelWorker
 
             self.tp_worker = TpModelWorker(**worker_kwargs)
+        logger.info(
+            "DSV4 worker backend active: %s",
+            self.server_args.dsv4_worker_backend,
+        )
 
     def maybe_init_draft_worker(self):
         if self.spec_algorithm.is_none():

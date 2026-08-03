@@ -177,8 +177,6 @@ def validate_dsv4_huge_kernel_bench_args(bench_args) -> None:
             "--output-len must be exactly 1 for prefill TTFT, "
             f"got {bench_args.output_len}"
         )
-    if bench_args.correctness_test:
-        errors.append("--correctness-test is unsupported in the prefill-only runner")
     invalid_input_lens = [
         value
         for value in bench_args.input_len
