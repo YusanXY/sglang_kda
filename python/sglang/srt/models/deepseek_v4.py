@@ -1150,7 +1150,14 @@ class MQALayer(MqaAttentionBase):
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
             # memset.
-            if _is_gfx942_supported:
+            if huge_mode:
+                q_padded = e2e_descriptor.attention_q_padded
+                if q_padded.shape[0] != x.shape[0]:
+                    raise RuntimeError(
+                        f"layer {self.layer_id}: huge attention workspace has "
+                        f"{q_padded.shape[0]} rows for {x.shape[0]} tokens"
+                    )
+            elif _is_gfx942_supported:
                 q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
             else:
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
@@ -1316,7 +1323,15 @@ class MQALayer(MqaAttentionBase):
                 raise RuntimeError(
                     "DSV4 huge output fusion did not produce WO_A FP8 operands"
                 )
-            output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+            if huge_mode:
+                output = e2e_descriptor.wo_a_gemm_output
+                if output.shape != (T, G, R):
+                    raise RuntimeError(
+                        f"layer {self.layer_id}: huge WO_A GEMM workspace shape "
+                        f"{tuple(output.shape)} != {(T, G, R)}"
+                    )
+            else:
+                output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
                 (o_fp8, o_s),

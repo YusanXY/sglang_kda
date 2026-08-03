@@ -92,8 +92,10 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     seq_lens: torch.Tensor
     extend_seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
+    attention_q_padded: torch.Tensor
     wo_a_output_q: torch.Tensor
     wo_a_output_s_storage: torch.Tensor
+    wo_a_gemm_output: torch.Tensor
     num_tokens: int
     batch_size: int
 
@@ -133,7 +135,14 @@ class DSV4WholeLayerRuntime:
         # then performs no per-layer or per-batch allocator calls.  Rebuild on
         # a shape change instead of leaking one large workspace per observed T.
         self._wo_a_workspace: Optional[
-            tuple[int, torch.device, torch.Tensor, torch.Tensor]
+            tuple[
+                int,
+                torch.device,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
         ] = None
 
     @property
@@ -231,7 +240,12 @@ class DSV4WholeLayerRuntime:
         attn_backend = get_attn_backend()
         metadata = attn_backend.forward_metadata
         core = metadata.core_attn_metadata
-        output_q, output_s_storage = self._get_wo_a_workspace(
+        (
+            attention_q_padded,
+            output_q,
+            output_s_storage,
+            wo_a_gemm_output,
+        ) = self._get_wo_a_workspace(
             num_tokens,
             positions.device,
         )
@@ -248,8 +262,10 @@ class DSV4WholeLayerRuntime:
             seq_lens=forward_batch.seq_lens,
             extend_seq_lens=forward_batch.extend_seq_lens,
             out_cache_loc=forward_batch.out_cache_loc,
+            attention_q_padded=attention_q_padded,
             wo_a_output_q=output_q,
             wo_a_output_s_storage=output_s_storage,
+            wo_a_gemm_output=wo_a_gemm_output,
             num_tokens=num_tokens,
             batch_size=batch_size,
         )
@@ -260,12 +276,32 @@ class DSV4WholeLayerRuntime:
         self,
         num_tokens: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         workspace = self._wo_a_workspace
         if workspace is not None:
-            cached_tokens, cached_device, output_q, output_s_storage = workspace
+            (
+                cached_tokens,
+                cached_device,
+                attention_q_padded,
+                output_q,
+                output_s_storage,
+                wo_a_gemm_output,
+            ) = workspace
             if cached_tokens == num_tokens and cached_device == device:
-                return output_q, output_s_storage
+                return (
+                    attention_q_padded,
+                    output_q,
+                    output_s_storage,
+                    wo_a_gemm_output,
+                )
+        # Decoder layers execute serially on the same stream, so exact-T
+        # attention/WO buffers can be model-scoped scratch instead of three
+        # fresh allocator calls in each of the 43 layers.
+        attention_q_padded = torch.empty(
+            (num_tokens, 64, 512),
+            dtype=torch.bfloat16,
+            device=device,
+        )
         output_q = torch.empty(
             (num_tokens, 2, 4096),
             dtype=torch.float8_e4m3fn,
@@ -276,13 +312,20 @@ class DSV4WholeLayerRuntime:
             dtype=torch.float32,
             device=device,
         )
+        wo_a_gemm_output = torch.empty(
+            (num_tokens, 2, 1024),
+            dtype=torch.bfloat16,
+            device=device,
+        )
         self._wo_a_workspace = (
             num_tokens,
             device,
+            attention_q_padded,
             output_q,
             output_s_storage,
+            wo_a_gemm_output,
         )
-        return output_q, output_s_storage
+        return attention_q_padded, output_q, output_s_storage, wo_a_gemm_output
 
     def execute_layer(
         self,

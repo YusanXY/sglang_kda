@@ -86,6 +86,17 @@ def combined_topk_width(topk: int, window_size: int) -> int:
     return ceil_align(topk + window_size, SPARSE_PREFILL_TOPK_ALIGNMENT)
 
 
+def strict_batch1_swa_token_count(
+    num_qo_tokens: int,
+    max_seq_len: int,
+    swa_window_size: int,
+) -> int:
+    """Exact batch-1 union size without reading a GPU prefix sum."""
+    if num_qo_tokens < 0 or max_seq_len < 0 or swa_window_size <= 0:
+        raise ValueError("invalid strict batch-1 SWA geometry")
+    return min(max_seq_len, num_qo_tokens + swa_window_size - 1)
+
+
 def combine_topk_swa_indices(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -195,6 +206,7 @@ def build_swa_token_ids(
     req_to_token: torch.Tensor,
     full_to_swa: torch.Tensor,
     swa_window: int,
+    total_swa_hint: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a flat list of physical SWA-cache token IDs covering each
     request's positional union of every query's SWA window.
@@ -238,7 +250,16 @@ def build_swa_token_ids(
     swa_first_pos = (seq_lens - swa_gather_lens).to(torch.int32)
     swa_offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
     swa_offsets[1:] = torch.cumsum(swa_gather_lens, dim=0).to(torch.int32)
-    total_swa = int(swa_offsets[-1].item())  # one CPU sync per chunk
+    if total_swa_hint is None:
+        total_swa = int(swa_offsets[-1].item())  # native: one sync per chunk
+    else:
+        # The strict huge runtime supports one request only.  Its caller has
+        # the host-side query count and maximum sequence length already, so it
+        # can provide the exact union size without synchronizing this GPU
+        # cumsum back to the host.
+        total_swa = total_swa_hint
+        if total_swa < 0:
+            raise ValueError("total_swa_hint must be non-negative")
 
     swa_token_ids = torch.empty(total_swa, dtype=torch.int32, device=device)
     if total_swa == 0:
@@ -322,12 +343,25 @@ class SparsePrefillChunkCache:
         swa_page_size: int,
         num_qo_tokens: int,
         max_seq_len: int,
+        strict_batch1_gpu_only: bool = False,
     ) -> "SparsePrefillChunkCache":
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
 
         query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
         query_start_loc[1:] = torch.cumsum(extend_seq_lens, dim=0).to(torch.int32)
+
+        total_swa_hint = None
+        if strict_batch1_gpu_only:
+            if num_reqs != 1:
+                raise RuntimeError(
+                    "strict huge sparse-prefill metadata requires batch=1"
+                )
+            total_swa_hint = strict_batch1_swa_token_count(
+                num_qo_tokens,
+                max_seq_len,
+                swa_window_size,
+            )
 
         swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets = (
             build_swa_token_ids(
@@ -337,6 +371,7 @@ class SparsePrefillChunkCache:
                 req_to_token=req_to_token,
                 full_to_swa=full_to_swa,
                 swa_window=swa_window_size,
+                total_swa_hint=total_swa_hint,
             )
         )
 

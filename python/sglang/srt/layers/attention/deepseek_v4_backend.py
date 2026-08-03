@@ -523,6 +523,9 @@ class DeepseekV4AttnBackend(
         self.c4_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
+        self.dsv4_huge_mode = (
+            model_runner.server_args.dsv4_worker_backend == "huge_kernel"
+        )
 
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
@@ -1795,6 +1798,7 @@ class DeepseekV4AttnBackend(
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
+                strict_batch1_gpu_only=self.dsv4_huge_mode,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
