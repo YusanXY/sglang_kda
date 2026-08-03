@@ -384,9 +384,9 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def _init_model_runner(self):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.model_executor.model_runner_factory import create_model_runner
 
-        self._model_runner = ModelRunner(
+        self._model_runner = create_model_runner(
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,
             gpu_id=self.gpu_id,
@@ -401,12 +401,12 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def _init_multi_layer_eagle_model_runners(self):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.model_executor.model_runner_factory import create_model_runner
 
         self.model_runner_list.append(self.model_runner)
         for i in range(1, self.server_args.speculative_num_steps):
             self.model_runner_list.append(
-                ModelRunner(
+                create_model_runner(
                     model_config=self.model_config,
                     mem_fraction_static=self.server_args.mem_fraction_static,
                     gpu_id=self.gpu_id,

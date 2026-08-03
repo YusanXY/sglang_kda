@@ -80,7 +80,7 @@ from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_ba
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_factory import create_model_runner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -348,7 +348,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
 
         model_runner = MlxModelRunnerStub(**runner_kwargs)
     else:
-        model_runner = ModelRunner(**runner_kwargs)
+        model_runner = create_model_runner(**runner_kwargs)
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
         model_runner.init_cuda_graphs()
@@ -983,6 +983,13 @@ def latency_test(
 
 
 def main(server_args, bench_args):
+    if server_args.dsv4_worker_backend == "huge_kernel":
+        from sglang.srt.model_executor.dsv4_huge_kernel_model_runner import (
+            validate_dsv4_huge_kernel_bench_args,
+        )
+
+        validate_dsv4_huge_kernel_bench_args(bench_args)
+
     # Post-init write to the legacy cuda_graph_max_bs_decode field would
     # not propagate to cuda_graph_config; update the decode phase directly.
     if server_args.cuda_graph_config is not None:

@@ -543,6 +543,17 @@ class ServerArgs:
             )
         ),
     ] = "auto"
+    dsv4_worker_backend: A[
+        Literal["native", "huge_kernel"],
+        Arg(
+            help=(
+                "Select the DeepSeek-V4 execution worker. 'native' keeps the "
+                "standard SGLang ModelRunner; 'huge_kernel' selects the "
+                "strict B200 TP4/EP4 prefill-only whole-layer development path."
+            ),
+            choices=("native", "huge_kernel"),
+        ),
+    ] = "native"
     model_config_parser: A[
         str,
         Arg(

@@ -1348,6 +1348,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
+        self._whole_layer_runner = None
 
     def _build_self_attn(
         self,
@@ -1376,6 +1377,17 @@ class DeepseekV4DecoderLayer(nn.Module):
         self._post_attention_layernorm_weight_bf16 = (
             self.post_attention_layernorm.weight.data.bfloat16().contiguous()
         )
+
+    def enable_huge_kernel_runner(self) -> None:
+        if self._whole_layer_runner is not None:
+            raise RuntimeError(
+                f"whole-layer runner already installed on layer {self.layer_id}"
+            )
+        from sglang.srt.model_executor.dsv4_huge_kernel_whole_layer_runner import (
+            Dsv4HugeKernelWholeLayerRunner,
+        )
+
+        self._whole_layer_runner = Dsv4HugeKernelWholeLayerRunner(self)
 
     def hc_pre(
         self,
@@ -1540,6 +1552,44 @@ class DeepseekV4DecoderLayer(nn.Module):
         return hc_post_torch_impl(x, residual, post, comb)
 
     def forward(
+        self,
+        positions: torch.tensor,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_ids_global: torch.Tensor,
+        prev_residual: Optional[torch.Tensor] = None,
+        prev_post: Optional[torch.Tensor] = None,
+        prev_comb: Optional[torch.Tensor] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        if self._whole_layer_runner is not None:
+            return self._whole_layer_runner(
+                positions=positions,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                input_ids_global=input_ids_global,
+                prev_residual=prev_residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+            )
+        return self._forward_native(
+            positions=positions,
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            input_ids_global=input_ids_global,
+            prev_residual=prev_residual,
+            prev_post=prev_post,
+            prev_comb=prev_comb,
+        )
+
+    def _forward_native(
         self,
         positions: torch.tensor,
         hidden_states: torch.Tensor,

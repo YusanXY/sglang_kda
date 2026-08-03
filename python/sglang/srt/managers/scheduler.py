@@ -760,6 +760,12 @@ class Scheduler(
             from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
             self.tp_worker = MlxTpModelWorker(**worker_kwargs)
+        elif self.server_args.dsv4_worker_backend == "huge_kernel":
+            from sglang.srt.managers.dsv4_huge_kernel_tp_worker import (
+                Dsv4HugeKernelTpModelWorker,
+            )
+
+            self.tp_worker = Dsv4HugeKernelTpModelWorker(**worker_kwargs)
         else:
             from sglang.srt.managers.tp_worker import TpModelWorker
 
