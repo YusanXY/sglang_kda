@@ -4,6 +4,8 @@ set -euo pipefail
 REPO=${REPO_ROOT:-/home/gjy/data/agent4kernel/sglang_kda_e2e}
 MODEL=${DSV4_MODEL:-/mnt/SFS-Shared/guojingyu/models/DeepSeek-V4-Flash}
 PYTHON=${PYTHON_BIN:-/home/gjy/data/agent4kernel/mega_mqa_logits/llm_flops/.runtime/venv/bin/python}
+CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.2}
+CUDA_CCCL_INCLUDE=${CUDA_CCCL_INCLUDE:-$CUDA_HOME/targets/x86_64-linux/include/cccl}
 PAIRS=${PAIRS:-5}
 IDLE_TIMEOUT_SECONDS=${IDLE_TIMEOUT_SECONDS:-1800}
 CACHE_HIT_TOLERANCE=${CACHE_HIT_TOLERANCE:-0.01}
@@ -24,7 +26,8 @@ if (( PAIRS < 5 )); then
   echo "PAIRS must be at least 5 for a formal comparison; got $PAIRS" >&2
   exit 2
 fi
-for required in "$REPO" "$MODEL" "$PYTHON" "$VALIDATOR" "$SUMMARIZER"; do
+for required in "$REPO" "$MODEL" "$PYTHON" "$VALIDATOR" "$SUMMARIZER" \
+  "$CUDA_HOME/bin/nvcc" "$CUDA_CCCL_INCLUDE/cuda/atomic"; do
   if [[ ! -e "$required" ]]; then
     echo "Required path does not exist: $required" >&2
     exit 2
@@ -36,6 +39,9 @@ MANIFEST=$RUN_ROOT/manifest.tsv
 printf 'pair\tordinal\tbackend\tresult\tlog\n' > "$MANIFEST"
 
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
+export CUDA_HOME
+export PATH="$CUDA_HOME/bin:$PATH"
+export CPATH="$CUDA_CCCL_INCLUDE${CPATH:+:$CPATH}"
 export TORCH_EXTENSIONS_DIR="$RUN_ROOT/torch_extensions"
 export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 export HF_HUB_OFFLINE=1
@@ -51,6 +57,8 @@ export SGLANG_DSV4_FP4_EXPERTS=1
   printf 'git_head=%s\n' "$(git -C "$REPO" rev-parse HEAD)"
   printf 'git_branch=%s\n' "$(git -C "$REPO" branch --show-current)"
   printf 'cuda_visible_devices=%s\n' "$GPU_IDS"
+  printf 'cuda_home=%s\ncuda_cccl_include=%s\n' "$CUDA_HOME" "$CUDA_CCCL_INCLUDE"
+  printf 'nvcc_version=%s\n' "$("$CUDA_HOME/bin/nvcc" --version | tail -n 1)"
   printf 'model=%s\npairs=%s\nbatch_size=1\n' "$MODEL" "$PAIRS"
   printf 'cached_history=%s\nnew_chunk=%s\ninput_len=%s\n' "$CACHED_HISTORY" "$NEW_CHUNK" "$INPUT_LEN"
   printf 'output_len=1\ncontext_capacity=%s\ncache_hit_rate=%s\n' "$CONTEXT_CAPACITY" "$CACHE_HIT_RATE"
@@ -101,6 +109,7 @@ run_one() {
     --chunked-prefill-size "$NEW_CHUNK"
     --cuda-graph-backend-decode disabled
     --cuda-graph-backend-prefill disabled
+    --skip-server-warmup
     --disable-overlap-schedule --enable-metrics --random-seed 42
     --run-name "pair${pair}_${backend}"
     --batch-size 1 --input-len "$INPUT_LEN" --output-len 1
