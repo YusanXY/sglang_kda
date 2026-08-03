@@ -5,6 +5,9 @@
 #include <string>
 
 #include "v2_sm100_mqa_logits.cuh"
+#define SGLANG_DSV4_TOPK_DEVICE_ONLY
+#include "../../deepseek_v4/topk_v1.cuh"
+#undef SGLANG_DSV4_TOPK_DEVICE_ONLY
 
 void launch_blockq8_tmem2(
     int grid_size,
@@ -79,6 +82,69 @@ void launch_blockq8_tmem2(
     if (status != cudaSuccess) {
         throw std::runtime_error(
             std::string("cluster2 Q16 cta_group::2 KV kernel launch failed: ") +
+            cudaGetErrorString(status));
+    }
+}
+
+void launch_topk512_sparse_prefill(
+    int batch_size,
+    int num_reqs,
+    int logits_stride,
+    int page_table_stride,
+    int combined_indices_stride,
+    const float* logits,
+    const int* seq_lens,
+    const int* page_table,
+    int* page_indices,
+    int* raw_indices,
+    const int* positions,
+    const int* query_start_loc,
+    const int* full_seq_lens,
+    const int* swa_gather_lens,
+    const int* compressed_base,
+    const int* swa_base,
+    int* combined_indices,
+    int* combined_lens,
+    cudaStream_t stream) {
+    static_assert(kTopK == 512 && kTopKBlockSize == 512);
+    constexpr auto kernel = topk_transform_kernel<false>;
+    constexpr int smem_bytes = kSMEM + sizeof(int32_t);
+    static const auto setup_status = cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_bytes);
+    if (setup_status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("top-k cudaFuncSetAttribute failed: ") +
+            cudaGetErrorString(setup_status));
+    }
+
+    const auto params = TopKParams{
+        logits,
+        seq_lens,
+        page_table,
+        page_indices,
+        raw_indices,
+        positions,
+        query_start_loc,
+        full_seq_lens,
+        swa_gather_lens,
+        compressed_base,
+        swa_base,
+        combined_indices,
+        combined_lens,
+        logits_stride,
+        page_table_stride,
+        combined_indices_stride,
+        static_cast<uint32_t>(num_reqs),
+        6,
+    };
+    topk_transform_kernel<false>
+        <<<batch_size, kTopKBlockSize, smem_bytes, stream>>>(params);
+    const auto status = cudaGetLastError();
+    if (status != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("clustered MQA top-k launch failed: ") +
             cudaGetErrorString(status));
     }
 }

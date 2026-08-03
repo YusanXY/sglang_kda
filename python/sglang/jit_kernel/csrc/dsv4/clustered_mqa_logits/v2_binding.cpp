@@ -110,6 +110,27 @@ void launch_blockq8_tmem2(
     CUtensorMap tensor_map_weights,
     cudaStream_t stream);
 
+void launch_topk512_sparse_prefill(
+    int batch_size,
+    int num_reqs,
+    int logits_stride,
+    int page_table_stride,
+    int combined_indices_stride,
+    const float* logits,
+    const int* seq_lens,
+    const int* page_table,
+    int* page_indices,
+    int* raw_indices,
+    const int* positions,
+    const int* query_start_loc,
+    const int* full_seq_lens,
+    const int* swa_gather_lens,
+    const int* compressed_base,
+    const int* swa_base,
+    int* combined_indices,
+    int* combined_lens,
+    cudaStream_t stream);
+
 torch::Tensor v2_forward_out(
         const torch::Tensor& q,
         const torch::Tensor& fused_kv,
@@ -280,10 +301,116 @@ torch::Tensor v2_forward(
         max_context_len);
 }
 
+void v2_forward_topk(
+        const torch::Tensor& q,
+        const torch::Tensor& fused_kv,
+        const torch::Tensor& weights,
+        const torch::Tensor& context_lens,
+        const torch::Tensor& grouped_block_table,
+        const torch::Tensor& schedule_meta,
+        const torch::Tensor& logits_workspace,
+        const torch::Tensor& page_table,
+        const torch::Tensor& page_indices,
+        const torch::Tensor& raw_indices,
+        const torch::Tensor& positions,
+        const torch::Tensor& query_start_loc,
+        const torch::Tensor& full_seq_lens,
+        const torch::Tensor& swa_gather_lens,
+        const torch::Tensor& compressed_base,
+        const torch::Tensor& swa_base,
+        const torch::Tensor& combined_indices,
+        const torch::Tensor& combined_lens,
+        int64_t max_context_len) {
+    auto logits = v2_forward_out(
+        q,
+        fused_kv,
+        weights,
+        context_lens,
+        grouped_block_table,
+        schedule_meta,
+        logits_workspace,
+        max_context_len);
+
+    const auto same_device = [&q](const torch::Tensor& tensor, const char* name) {
+        TORCH_CHECK(tensor.is_cuda() && tensor.device() == q.device(), name, " device mismatch");
+    };
+    const auto int32_tensor = [&same_device](const torch::Tensor& tensor, const char* name) {
+        same_device(tensor, name);
+        TORCH_CHECK(tensor.scalar_type() == at::kInt, name, " must be int32");
+    };
+    int32_tensor(page_table, "page_table");
+    int32_tensor(page_indices, "page_indices");
+    int32_tensor(raw_indices, "raw_indices");
+    int32_tensor(positions, "positions");
+    int32_tensor(query_start_loc, "query_start_loc");
+    int32_tensor(full_seq_lens, "full_seq_lens");
+    int32_tensor(swa_gather_lens, "swa_gather_lens");
+    int32_tensor(compressed_base, "compressed_base");
+    int32_tensor(swa_base, "swa_base");
+    int32_tensor(combined_indices, "combined_indices");
+    int32_tensor(combined_lens, "combined_lens");
+
+    const auto total_q = q.size(0);
+    TORCH_CHECK(page_table.dim() == 2 && page_table.size(0) == total_q &&
+                page_table.stride(1) == 1,
+                "page_table must be strided [M,max_pages]");
+    TORCH_CHECK(page_indices.dim() == 2 && page_indices.size(0) == total_q &&
+                page_indices.size(1) == 512 && page_indices.is_contiguous(),
+                "page_indices must be contiguous [M,512]");
+    TORCH_CHECK(raw_indices.sizes() == page_indices.sizes() && raw_indices.is_contiguous(),
+                "raw_indices must be contiguous [M,512]");
+    TORCH_CHECK(positions.dim() == 1 && positions.size(0) == total_q && positions.is_contiguous(),
+                "positions must be contiguous [M]");
+    TORCH_CHECK(full_seq_lens.dim() == 1 && full_seq_lens.is_contiguous(),
+                "full_seq_lens must be contiguous [R]");
+    const auto num_reqs = full_seq_lens.size(0);
+    TORCH_CHECK(num_reqs > 0 && num_reqs <= 16,
+                "clustered sparse-prefill supports 1..16 requests");
+    TORCH_CHECK(query_start_loc.dim() == 1 && query_start_loc.size(0) == num_reqs + 1 &&
+                query_start_loc.is_contiguous(),
+                "query_start_loc must be contiguous [R+1]");
+    for (const auto* tensor : {&swa_gather_lens, &compressed_base, &swa_base}) {
+        TORCH_CHECK(tensor->dim() == 1 && tensor->size(0) == num_reqs && tensor->is_contiguous(),
+                    "request epilogue tensors must be contiguous [R]");
+    }
+    TORCH_CHECK(combined_indices.dim() == 2 && combined_indices.size(0) == total_q &&
+                combined_indices.size(1) >= 640 && combined_indices.stride(1) == 1,
+                "combined_indices must be strided [M,>=640]");
+    TORCH_CHECK(combined_lens.dim() == 1 && combined_lens.size(0) == total_q &&
+                combined_lens.is_contiguous(),
+                "combined_lens must be contiguous [M]");
+
+    auto stream = at::cuda::getCurrentCUDAStream(q.get_device()).stream();
+    launch_topk512_sparse_prefill(
+        static_cast<int>(total_q),
+        static_cast<int>(num_reqs),
+        static_cast<int>(logits.stride(0)),
+        static_cast<int>(page_table.stride(0)),
+        static_cast<int>(combined_indices.stride(0)),
+        logits.data_ptr<float>(),
+        context_lens.data_ptr<int>(),
+        page_table.data_ptr<int>(),
+        page_indices.data_ptr<int>(),
+        raw_indices.data_ptr<int>(),
+        positions.data_ptr<int>(),
+        query_start_loc.data_ptr<int>(),
+        full_seq_lens.data_ptr<int>(),
+        swa_gather_lens.data_ptr<int>(),
+        compressed_base.data_ptr<int>(),
+        swa_base.data_ptr<int>(),
+        combined_indices.data_ptr<int>(),
+        combined_lens.data_ptr<int>(),
+        stream);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &v2_forward, "cluster2 Q16 cta_group::2 KV SM100 paged MQA logits");
     m.def(
         "forward_out",
         &v2_forward_out,
         "cluster2 Q16 paged MQA logits into a persistent device workspace");
+    m.def(
+        "forward_topk",
+        &v2_forward_topk,
+        "cluster2 Q16 paged MQA logits plus exact sparse-prefill top-k");
 }

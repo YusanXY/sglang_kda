@@ -5,6 +5,8 @@ from unittest import mock
 
 import torch
 from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
+    ClusteredMqaMetadata,
+    clustered_fp8_paged_mqa_topk,
     prepare_clustered_mqa_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
@@ -83,3 +85,57 @@ def test_huge_q16_skips_stock_schedule_until_cuda_tail_needs_it():
         assert metadata.ensure_deep_gemm_metadata() is schedule
 
     build.assert_called_once_with()
+
+
+def test_clustered_topk_submits_logits_and_epilogue_through_one_cpp_entry():
+    extension = mock.Mock()
+    q = torch.empty((2, 64, 128))
+    metadata = ClusteredMqaMetadata(
+        seq_lens=mock.sentinel.seq_lens,
+        page_table=mock.sentinel.grouped_page_table,
+        schedule=mock.sentinel.schedule,
+        logits_workspace=mock.sentinel.workspace,
+        max_context=320,
+        total_q=2,
+        extension=extension,
+    )
+    args = {
+        "kv_cache": mock.sentinel.kv_cache,
+        "weights": mock.sentinel.weights,
+        "page_table": mock.sentinel.query_page_table,
+        "page_indices": mock.sentinel.page_indices,
+        "raw_indices": mock.sentinel.raw_indices,
+        "positions": mock.sentinel.positions,
+        "query_start_loc": mock.sentinel.query_start_loc,
+        "full_seq_lens": mock.sentinel.full_seq_lens,
+        "swa_gather_lens": mock.sentinel.swa_gather_lens,
+        "compressed_base": mock.sentinel.compressed_base,
+        "swa_base": mock.sentinel.swa_base,
+        "combined_indices": mock.sentinel.combined_indices,
+        "combined_lens": mock.sentinel.combined_lens,
+    }
+
+    assert clustered_fp8_paged_mqa_topk(q=q, metadata=metadata, **args) is None
+
+    extension.forward_topk.assert_called_once_with(
+        q,
+        args["kv_cache"],
+        args["weights"],
+        metadata.seq_lens,
+        metadata.page_table,
+        metadata.schedule,
+        metadata.logits_workspace,
+        args["page_table"],
+        args["page_indices"],
+        args["raw_indices"],
+        args["positions"],
+        args["query_start_loc"],
+        args["full_seq_lens"],
+        args["swa_gather_lens"],
+        args["compressed_base"],
+        args["swa_base"],
+        args["combined_indices"],
+        args["combined_lens"],
+        metadata.max_context,
+    )
+    extension.forward_out.assert_not_called()

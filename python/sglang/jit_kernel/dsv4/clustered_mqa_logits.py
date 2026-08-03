@@ -27,11 +27,15 @@ QUERIES_PER_CLUSTER = 16
 _HERE = Path(__file__).resolve().parent
 _SOURCE_DIR = _HERE.parent / "csrc" / "dsv4" / "clustered_mqa_logits"
 _SOURCES = (_SOURCE_DIR / "v2_binding.cpp", _SOURCE_DIR / "v2_kernel.cu")
+_TOPK_V1 = _HERE.parent / "csrc" / "deepseek_v4" / "topk_v1.cuh"
+_TOPK_IMPL = _HERE.parent / "include" / "sgl_kernel" / "deepseek_v4" / "topk_impl.cuh"
 _DEPENDENCIES = (
     *_SOURCES,
     _SOURCE_DIR / "v2_mqa_logits_layout.cuh",
     _SOURCE_DIR / "v2_sm100_mqa_logits.cuh",
     _SOURCE_DIR / "v2_sm100_paged_mqa_logits.cuh",
+    _TOPK_V1,
+    _TOPK_IMPL,
 )
 
 
@@ -92,12 +96,17 @@ def load_clustered_mqa_extension():
         return load(
             name=module_name,
             sources=[str(path) for path in _SOURCES],
-            extra_include_paths=[str(_SOURCE_DIR), str(deep_gemm_include)],
-            extra_cflags=["-O3", "-std=c++17"],
+            extra_include_paths=[
+                str(_SOURCE_DIR),
+                str(deep_gemm_include),
+                str(_HERE.parent / "include"),
+            ],
+            extra_cflags=["-O3", "-std=c++20"],
             extra_cuda_cflags=[
                 "-O3",
-                "-std=c++17",
+                "-std=c++20",
                 "-lineinfo",
+                f"-DSGL_CUDA_ARCH={capability[0] * 100 + capability[1] * 10}",
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
             ],
@@ -195,9 +204,57 @@ def clustered_fp8_paged_mqa_logits(
     )
 
 
+def clustered_fp8_paged_mqa_topk(
+    *,
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    metadata: ClusteredMqaMetadata,
+    page_table: torch.Tensor,
+    page_indices: torch.Tensor,
+    raw_indices: torch.Tensor,
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    full_seq_lens: torch.Tensor,
+    swa_gather_lens: torch.Tensor,
+    compressed_base: torch.Tensor,
+    swa_base: torch.Tensor,
+    combined_indices: torch.Tensor,
+    combined_lens: torch.Tensor,
+) -> None:
+    """Submit clustered logits and exact radix top-k through one C++ entry."""
+
+    if q.shape != (metadata.total_q, HEADS, HEAD_DIM):
+        raise RuntimeError(
+            f"clustered DSV4 MQA Q must be [M,64,128], got {tuple(q.shape)}"
+        )
+    metadata.extension.forward_topk(
+        q,
+        kv_cache,
+        weights,
+        metadata.seq_lens,
+        metadata.page_table,
+        metadata.schedule,
+        metadata.logits_workspace,
+        page_table,
+        page_indices,
+        raw_indices,
+        positions,
+        query_start_loc,
+        full_seq_lens,
+        swa_gather_lens,
+        compressed_base,
+        swa_base,
+        combined_indices,
+        combined_lens,
+        metadata.max_context,
+    )
+
+
 __all__ = [
     "ClusteredMqaMetadata",
     "clustered_fp8_paged_mqa_logits",
+    "clustered_fp8_paged_mqa_topk",
     "load_clustered_mqa_extension",
     "prepare_clustered_mqa_metadata",
 ]

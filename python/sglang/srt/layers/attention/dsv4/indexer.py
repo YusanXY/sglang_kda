@@ -701,16 +701,54 @@ class C4IndexerBackendMixin:
             if self.dsv4_huge_mode and clustered_metadata is not None:
                 if not isinstance(q_indexer, torch.Tensor):
                     raise RuntimeError("dsv4 huge clustered MQA requires FP8 Q")
+                if get_global_indexer_capturer() is not None:
+                    raise RuntimeError(
+                        "dsv4 huge clustered MQA does not support index capture"
+                    )
+                if self.hisparse_coordinator is not None:
+                    raise RuntimeError(
+                        "dsv4 huge clustered MQA does not support HiSparse"
+                    )
+                if self.debug_use_external_c4_sparse_indices:
+                    raise RuntimeError(
+                        "dsv4 huge clustered MQA does not support external C4 indices"
+                    )
+                cache = metadata.sparse_prefill_cache
+                if cache is None:
+                    raise RuntimeError(
+                        "huge C4 indexer requires sparse-prefill geometry to be "
+                        "planned before layer execution"
+                    )
+                raw_indices = core_metadata.c4_sparse_raw_indices
+                if raw_indices is None:
+                    raise RuntimeError(
+                        "huge C4 indexer requires the raw-index output buffer"
+                    )
+                combined_indices, combined_lens = (
+                    cache.get_fused_c4_epilogue_outputs()
+                )
                 from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
-                    clustered_fp8_paged_mqa_logits,
+                    clustered_fp8_paged_mqa_topk,
                 )
 
-                logits = clustered_fp8_paged_mqa_logits(
+                clustered_fp8_paged_mqa_topk(
                     q=q_indexer,
                     kv_cache=c4_indexer_kv_cache,
                     weights=weights,
                     metadata=clustered_metadata,
+                    page_table=page_table,
+                    page_indices=c4_sparse_page_indices,
+                    raw_indices=raw_indices,
+                    positions=positions,
+                    query_start_loc=cache.query_start_loc,
+                    full_seq_lens=cache.seq_lens,
+                    swa_gather_lens=cache.swa_gather_lens,
+                    compressed_base=cache.c4_compressed_base,
+                    swa_base=cache.c4_swa_base,
+                    combined_indices=combined_indices,
+                    combined_lens=combined_lens,
                 )
+                return
             elif kda_paged_mqa_logits is not None:
                 logits = kda_paged_mqa_logits(
                     q=q,
