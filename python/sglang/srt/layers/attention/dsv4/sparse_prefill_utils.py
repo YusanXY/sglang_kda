@@ -343,25 +343,13 @@ class SparsePrefillChunkCache:
         swa_page_size: int,
         num_qo_tokens: int,
         max_seq_len: int,
-        strict_batch1_gpu_only: bool = False,
+        total_swa_hint: Optional[int] = None,
     ) -> "SparsePrefillChunkCache":
         device = seq_lens.device
         num_reqs = seq_lens.shape[0]
 
         query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
         query_start_loc[1:] = torch.cumsum(extend_seq_lens, dim=0).to(torch.int32)
-
-        total_swa_hint = None
-        if strict_batch1_gpu_only:
-            if num_reqs != 1:
-                raise RuntimeError(
-                    "strict huge sparse-prefill metadata requires batch=1"
-                )
-            total_swa_hint = strict_batch1_swa_token_count(
-                num_qo_tokens,
-                max_seq_len,
-                swa_window_size,
-            )
 
         swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets = (
             build_swa_token_ids(
@@ -522,17 +510,7 @@ class SparsePrefillChunkCache:
         buffers across layers — the kernel only overwrites the valid prefix.
         """
         topk = c4_sparse_raw_indices.shape[-1]
-        if self.c4_combined_indices is None:
-            device = self.seq_lens.device
-            self.c4_combined_indices = torch.full(
-                (self.num_qo_tokens, combined_topk_width(topk, self.swa_window_size)),
-                -1,
-                dtype=torch.int32,
-                device=device,
-            )
-            self.c4_combined_lens = torch.zeros(
-                self.num_qo_tokens, dtype=torch.int32, device=device
-            )
+        self.ensure_c4_combined_outputs(topk)
         return combine_topk_swa_indices(
             topk_indices=c4_sparse_raw_indices,
             query_start_loc=self.query_start_loc,
@@ -546,3 +524,37 @@ class SparsePrefillChunkCache:
             out_indices=self.c4_combined_indices,
             out_lens=self.c4_combined_lens,
         )
+
+    def ensure_c4_combined_outputs(self, topk: int) -> None:
+        """Allocate the model-scoped C4 epilogue outputs once per chunk.
+
+        Huge mode passes these buffers directly to the CUDA top-k kernel. The
+        native path keeps using :meth:`combine_c4_layer`, which calls this
+        allocator before launching the standalone Triton combiner.
+        """
+        if self.c4_combined_indices is None:
+            device = self.seq_lens.device
+            self.c4_combined_indices = torch.full(
+                (self.num_qo_tokens, combined_topk_width(topk, self.swa_window_size)),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.c4_combined_lens = torch.zeros(
+                self.num_qo_tokens, dtype=torch.int32, device=device
+            )
+        else:
+            assert self.c4_combined_indices.shape == (
+                self.num_qo_tokens,
+                combined_topk_width(topk, self.swa_window_size),
+            )
+            assert self.c4_combined_lens.shape == (self.num_qo_tokens,)
+
+    def get_fused_c4_epilogue_outputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return outputs written in-place by the fused CUDA top-k epilogue."""
+        if self.c4_combined_indices is None or self.c4_combined_lens is None:
+            raise RuntimeError(
+                "fused C4 top-k epilogue outputs were not allocated during "
+                "huge-kernel metadata planning"
+            )
+        return self.c4_combined_indices, self.c4_combined_lens

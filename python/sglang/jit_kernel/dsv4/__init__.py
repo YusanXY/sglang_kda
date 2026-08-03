@@ -30,6 +30,7 @@ from .moe import (
     silu_and_mul_contig_post_quant,
     silu_and_mul_masked_post_quant,
 )
+from .paged_dequant import dual_paged_dequantize_k_cache_bf16
 from .topk import plan_topk_v2, topk_transform_512, topk_transform_512_v2
 from .utils import make_name
 
@@ -58,6 +59,7 @@ __all__ = [
     "plan_topk_v2",
     "hash_topk",
     "mega_moe_pre_dispatch",
+    "dual_paged_dequantize_k_cache_bf16",
     "mask_topk_ids",
     "silu_and_mul_clamp",
     "silu_and_mul_masked_post_quant",

@@ -49,7 +49,8 @@ def _sample(root, ordinal, backend, *, huge_ttft=0.8, hit_rate=0.9412):
     log.write_text(
         "Warming up cache with 94.1% hit rate (65536 tokens per request)\n"
         "Cache warmup completed\n"
-        "Prefill batch, #new-token: 4096, #cached-token: 65536, cuda graph: False\n"
+        "Prefill batch, #new-seq: 1, #new-token: 4096, "
+        "#cached-token: 65536, cuda graph: False\n"
         f"DSV4 worker backend active: {backend}\n",
         encoding="utf-8",
     )

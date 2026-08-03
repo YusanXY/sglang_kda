@@ -21,6 +21,9 @@ from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_m
 
 CompressRatio = Literal[0, 4, 128]
 
+_MAX_FORWARD_TOKENS = 4096
+_MAX_FORWARD_REQUESTS = 16
+
 # This is model identity, not a generic V4 default.  Fail rather than silently
 # running a different architecture through a shape-specialized executor.
 _DSV4_FLASH_RATIOS: tuple[int, ...] = (
@@ -131,12 +134,11 @@ class DSV4WholeLayerRuntime:
         self._generation = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
         self._active: Optional[DSV4ForwardDescriptor] = None
-        # Exactly one live shape: the formal benchmark settles at T=4096 and
-        # then performs no per-layer or per-batch allocator calls.  Rebuild on
-        # a shape change instead of leaking one large workspace per observed T.
+        # One fixed-capacity allocation serves both req=1 and req<=16. Views are
+        # exact-T and contiguous, so changing the per-request split never calls
+        # the CUDA allocator or changes any layer ABI.
         self._wo_a_workspace: Optional[
             tuple[
-                int,
                 torch.device,
                 torch.Tensor,
                 torch.Tensor,
@@ -223,14 +225,26 @@ class DSV4WholeLayerRuntime:
             )
         batch_size = int(forward_batch.req_pool_indices.shape[0])
         num_tokens = int(positions.shape[0])
-        if batch_size != 1:
+        if not 1 <= batch_size <= _MAX_FORWARD_REQUESTS:
             raise RuntimeError(
-                f"DSV4 huge runtime requires batch_size=1, got {batch_size}"
+                "DSV4 huge runtime requires 1..16 requests per EXTEND, "
+                f"got {batch_size}"
             )
-        if not 1 <= num_tokens <= 4096:
+        if not 1 <= num_tokens <= _MAX_FORWARD_TOKENS:
             raise RuntimeError(
-                "DSV4 huge runtime requires 1..4096 live prefill tokens, "
+                "DSV4 huge runtime requires aggregate M in 1..4096, "
                 f"got {num_tokens}"
+            )
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        if extend_lens is None or len(extend_lens) != batch_size:
+            raise RuntimeError(
+                "DSV4 huge runtime requires one host-mirrored EXTEND length "
+                "per request; GPU length readback is forbidden"
+            )
+        if sum(int(length) for length in extend_lens) != num_tokens:
+            raise RuntimeError(
+                "DSV4 huge runtime requires sum(extend_seq_lens_cpu) == M; "
+                f"got {extend_lens!r} for M={num_tokens}"
             )
         if input_ids.shape[0] != num_tokens:
             raise RuntimeError(
@@ -280,52 +294,56 @@ class DSV4WholeLayerRuntime:
         workspace = self._wo_a_workspace
         if workspace is not None:
             (
-                cached_tokens,
                 cached_device,
                 attention_q_padded,
                 output_q,
                 output_s_storage,
                 wo_a_gemm_output,
             ) = workspace
-            if cached_tokens == num_tokens and cached_device == device:
+            if cached_device == device:
                 return (
-                    attention_q_padded,
-                    output_q,
-                    output_s_storage,
-                    wo_a_gemm_output,
+                    attention_q_padded[:num_tokens],
+                    output_q[:num_tokens],
+                    output_s_storage[: 2 * num_tokens * 32].view(2, num_tokens, 32),
+                    wo_a_gemm_output[:num_tokens],
                 )
-        # Decoder layers execute serially on the same stream, so exact-T
-        # attention/WO buffers can be model-scoped scratch instead of three
-        # fresh allocator calls in each of the 43 layers.
+        # Decoder layers execute serially on one stream. Allocate the supported
+        # aggregate-M capacity once; exact-T prefix views remain contiguous.
         attention_q_padded = torch.empty(
-            (num_tokens, 64, 512),
+            (_MAX_FORWARD_TOKENS, 64, 512),
             dtype=torch.bfloat16,
             device=device,
         )
         output_q = torch.empty(
-            (num_tokens, 2, 4096),
+            (_MAX_FORWARD_TOKENS, 2, 4096),
             dtype=torch.float8_e4m3fn,
             device=device,
         )
+        # Keep this flat so [2,T,32] can be an exact contiguous view for every
+        # T. Slicing a [2,capacity,32] tensor on dim 1 would not be contiguous.
         output_s_storage = torch.empty(
-            (2, num_tokens, 32),
+            (2 * _MAX_FORWARD_TOKENS * 32,),
             dtype=torch.float32,
             device=device,
         )
         wo_a_gemm_output = torch.empty(
-            (num_tokens, 2, 1024),
+            (_MAX_FORWARD_TOKENS, 2, 1024),
             dtype=torch.bfloat16,
             device=device,
         )
         self._wo_a_workspace = (
-            num_tokens,
             device,
             attention_q_padded,
             output_q,
             output_s_storage,
             wo_a_gemm_output,
         )
-        return attention_q_padded, output_q, output_s_storage, wo_a_gemm_output
+        return (
+            attention_q_padded[:num_tokens],
+            output_q[:num_tokens],
+            output_s_storage[: 2 * num_tokens * 32].view(2, num_tokens, 32),
+            wo_a_gemm_output[:num_tokens],
+        )
 
     def execute_layer(
         self,

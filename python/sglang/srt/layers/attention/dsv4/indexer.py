@@ -737,7 +737,37 @@ class C4IndexerBackendMixin:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
         kda_topk_transform = get_kda_operator("deepseek_v4.topk_transform")
-        if kda_topk_transform is not None:
+        if self.dsv4_huge_mode:
+            cache = metadata.sparse_prefill_cache
+            if cache is None:
+                raise RuntimeError(
+                    "huge C4 indexer requires sparse-prefill geometry to be "
+                    "planned before layer execution"
+                )
+            if raw_indices is None:
+                raise RuntimeError(
+                    "huge C4 indexer requires the raw-index output buffer"
+                )
+            combined_indices, combined_lens = (
+                cache.get_fused_c4_epilogue_outputs()
+            )
+            topk_transform_512(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
+                positions=positions,
+                query_start_loc=cache.query_start_loc,
+                full_seq_lens=cache.seq_lens,
+                swa_gather_lens=cache.swa_gather_lens,
+                compressed_base=cache.c4_compressed_base,
+                swa_base=cache.c4_swa_base,
+                combined_indices=combined_indices,
+                combined_lens=combined_lens,
+            )
+        elif kda_topk_transform is not None:
             kda_topk_transform(
                 scores=logits,
                 seq_lens=c4_seq_lens,

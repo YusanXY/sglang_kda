@@ -48,7 +48,20 @@ def _stats(values: list[float]) -> dict[str, float | int]:
     }
 
 
-def summarize(manifest: Path, min_pairs: int, tolerance: float) -> dict:
+def summarize(
+    manifest: Path,
+    min_pairs: int,
+    tolerance: float,
+    *,
+    expected_batch_size: int = EXPECTED_BATCH_SIZE,
+    expected_cached_history: int = EXPECTED_CACHED_HISTORY,
+    expected_new_per_request: int = EXPECTED_NEW_CHUNK,
+    expected_output_len: int = EXPECTED_OUTPUT_LEN,
+    require_shape_warmup: bool = False,
+) -> dict:
+    expected_input_len = expected_cached_history + expected_new_per_request
+    expected_cache_hit_rate = expected_cached_history / expected_input_len
+    expected_aggregate_new = expected_batch_size * expected_new_per_request
     rows = _read_manifest(manifest)
     ordinals = [int(row["ordinal"]) for row in rows]
     if ordinals != list(range(1, len(rows) + 1)):
@@ -70,7 +83,15 @@ def summarize(manifest: Path, min_pairs: int, tolerance: float) -> dict:
     samples = []
     for row in rows:
         checked = validate(
-            Path(row["result"]), Path(row["log"]), row["backend"], tolerance
+            Path(row["result"]),
+            Path(row["log"]),
+            row["backend"],
+            tolerance,
+            expected_batch_size=expected_batch_size,
+            expected_cached_history=expected_cached_history,
+            expected_new_per_request=expected_new_per_request,
+            expected_output_len=expected_output_len,
+            require_shape_warmup=require_shape_warmup,
         )
         checked["pair"] = int(row["pair"])
         checked["ordinal"] = int(row["ordinal"])
@@ -115,16 +136,19 @@ def summarize(manifest: Path, min_pairs: int, tolerance: float) -> dict:
             "wins_gate_passed": wins_gate,
         },
         "semantics": {
-            "batch_size": EXPECTED_BATCH_SIZE,
-            "cached_history": EXPECTED_CACHED_HISTORY,
-            "new_chunk": EXPECTED_NEW_CHUNK,
-            "input_len": EXPECTED_INPUT_LEN,
-            "output_len": EXPECTED_OUTPUT_LEN,
-            "expected_cache_hit_rate": EXPECTED_CACHE_HIT_RATE,
+            "batch_size": expected_batch_size,
+            "cached_history": expected_cached_history,
+            "cached_history_per_request": expected_cached_history,
+            "new_chunk": expected_aggregate_new,
+            "new_tokens_per_request": expected_new_per_request,
+            "aggregate_new_tokens": expected_aggregate_new,
+            "input_len": expected_input_len,
+            "output_len": expected_output_len,
+            "expected_cache_hit_rate": expected_cache_hit_rate,
         },
         "backend_ttft": {"native": native_stats, "huge_kernel": huge_stats},
         "incremental_throughput_4096_tokens_per_second": {
-            backend: _stats([EXPECTED_NEW_CHUNK / value for value in values])
+            backend: _stats([expected_aggregate_new / value for value in values])
             for backend, values in by_backend.items()
         },
         "paired_speedup": _stats([row["speedup"] for row in paired]),
@@ -142,12 +166,18 @@ def _markdown(summary: dict) -> str:
     gate = summary["acceptance_gate"]
     speedup = summary["paired_speedup"]
     inc = summary["incremental_throughput_4096_tokens_per_second"]
+    semantics = summary["semantics"]
     lines = [
         "# DSV4 incremental-prefill TTFT comparison",
         "",
         f"Formal status: **{summary['status']}**",
         "",
-        "Semantic gate: batch=1, 65536 cached tokens, 4096 new tokens, output=1.",
+        "Semantic gate: "
+        f"batch={semantics['batch_size']}, "
+        f"cached/request={semantics['cached_history_per_request']}, "
+        f"new/request={semantics['new_tokens_per_request']}, "
+        f"aggregate new={semantics['aggregate_new_tokens']}, "
+        f"output={semantics['output_len']}.",
         "",
         "| backend | n | mean TTFT (s) | median TTFT (s) | median 4K throughput (token/s) |",
         "|---|---:|---:|---:|---:|",
@@ -175,8 +205,26 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--min-pairs", type=int, default=5)
     parser.add_argument("--cache-hit-tolerance", type=float, default=0.01)
+    parser.add_argument("--batch-size", type=int, default=EXPECTED_BATCH_SIZE)
+    parser.add_argument(
+        "--cached-history-per-request", type=int, default=EXPECTED_CACHED_HISTORY
+    )
+    parser.add_argument(
+        "--new-tokens-per-request", type=int, default=EXPECTED_NEW_CHUNK
+    )
+    parser.add_argument("--output-len", type=int, default=EXPECTED_OUTPUT_LEN)
+    parser.add_argument("--require-shape-warmup", action="store_true")
     args = parser.parse_args()
-    summary = summarize(args.manifest, args.min_pairs, args.cache_hit_tolerance)
+    summary = summarize(
+        args.manifest,
+        args.min_pairs,
+        args.cache_hit_tolerance,
+        expected_batch_size=args.batch_size,
+        expected_cached_history=args.cached_history_per_request,
+        expected_new_per_request=args.new_tokens_per_request,
+        expected_output_len=args.output_len,
+        require_shape_warmup=args.require_shape_warmup,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"

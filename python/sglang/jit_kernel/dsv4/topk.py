@@ -49,15 +49,49 @@ def topk_transform_512(
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
+    *,
+    positions: Optional[torch.Tensor] = None,
+    query_start_loc: Optional[torch.Tensor] = None,
+    full_seq_lens: Optional[torch.Tensor] = None,
+    swa_gather_lens: Optional[torch.Tensor] = None,
+    compressed_base: Optional[torch.Tensor] = None,
+    swa_base: Optional[torch.Tensor] = None,
+    combined_indices: Optional[torch.Tensor] = None,
+    combined_lens: Optional[torch.Tensor] = None,
 ) -> None:
+    sparse_args = (
+        positions,
+        query_start_loc,
+        full_seq_lens,
+        swa_gather_lens,
+        compressed_base,
+        swa_base,
+        combined_indices,
+        combined_lens,
+    )
+    has_sparse_epilogue = combined_indices is not None
+    if any(value is not None for value in sparse_args) and not all(
+        value is not None for value in sparse_args
+    ):
+        raise ValueError(
+            "sparse-prefill topk epilogue tensors must all be provided together"
+        )
     if is_hip_runtime():
+        if has_sparse_epilogue:
+            raise RuntimeError("sparse-prefill topk epilogue requires CUDA")
         torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
     else:
         module = _jit_topk_v1_module(out_page_indices.shape[1])
         module.topk_transform(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+            out_raw_indices,
+            *sparse_args,
         )
 
 

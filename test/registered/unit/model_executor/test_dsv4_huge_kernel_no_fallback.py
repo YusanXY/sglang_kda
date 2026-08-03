@@ -75,6 +75,7 @@ def test_model_runner_rejects_invalid_forward_before_native_runner_executes():
         global_forward_mode=ForwardMode.DECODE,
         batch_size=1,
         extend_num_tokens=None,
+        extend_seq_lens_cpu=None,
     )
 
     with mock.patch.object(ModelRunner, "forward") as native_forward:

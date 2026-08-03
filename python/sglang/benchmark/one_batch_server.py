@@ -134,6 +134,8 @@ class BenchArgs:
     append_to_github_summary: bool = True
     seed: int = 42
     cache_hit_rate: float = 0.0
+    share_cached_prefix_across_batch: bool = False
+    warmup_cached_prefill_shape: bool = False
     backend: str = "sglang"
     fake_prefill: bool = False
     server_args_for_metrics: Optional[List[str]] = None
@@ -141,6 +143,7 @@ class BenchArgs:
     lora_request_distribution: str = "uniform"
     lora_zipf_alpha: float = 1.1
     enable_multi_batch: bool = False
+    request_timeout: float = DEFAULT_TIMEOUT
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -178,6 +181,15 @@ class BenchArgs:
             ),
         )
         parser.add_argument("--skip-warmup", action="store_true")
+        parser.add_argument(
+            "--request-timeout",
+            type=float,
+            default=BenchArgs.request_timeout,
+            help=(
+                "HTTP request timeout in seconds. Increase this for the first "
+                "cold-compilation request of very large models."
+            ),
+        )
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
         parser.add_argument(
@@ -284,6 +296,24 @@ class BenchArgs:
             default=BenchArgs.cache_hit_rate,
             help="Cache hit rate for benchmarking (0.0-1.0). "
             "0.0 means no cache hits (flush all), 0.4 means 40%% of input tokens are cached.",
+        )
+        parser.add_argument(
+            "--share-cached-prefix-across-batch",
+            action="store_true",
+            help=(
+                "Make the cache-hit prefix identical across requests while "
+                "keeping each request's uncached suffix unchanged. This is "
+                "useful for deterministic multi-request cached-prefill shapes."
+            ),
+        )
+        parser.add_argument(
+            "--warmup-cached-prefill-shape",
+            action="store_true",
+            help=(
+                "After populating the prefix cache, run one full cached-prefill "
+                "shape with a deliberately different first suffix token. The "
+                "measured request still matches only the requested prefix."
+            ),
         )
         parser.add_argument(
             "--backend",
@@ -411,6 +441,7 @@ def _warmup_cache(
     image_data: Optional[List] = None,
     backend: str = "sglang",
     model_name: Optional[str] = None,
+    warmup_cached_prefill_shape: bool = False,
 ):
     """Warm up the cache by sending prefix tokens to populate the radix/prefix cache.
 
@@ -466,6 +497,52 @@ def _warmup_cache(
     )
     warmup_response.raise_for_status()
     print("Cache warmup completed")
+
+    if warmup_cached_prefill_shape:
+        if cached_token_len >= min(len(ids) for ids in input_ids):
+            raise ValueError(
+                "--warmup-cached-prefill-shape requires at least one uncached "
+                "suffix token per request"
+            )
+        final_first_suffix_tokens = {
+            ids[cached_token_len] for ids in input_ids
+        }
+        marker = next(
+            (
+                token
+                for ids in input_ids
+                for token in ids[:cached_token_len]
+                if token not in final_first_suffix_tokens
+            ),
+            None,
+        )
+        if marker is None:
+            raise ValueError(
+                "could not find a valid prefix token distinct from every "
+                "request's first suffix token"
+            )
+        shape_warmup_input_ids = []
+        for ids in input_ids:
+            warm_ids = list(ids)
+            warm_ids[cached_token_len] = marker
+            shape_warmup_input_ids.append(warm_ids)
+        shape_warmup_payload = dict(cache_warmup_payload)
+        if backend == "vllm":
+            shape_warmup_payload["prompt"] = shape_warmup_input_ids
+        else:
+            shape_warmup_payload["input_ids"] = shape_warmup_input_ids
+        print(
+            "Warming exact cached-prefill shape with a non-matching suffix "
+            f"({len(input_ids)} requests, "
+            f"{sum(len(ids) - cached_token_len for ids in input_ids)} new tokens)"
+        )
+        shape_response = requests.post(
+            gen_url,
+            json=shape_warmup_payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        shape_response.raise_for_status()
+        print("Cached-prefill shape warmup completed")
 
 
 def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
@@ -547,6 +624,8 @@ def run_one_case(
     dataset_path: str = BenchArgs.dataset_path,
     parallel_batch: bool = False,
     cache_hit_rate: float = BenchArgs.cache_hit_rate,
+    share_cached_prefix_across_batch: bool = False,
+    warmup_cached_prefill_shape: bool = False,
     backend: str = "sglang",
     model_name: Optional[str] = None,
     gsp_num_groups: int = BenchArgs.gsp_num_groups,
@@ -620,6 +699,22 @@ def run_one_case(
         else:
             input_ids = [req.prompt for req in input_requests]
             image_data = None
+
+    if share_cached_prefix_across_batch:
+        if not 0.0 < cache_hit_rate <= 1.0:
+            raise ValueError(
+                "--share-cached-prefix-across-batch requires "
+                "--cache-hit-rate in (0, 1]"
+            )
+        cached_token_len = int(input_len * cache_hit_rate)
+        if cached_token_len <= 0:
+            raise ValueError("shared cached prefix must contain at least one token")
+        if any(len(ids) < cached_token_len for ids in input_ids):
+            raise ValueError(
+                "every request must be at least as long as the shared cached prefix"
+            )
+        shared_prefix = list(input_ids[0][:cached_token_len])
+        input_ids = [shared_prefix + list(ids[cached_token_len:]) for ids in input_ids]
 
     # Build payload based on backend
     if backend == "vllm":
@@ -705,6 +800,7 @@ def run_one_case(
             image_data=image_data,
             backend=backend,
             model_name=model_name,
+            warmup_cached_prefill_shape=warmup_cached_prefill_shape,
         )
 
     # Turn on profiler
@@ -938,6 +1034,13 @@ def run_benchmark_internal(
     bench_args: BenchArgs,
     launch_server_func: Callable = launch_server,
 ):
+    global DEFAULT_TIMEOUT
+    if bench_args.request_timeout <= 0:
+        raise ValueError(
+            f"--request-timeout must be positive, got {bench_args.request_timeout}"
+        )
+    DEFAULT_TIMEOUT = bench_args.request_timeout
+
     # set random seed
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
@@ -1133,6 +1236,12 @@ def run_benchmark_internal(
                     dataset_path=bench_args.dataset_path,
                     parallel_batch=bench_args.parallel_batch,
                     cache_hit_rate=bench_args.cache_hit_rate,
+                    share_cached_prefix_across_batch=(
+                        bench_args.share_cached_prefix_across_batch
+                    ),
+                    warmup_cached_prefill_shape=(
+                        bench_args.warmup_cached_prefill_shape
+                    ),
                     backend=bench_args.backend,
                     model_name=model_name,
                     fake_prefill=bench_args.fake_prefill,
@@ -1182,6 +1291,12 @@ def run_benchmark_internal(
                             dataset_path=bench_args.dataset_path,
                             parallel_batch=bench_args.parallel_batch,
                             cache_hit_rate=bench_args.cache_hit_rate,
+                            share_cached_prefix_across_batch=(
+                                bench_args.share_cached_prefix_across_batch
+                            ),
+                            warmup_cached_prefill_shape=(
+                                bench_args.warmup_cached_prefill_shape
+                            ),
                             profile=bench_args.profile,
                             profile_activities=bench_args.profile_activities,
                             profile_start_step=bench_args.profile_start_step,

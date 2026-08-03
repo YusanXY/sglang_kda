@@ -25,10 +25,64 @@ struct TopKParams {
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
   int32_t* __restrict__ raw_indices;  // optional: output raw abs position indices before page transform
+  const int32_t* __restrict__ positions;          // optional sparse-prefill epilogue
+  const int32_t* __restrict__ query_start_loc;
+  const int32_t* __restrict__ full_seq_lens;
+  const int32_t* __restrict__ swa_gather_lens;
+  const int32_t* __restrict__ compressed_base;
+  const int32_t* __restrict__ swa_base;
+  int32_t* __restrict__ combined_indices;
+  int32_t* __restrict__ combined_lens;
   const int64_t score_stride;
   const int64_t page_table_stride;
+  const int64_t combined_indices_stride;
+  uint32_t num_reqs;
   uint32_t page_bits;
 };
+
+constexpr uint32_t kSparsePrefillSWAWindow = 128;
+
+SGL_DEVICE uint32_t query_owner(
+    const int32_t* __restrict__ query_start_loc,
+    const uint32_t work_id,
+    const uint32_t num_reqs) {
+  const int32_t base = query_start_loc[0];
+#pragma unroll 16
+  for (uint32_t req = 0; req < num_reqs; ++req) {
+    if (work_id < static_cast<uint32_t>(query_start_loc[req + 1] - base)) {
+      return req;
+    }
+  }
+  return num_reqs - 1;
+}
+
+SGL_DEVICE void sparse_prefill_epilogue(
+    const TopKParams& params,
+    const uint32_t work_id,
+    const uint32_t compressed_seq_len,
+    const uint32_t req,
+    const int32_t* __restrict__ raw_indices_ptr) {
+  const int32_t pos = params.positions[work_id];
+  const uint32_t topk_len = compressed_seq_len < kTopK ? compressed_seq_len : kTopK;
+  const uint32_t swa_len = static_cast<uint32_t>(pos + 1) < kSparsePrefillSWAWindow
+      ? static_cast<uint32_t>(pos + 1)
+      : kSparsePrefillSWAWindow;
+  const int32_t gather_start = params.full_seq_lens[req] - params.swa_gather_lens[req];
+  auto* row = params.combined_indices + work_id * params.combined_indices_stride;
+  const uint32_t tx = threadIdx.x;
+
+  if (tx < topk_len) {
+    row[tx] = raw_indices_ptr[tx] + params.compressed_base[req];
+  }
+  if (tx < swa_len) {
+    row[topk_len + tx] =
+        params.swa_base[req] + static_cast<int32_t>(tx) + pos -
+        static_cast<int32_t>(swa_len) + 1 - gather_start;
+  }
+  if (tx == 0) {
+    params.combined_lens[work_id] = static_cast<int32_t>(topk_len + swa_len);
+  }
+}
 
 SGL_DEVICE uint8_t convert_to_uint8(float x) {
   __half h = __float2half_rn(x);
@@ -230,8 +284,11 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
 template <bool kUsePDL>
 __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params) {
   const auto &[
-    scores, seq_lens, page_table, page_indices, raw_indices, // pointers
-    score_stride, page_table_stride, page_bits // sizes
+    scores, seq_lens, page_table, page_indices, raw_indices,
+    positions, query_start_loc, full_seq_lens, swa_gather_lens,
+    compressed_base, swa_base, combined_indices, combined_lens, // pointers
+    score_stride, page_table_stride, combined_indices_stride,
+    num_reqs, page_bits // sizes
   ] = params;
   const uint32_t work_id = blockIdx.x;
 
@@ -241,22 +298,39 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
   const auto page_ptr = page_table + work_id * page_table_stride;
   const auto indices_ptr = page_indices + work_id * kTopK;
   const auto raw_indices_ptr = raw_indices != nullptr ? raw_indices + work_id * kTopK : nullptr;
+  const auto tx = threadIdx.x;
+  __shared__ int32_t s_topk_indices[kTopK];
+  __shared__ uint32_t s_query_owner;
+  const int32_t* epilogue_indices_ptr = raw_indices_ptr;
 
   device::PDLWaitPrimary<kUsePDL>();
 
   if (seq_len <= kTopK) {
     naive_transform(score_ptr, page_ptr, indices_ptr, raw_indices_ptr, seq_len, page_bits);
   } else {
-    __shared__ int32_t s_topk_indices[kTopK];
     radix_topk(score_ptr, s_topk_indices, seq_len);
     static_assert(kTopK <= kTopKBlockSize);
-    const auto tx = threadIdx.x;
     if (kTopK == kTopKBlockSize || tx < kTopK) {
       indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], page_bits);
       if (raw_indices_ptr != nullptr) {
         raw_indices_ptr[tx] = s_topk_indices[tx];
       }
     }
+    // The selected positions already live in this CTA's shared memory.  Feed
+    // them directly to the fused sparse-prefill epilogue instead of writing
+    // then re-reading the raw-index tensor through global memory.
+    epilogue_indices_ptr = s_topk_indices;
+  }
+
+  if (combined_indices != nullptr) {
+    // Resolve the request owner once per CTA.  This barrier also publishes the
+    // selected positions on the short (seq_len <= top-k) global-output path.
+    if (tx == 0) {
+      s_query_owner = query_owner(query_start_loc, work_id, num_reqs);
+    }
+    __syncthreads();
+    sparse_prefill_epilogue(
+        params, work_id, seq_len, s_query_owner, epilogue_indices_ptr);
   }
 
   device::PDLTriggerSecondary<kUsePDL>();
@@ -282,7 +356,15 @@ struct TopKKernel {
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> positions,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> query_start_loc,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> full_seq_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> swa_gather_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> compressed_base,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> swa_base,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> combined_indices,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> combined_lens) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto S = SymbolicSize{"score_stride"};
@@ -318,6 +400,64 @@ struct TopKKernel {
       raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
     }
 
+    const bool sparse_epilogue = combined_indices.has_value();
+    RuntimeCheck(
+        sparse_epilogue == positions.has_value() &&
+            sparse_epilogue == query_start_loc.has_value() &&
+            sparse_epilogue == full_seq_lens.has_value() &&
+            sparse_epilogue == swa_gather_lens.has_value() &&
+            sparse_epilogue == compressed_base.has_value() &&
+            sparse_epilogue == swa_base.has_value() &&
+            sparse_epilogue == combined_lens.has_value(),
+        "sparse-prefill topk epilogue tensors must be provided together");
+    RuntimeCheck(
+        !sparse_epilogue || raw_indices_ptr != nullptr,
+        "sparse-prefill topk epilogue requires raw_indices output");
+
+    const int32_t* positions_ptr = nullptr;
+    const int32_t* query_start_loc_ptr = nullptr;
+    const int32_t* full_seq_lens_ptr = nullptr;
+    const int32_t* swa_gather_lens_ptr = nullptr;
+    const int32_t* compressed_base_ptr = nullptr;
+    const int32_t* swa_base_ptr = nullptr;
+    int32_t* combined_indices_ptr = nullptr;
+    int32_t* combined_lens_ptr = nullptr;
+    int64_t combined_indices_stride = 0;
+    uint32_t num_reqs = 0;
+    if (sparse_epilogue) {
+      auto R = SymbolicSize{"num_reqs"};
+      auto C = SymbolicSize{"combined_stride"};
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(positions.value());
+      TensorMatcher({-1}).with_dtype<int32_t>().with_device(device).verify(query_start_loc.value());
+      TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(full_seq_lens.value());
+      TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(swa_gather_lens.value());
+      TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(compressed_base.value());
+      TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(swa_base.value());
+      TensorMatcher({B, -1})
+          .with_strides({C, 1})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(combined_indices.value());
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device).verify(combined_lens.value());
+      RuntimeCheck(
+          query_start_loc.value().shape()[0] == R.unwrap() + 1,
+          "query_start_loc must have num_reqs + 1 entries");
+      RuntimeCheck(R.unwrap() > 0 && R.unwrap() <= 16, "sparse-prefill topk supports 1..16 requests");
+      RuntimeCheck(
+          combined_indices.value().shape()[1] >= kTopK + kSparsePrefillSWAWindow,
+          "combined_indices row is too narrow");
+      positions_ptr = static_cast<int32_t*>(positions.value().data_ptr());
+      query_start_loc_ptr = static_cast<int32_t*>(query_start_loc.value().data_ptr());
+      full_seq_lens_ptr = static_cast<int32_t*>(full_seq_lens.value().data_ptr());
+      swa_gather_lens_ptr = static_cast<int32_t*>(swa_gather_lens.value().data_ptr());
+      compressed_base_ptr = static_cast<int32_t*>(compressed_base.value().data_ptr());
+      swa_base_ptr = static_cast<int32_t*>(swa_base.value().data_ptr());
+      combined_indices_ptr = static_cast<int32_t*>(combined_indices.value().data_ptr());
+      combined_lens_ptr = static_cast<int32_t*>(combined_lens.value().data_ptr());
+      combined_indices_stride = C.unwrap();
+      num_reqs = static_cast<uint32_t>(R.unwrap());
+    }
+
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     const auto page_bits = static_cast<uint32_t>(std::countr_zero(page_size));
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
@@ -327,8 +467,18 @@ struct TopKKernel {
         .page_table = static_cast<int32_t*>(page_table.data_ptr()),
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .raw_indices = raw_indices_ptr,
+        .positions = positions_ptr,
+        .query_start_loc = query_start_loc_ptr,
+        .full_seq_lens = full_seq_lens_ptr,
+        .swa_gather_lens = swa_gather_lens_ptr,
+        .compressed_base = compressed_base_ptr,
+        .swa_base = swa_base_ptr,
+        .combined_indices = combined_indices_ptr,
+        .combined_lens = combined_lens_ptr,
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
+        .combined_indices_stride = combined_indices_stride,
+        .num_reqs = num_reqs,
         .page_bits = page_bits,
     };
     constexpr auto kSMEM_ = kSMEM + sizeof(int32_t);  // align up a little

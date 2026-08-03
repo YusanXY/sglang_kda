@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 DSV4_HUGE_CONTEXT_CAPACITY = 73728
 DSV4_HUGE_MAX_EXTEND_TOKENS = 4096
+DSV4_HUGE_MAX_REQUESTS = 16
+DSV4_HUGE_MAX_TOTAL_TOKENS = 393216
 DSV4_HUGE_TP_SIZE = 4
 DSV4_HUGE_EP_SIZE = 4
 DSV4_FLASH_COMPRESS_RATIOS = (0, 0) + (4, 128) * 20 + (4,)
@@ -90,8 +92,6 @@ def validate_dsv4_huge_kernel_startup(
         "attn_cp_size": 1,
         "dcp_size": 1,
         "nnodes": 1,
-        "max_running_requests": 1,
-        "max_total_tokens": DSV4_HUGE_CONTEXT_CAPACITY,
         "chunked_prefill_size": DSV4_HUGE_MAX_EXTEND_TOKENS,
         "page_size": 256,
         "moe_runner_backend": "flashinfer_mxfp4",
@@ -102,6 +102,22 @@ def validate_dsv4_huge_kernel_startup(
         actual = getattr(server_args, field)
         if actual != expected:
             errors.append(f"{field} must be {expected!r}, got {actual!r}")
+
+    if not 1 <= server_args.max_running_requests <= DSV4_HUGE_MAX_REQUESTS:
+        errors.append(
+            "max_running_requests must be in [1, "
+            f"{DSV4_HUGE_MAX_REQUESTS}], got {server_args.max_running_requests!r}"
+        )
+    if not (
+        DSV4_HUGE_CONTEXT_CAPACITY
+        <= server_args.max_total_tokens
+        <= DSV4_HUGE_MAX_TOTAL_TOKENS
+    ):
+        errors.append(
+            "max_total_tokens must be in "
+            f"[{DSV4_HUGE_CONTEXT_CAPACITY}, {DSV4_HUGE_MAX_TOTAL_TOKENS}], "
+            f"got {server_args.max_total_tokens!r}"
+        )
 
     if model_config.context_len != DSV4_HUGE_CONTEXT_CAPACITY:
         errors.append(
@@ -153,16 +169,41 @@ def validate_dsv4_huge_kernel_forward(forward_batch: ForwardBatch) -> None:
             "dsv4 huge_kernel only accepts global ForwardMode.EXTEND; "
             f"got {forward_batch.global_forward_mode!r}"
         )
-    if forward_batch.batch_size != 1:
+    batch_size = forward_batch.batch_size
+    if not 1 <= batch_size <= DSV4_HUGE_MAX_REQUESTS:
         raise ValueError(
-            "dsv4 huge_kernel only accepts batch_size=1; "
-            f"got {forward_batch.batch_size}"
+            f"dsv4 huge_kernel batch_size must be in [1, "
+            f"{DSV4_HUGE_MAX_REQUESTS}]; got {batch_size}"
         )
     num_tokens = forward_batch.extend_num_tokens
     if num_tokens is None or not 1 <= num_tokens <= DSV4_HUGE_MAX_EXTEND_TOKENS:
         raise ValueError(
-            "dsv4 huge_kernel EXTEND size must be in [1, 4096] so the 64K "
-            f"cache can be built incrementally; got {num_tokens!r}"
+            "dsv4 huge_kernel total EXTEND M must be in [1, 4096]; "
+            f"got {num_tokens!r}"
+        )
+    extend_lens = forward_batch.extend_seq_lens_cpu
+    if extend_lens is None:
+        raise ValueError(
+            "dsv4 huge_kernel requires the existing host extend-length mirror; "
+            "it will not synchronize the GPU length tensor"
+        )
+    if len(extend_lens) != batch_size:
+        raise ValueError(
+            f"extend_seq_lens_cpu has {len(extend_lens)} rows for "
+            f"batch_size={batch_size}"
+        )
+    if any(
+        not 1 <= int(length) <= DSV4_HUGE_MAX_EXTEND_TOKENS
+        for length in extend_lens
+    ):
+        raise ValueError(
+            "every huge-kernel request must contribute 1..4096 EXTEND tokens; "
+            f"got {extend_lens!r}"
+        )
+    if sum(int(length) for length in extend_lens) != num_tokens:
+        raise ValueError(
+            "sum(extend_seq_lens_cpu) must equal the total EXTEND M without a "
+            f"device readback; got lengths={extend_lens!r}, M={num_tokens}"
         )
 
 
@@ -170,8 +211,12 @@ def validate_dsv4_huge_kernel_bench_args(bench_args) -> None:
     """Fail in the parent process before bench_one_batch spawns TP workers."""
 
     errors = []
-    if tuple(bench_args.batch_size) != (1,):
-        errors.append(f"--batch-size must be exactly 1, got {bench_args.batch_size}")
+    batch_sizes = tuple(bench_args.batch_size)
+    if len(batch_sizes) != 1 or not 1 <= batch_sizes[0] <= DSV4_HUGE_MAX_REQUESTS:
+        errors.append(
+            f"--batch-size must contain one value in [1, {DSV4_HUGE_MAX_REQUESTS}], "
+            f"got {bench_args.batch_size}"
+        )
     if tuple(bench_args.output_len) != (1,):
         errors.append(
             "--output-len must be exactly 1 for prefill TTFT, "
@@ -187,6 +232,12 @@ def validate_dsv4_huge_kernel_bench_args(bench_args) -> None:
             "every --input-len must be in [1, 4096], got "
             f"{invalid_input_lens}"
         )
+    if (
+        len(batch_sizes) == 1
+        and bench_args.input_len
+        and batch_sizes[0] * max(bench_args.input_len) > DSV4_HUGE_MAX_EXTEND_TOKENS
+    ):
+        errors.append("bench_one_batch must keep aggregate M=batch*input_len <= 4096")
     if errors:
         details = "\n  - ".join(errors)
         raise ValueError(

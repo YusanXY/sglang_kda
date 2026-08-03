@@ -18,6 +18,7 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+from sglang.jit_kernel.dsv4 import dual_paged_dequantize_k_cache_bf16
 from sglang.jit_kernel.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     dequantize_k_cache_paged,
@@ -784,12 +785,38 @@ class DeepseekV4AttnBackend(
 
         c4_compress_metadata = create(compress_ratio=4)
         c128_compress_metadata = create(compress_ratio=128)
-        return DSV4Metadata(
+        metadata = DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c4_compress_metadata=c4_compress_metadata,
             c128_compress_metadata=c128_compress_metadata,
         )
+        if self.dsv4_huge_mode:
+            # Build all request geometry once, before layer 0.  In particular,
+            # the C4 top-k CUDA kernel needs the preallocated combined-index
+            # outputs and request-local bases in its epilogue.  This removes
+            # both lazy per-layer Python setup and the standalone Triton
+            # topk+SWA combine launch from every C4 layer.
+            total_swa_hint = sum(
+                min(int(seq_lens_cpu[i]), int(ext) + SWA_WINDOW - 1)
+                for i, ext in enumerate(extend_seq_lens_cpu)
+            )
+            sparse_cache = SparsePrefillChunkCache.build(
+                seq_lens=seq_lens.to(torch.int32),
+                extend_seq_lens=extend_seq_lens.to(torch.int32),
+                req_pool_indices=req_pool_indices.to(torch.int32),
+                req_to_token=self.req_to_token,
+                full_to_swa=self.token_to_kv_pool.full_to_swa_index_mapping,
+                swa_window_size=SWA_WINDOW,
+                swa_page_size=self.token_to_kv_pool.swa_window_size,
+                num_qo_tokens=num_tokens,
+                max_seq_len=max_seq_len,
+                total_swa_hint=total_swa_hint,
+            )
+            sparse_cache.ensure_c4(core_attn_metadata.page_table, self.page_size // 4)
+            sparse_cache.ensure_c4_combined_outputs(self.c4_topk)
+            metadata.sparse_prefill_cache = sparse_cache
+        return metadata
 
     def init_forward_metadata_target_verify(
         self,
@@ -1786,6 +1813,23 @@ class DeepseekV4AttnBackend(
         if cache is None:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             assert seq_lens_cpu is not None
+            total_swa_hint = None
+            if self.dsv4_huge_mode:
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                if extend_seq_lens_cpu is None or len(extend_seq_lens_cpu) != len(
+                    seq_lens_cpu
+                ):
+                    raise RuntimeError(
+                        "huge sparse-prefill requires host mirrors for every "
+                        "request length"
+                    )
+                # These mirrors already exist on the scheduler path. Computing
+                # the allocation extent here performs no GPU readback and lets
+                # batch=16 avoid swa_offsets[-1].item().
+                total_swa_hint = sum(
+                    min(int(seq_lens_cpu[i]), int(ext) + SWA_WINDOW - 1)
+                    for i, ext in enumerate(extend_seq_lens_cpu)
+                )
             # ``swa_window_size`` on the pool is its storage page size, not
             # the model's SWA window — pass both explicitly.
             cache = SparsePrefillChunkCache.build(
@@ -1798,7 +1842,7 @@ class DeepseekV4AttnBackend(
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
                 max_seq_len=int(seq_lens_cpu.max().item()),
-                strict_batch1_gpu_only=self.dsv4_huge_mode,
+                total_swa_hint=total_swa_hint,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
@@ -1829,11 +1873,16 @@ class DeepseekV4AttnBackend(
                 )
                 cache.ensure_c4(core_attn_metadata.page_table, extra_page_size)
                 flat_token_ids = cache.c4_flat_token_ids
-                combined_indices, combined_lens = cache.combine_c4_layer(
-                    c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
-                        : cache.num_qo_tokens
-                    ],
-                )
+                if self.dsv4_huge_mode:
+                    combined_indices, combined_lens = (
+                        cache.get_fused_c4_epilogue_outputs()
+                    )
+                else:
+                    combined_indices, combined_lens = cache.combine_c4_layer(
+                        c4_sparse_raw_indices=core_attn_metadata.c4_sparse_raw_indices[
+                            : cache.num_qo_tokens
+                        ],
+                    )
             n_compressed = flat_token_ids.shape[0]
             workspace = self.sparse_prefill_workspace.get(
                 n_compressed + cache.swa_token_ids.shape[0]
@@ -1841,19 +1890,35 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if compressed_slice is not None:
-            dequantize_k_cache_paged(
+        swa_k_cache = token_to_kv_pool.get_swa_key_buffer_radix(layer_id)
+        if compressed_slice is not None and self.dsv4_huge_mode:
+            if extra_k_cache is None or flat_token_ids is None:
+                raise RuntimeError(
+                    "huge compressed sparse-prefill requires both cache sources"
+                )
+            dual_paged_dequantize_k_cache_bf16(
                 extra_k_cache,
                 flat_token_ids,
-                page_size=extra_page_size,
-                out=compressed_slice,
+                extra_page_size,
+                swa_k_cache,
+                cache.swa_token_ids,
+                cache.swa_page_size,
+                workspace,
             )
-        dequantize_k_cache_paged(
-            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-            cache.swa_token_ids,
-            page_size=cache.swa_page_size,
-            out=swa_slice,
-        )
+        else:
+            if compressed_slice is not None:
+                dequantize_k_cache_paged(
+                    extra_k_cache,
+                    flat_token_ids,
+                    page_size=extra_page_size,
+                    out=compressed_slice,
+                )
+            dequantize_k_cache_paged(
+                swa_k_cache,
+                cache.swa_token_ids,
+                page_size=cache.swa_page_size,
+                out=swa_slice,
+            )
         kv = workspace
 
         kda_sparse_prefill = get_kda_operator(

@@ -87,7 +87,8 @@ def test_startup_contract_accepts_flash_b300_tp4_ep4():
     [
         ("tp_size", 8),
         ("ep_size", 1),
-        ("max_running_requests", 2),
+        ("max_running_requests", 17),
+        ("max_total_tokens", 393217),
         ("disable_overlap_schedule", False),
         ("page_size", 1),
         ("moe_runner_backend", "auto"),
@@ -146,6 +147,19 @@ def test_dynamic_contract_accepts_incremental_cache_build(num_tokens):
             global_forward_mode=ForwardMode.EXTEND,
             batch_size=1,
             extend_num_tokens=num_tokens,
+            extend_seq_lens_cpu=[num_tokens],
+        )
+    )
+
+
+def test_dynamic_contract_accepts_batch16_aggregate_m4096():
+    validate_dsv4_huge_kernel_forward(
+        SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            global_forward_mode=ForwardMode.EXTEND,
+            batch_size=16,
+            extend_num_tokens=4096,
+            extend_seq_lens_cpu=[256] * 16,
         )
     )
 
@@ -158,18 +172,21 @@ def test_dynamic_contract_accepts_incremental_cache_build(num_tokens):
             global_forward_mode=ForwardMode.DECODE,
             batch_size=1,
             extend_num_tokens=None,
+            extend_seq_lens_cpu=None,
         ),
         SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             global_forward_mode=ForwardMode.EXTEND,
             batch_size=2,
             extend_num_tokens=4096,
+            extend_seq_lens_cpu=[2048],
         ),
         SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             global_forward_mode=ForwardMode.EXTEND,
             batch_size=1,
             extend_num_tokens=4097,
+            extend_seq_lens_cpu=[4097],
         ),
     ],
 )
@@ -190,6 +207,23 @@ def test_bench_contract_requires_single_prefill_ttft_point():
                 batch_size=(1,),
                 input_len=(4096,),
                 output_len=(2,),
+                correctness_test=False,
+            )
+        )
+    validate_dsv4_huge_kernel_bench_args(
+        SimpleNamespace(
+            batch_size=(16,),
+            input_len=(256,),
+            output_len=(1,),
+            correctness_test=False,
+        )
+    )
+    with pytest.raises(ValueError, match="aggregate M"):
+        validate_dsv4_huge_kernel_bench_args(
+            SimpleNamespace(
+                batch_size=(16,),
+                input_len=(4096,),
+                output_len=(1,),
                 correctness_test=False,
             )
         )
