@@ -692,6 +692,36 @@ def validate_correctness_output_args(bench_args) -> None:
         raise ValueError("--correctness-output-file must end in .pt")
 
 
+def _reject_stale_correctness_output(bench_args) -> None:
+    output_file = bench_args.correctness_output_file
+    if output_file and os.path.exists(output_file):
+        raise FileExistsError(
+            "refusing to reuse existing --correctness-output-file: "
+            f"{output_file}"
+        )
+
+
+def _raise_for_failed_workers(workers) -> None:
+    failures = [
+        f"pid={proc.pid}, exitcode={proc.exitcode}"
+        for proc in workers
+        if proc.exitcode != 0
+    ]
+    if failures:
+        raise RuntimeError(
+            "bench_one_batch worker process failed: " + ", ".join(failures)
+        )
+
+
+def _verify_correctness_output(bench_args) -> None:
+    output_file = bench_args.correctness_output_file
+    if output_file and not os.path.isfile(output_file):
+        raise RuntimeError(
+            "correctness worker completed without producing output: "
+            f"{output_file}"
+        )
+
+
 def _save_correctness_output(output_file, next_token_ids, next_token_logits) -> None:
     if next_token_logits is None:
         raise ValueError("correctness output requires final next-token logits")
@@ -725,6 +755,10 @@ def correctness_test(
     gpu_id,
     tp_rank,
 ):
+    initialize_moe_config(server_args)
+    initialize_fp8_gemm_config(server_args)
+    initialize_fp4_gemm_config(server_args)
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -1040,6 +1074,7 @@ def latency_test(
 
 def main(server_args, bench_args):
     validate_correctness_output_args(bench_args)
+    _reject_stale_correctness_output(bench_args)
     if server_args.dsv4_worker_backend == "huge_kernel":
         from sglang.srt.model_executor.dsv4_huge_kernel_model_runner import (
             validate_dsv4_huge_kernel_bench_args,
@@ -1094,7 +1129,9 @@ def main(server_args, bench_args):
         for proc in workers:
             proc.join()
 
-        proc.terminate()
+        _raise_for_failed_workers(workers)
+
+    _verify_correctness_output(bench_args)
 
 
 def cli_main():

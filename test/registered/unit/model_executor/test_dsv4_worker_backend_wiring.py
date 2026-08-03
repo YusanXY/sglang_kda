@@ -10,7 +10,10 @@ import torch
 
 from sglang.benchmark.one_batch import (
     BenchArgs,
+    _raise_for_failed_workers,
+    _reject_stale_correctness_output,
     _save_correctness_output,
+    _verify_correctness_output,
     prepare_inputs_for_correctness_test,
     validate_correctness_output_args,
 )
@@ -78,6 +81,29 @@ def test_low_level_bench_uses_shared_model_runner_factory():
     assert "ModelRunner" not in calls
 
 
+def test_correctness_initializes_moe_and_quant_backends_before_model_load():
+    tree = ast.parse(ONE_BATCH_PATH.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "correctness_test"
+    )
+    direct_calls = []
+    for statement in function.body:
+        value = getattr(statement, "value", None)
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+            direct_calls.append(value.func.id)
+
+    assert direct_calls[:3] == [
+        "initialize_moe_config",
+        "initialize_fp8_gemm_config",
+        "initialize_fp4_gemm_config",
+    ]
+    assert direct_calls.index("initialize_fp4_gemm_config") < direct_calls.index(
+        "load_model"
+    )
+
+
 def test_correctness_output_parser_and_huge_validator():
     parser = argparse.ArgumentParser()
     BenchArgs.add_cli_args(parser)
@@ -140,3 +166,31 @@ def test_correctness_output_is_cpu_float32_and_atomic(tmp_path):
 
     source = ONE_BATCH_PATH.read_text(encoding="utf-8")
     assert "if tp_rank == 0 and bench_args.correctness_output_file:" in source
+
+
+def test_parent_rejects_stale_or_missing_correctness_output(tmp_path):
+    output = tmp_path / "correctness.pt"
+    bench_args = SimpleNamespace(correctness_output_file=str(output))
+
+    output.write_bytes(b"stale")
+    with pytest.raises(FileExistsError, match="refusing to reuse"):
+        _reject_stale_correctness_output(bench_args)
+
+    output.unlink()
+    _reject_stale_correctness_output(bench_args)
+    with pytest.raises(RuntimeError, match="without producing output"):
+        _verify_correctness_output(bench_args)
+
+    output.write_bytes(b"new")
+    _verify_correctness_output(bench_args)
+
+
+def test_parent_raises_for_any_failed_worker_and_never_terminates_joined_workers():
+    workers = [
+        SimpleNamespace(pid=101, exitcode=0),
+        SimpleNamespace(pid=102, exitcode=17),
+    ]
+    with pytest.raises(RuntimeError, match=r"pid=102, exitcode=17"):
+        _raise_for_failed_workers(workers)
+
+    assert "terminate" not in _calls(ONE_BATCH_PATH, "main")
