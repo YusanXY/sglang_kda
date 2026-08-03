@@ -115,9 +115,10 @@ operator_export/
 
 DeepSeek V4 的长上下文对比使用
 `python -m sglang.benchmark.one_batch_server --cache-hit-rate`，先建立历史 KV，
-再只计时未命中的 suffix。已验证的 64K case 固定为
-`61440 cached + 4096 new = 65536 context`、batch size 1、output 1；不要把
-`--context-length` 容量参数误认为历史长度。完整 baseline/KDA 命令、日志验收和
+再只计时未命中的 suffix。目标 case 固定为
+`65536 cached history + 4096 new = 69632 input_len`、batch size 1、output 1，
+对应 `cache_hit_rate=0.9411764705882353`。`--context-length` 必须覆盖完整输入和
+模型预留，不能把容量参数误认为历史长度。完整 baseline/KDA 命令、日志验收和
 指标计算见 [增量 chunked prefill benchmark 策略](docs/kda-incremental-prefill-benchmark.md)。
 
 ## 文档导航

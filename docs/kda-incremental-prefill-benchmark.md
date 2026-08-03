@@ -6,32 +6,26 @@
 
 ## 1. 固定语义
 
-本文使用的 `context=65536` 是本次 chunk 完成后的总 prompt 长度，不是纯历史
-长度：
+本文固定测试“纯历史为 65536，再追加 4096”：
 
 | 项目 | 值 |
 |---|---:|
-| 最终 prompt context `L` | 65536 |
-| 已缓存历史 `H` | 61440 |
+| 已缓存纯历史 `H` | 65536 |
 | 新增 chunk `M` | 4096 |
-| cache hit rate `H / L` | 0.9375 |
+| 完整输入 `L = H + M` | 69632 |
+| cache hit rate `H / L` | 0.9411764705882353 |
 | measured request / batch size | 1 |
 | output tokens | 1 |
-
-这与 `deepseek_v4_chunked_mega_mqa_logits` 的 `m=4096` 正式 case 一致：查询
-处理结束时 raw context 为 65536。
-
-`--context-length` 是服务端容量上限，不等于被测历史长度。DeepSeek V4 会为
-生成和内部状态预留 token，因此本策略将容量设置为 69632；实际输入仍由
-`--input-len 65536` 固定。
-
-若目标改成“纯历史为 65536，再追加 4096”，则应改为：
 
 ```text
 input_len = 65536 + 4096 = 69632
 cache_hit_rate = 65536 / 69632 = 0.9411764705882353
 context_length >= input_len + 模型预留
 ```
+
+`--context-length` 是服务端容量上限，不等于被测历史长度。DeepSeek V4 会为
+生成和内部状态预留 token，因此命令示例使用 73728 作为容量；实际完整输入由
+`--input-len 69632` 固定。若部署的模型预留更大，应继续增大容量。
 
 ## 2. 为什么使用 one_batch_server
 
@@ -51,7 +45,7 @@ context_length >= input_len + 模型预留
 因此，本策略的正式请求必须在 server 日志中出现：
 
 ```text
-#new-seq: 1, #new-token: 4096, #cached-token: 61440
+#new-seq: 1, #new-token: 4096, #cached-token: 65536
 ```
 
 cache warmup 是额外的准备请求，不计入 measured request 数。warmup 和正式请求
@@ -94,8 +88,8 @@ baseline 不传 `--kda-kernel-config`，并显式关闭 KDA profile：
   --attention-backend dsv4 \
   --moe-runner-backend flashinfer_mxfp4 \
   --disable-flashinfer-autotune \
-  --context-length 69632 \
-  --max-total-tokens 69632 \
+  --context-length 73728 \
+  --max-total-tokens 73728 \
   --max-running-requests 1 \
   --mem-fraction-static 0.75 \
   --page-size 256 \
@@ -106,17 +100,17 @@ baseline 不传 `--kda-kernel-config`，并显式关闭 KDA profile：
   --disable-overlap-schedule \
   --kda-kernel-profile off \
   --batch-size 1 \
-  --input-len 65536 \
+  --input-len 69632 \
   --output-len 1 \
   --dataset-name random-ids \
-  --cache-hit-rate 0.9375 \
+  --cache-hit-rate 0.9411764705882353 \
   --skip-warmup \
   --no-append-to-github-summary \
   --result-filename baseline.jsonl 2>&1 | tee baseline.log
 ```
 
 `--skip-warmup` 只跳过 benchmark 客户端额外的通用 case；server 自身 warmup 和
-61440-token prefix warmup 仍会执行。
+65536-token prefix warmup 仍会执行。
 
 ## 5. KDA/reference
 
@@ -131,8 +125,8 @@ baseline 不传 `--kda-kernel-config`，并显式关闭 KDA profile：
   --attention-backend dsv4 \
   --moe-runner-backend flashinfer_mxfp4 \
   --disable-flashinfer-autotune \
-  --context-length 69632 \
-  --max-total-tokens 69632 \
+  --context-length 73728 \
+  --max-total-tokens 73728 \
   --max-running-requests 1 \
   --mem-fraction-static 0.75 \
   --page-size 256 \
@@ -144,10 +138,10 @@ baseline 不传 `--kda-kernel-config`，并显式关闭 KDA profile：
   --kda-kernel-config "$KDA_CONFIG" \
   --kda-kernel-profile "$KDA_PROFILE" \
   --batch-size 1 \
-  --input-len 65536 \
+  --input-len 69632 \
   --output-len 1 \
   --dataset-name random-ids \
-  --cache-hit-rate 0.9375 \
+  --cache-hit-rate 0.9411764705882353 \
   --skip-warmup \
   --no-append-to-github-summary \
   --result-filename reference.jsonl 2>&1 | tee reference.log
@@ -166,7 +160,7 @@ KDA route enabled: slot=deepseek_v4.paged_mqa_logits
 以 `last_ttft` 作为主要端到端增量 prefill 指标。因为只生成 1 个 token，
 `latency` 与 `last_ttft` 应接近。
 
-`one_batch_server` 的 `input_throughput` 使用完整 `input_len=65536` 作为分子，
+`one_batch_server` 的 `input_throughput` 使用完整 `input_len=69632` 作为分子，
 不能直接解释为 4096-token 增量吞吐。应额外计算：
 
 ```text
@@ -183,9 +177,9 @@ scheduler 日志中的该批次 `input throughput` 只统计 `#new-token=4096`�
 每轮完成后检查：
 
 - 进程退出码为 0；
-- `batch size: 1`、`input_len: 65536`、`output_len: 1`；
-- warmup 明确使用 61440 tokens；
-- 正式请求明确为 `4096 new + 61440 cached`；
+- `batch size: 1`、`input_len: 69632`、`output_len: 1`；
+- warmup 明确使用 65536 tokens；
+- 正式请求明确为 `4096 new + 65536 cached`；
 - baseline 的 `kda_kernel_profile` 为 `off`；
 - KDA 轮四个 TP rank 都加载预期 slot；
 - 日志没有 traceback、OOM 或 adapter fallback；
@@ -214,3 +208,9 @@ JSONL 中的 `cache_hit_rate` 依赖 `/metrics`。未启用 server metrics 时�
 | two-slot reference | 0.2650 s | 0.2647 s | 15474 tok/s |
 
 该快照对应约 1.45× TTFT speedup，但只有一个样本，不能代替多轮统计或
+算子级归因。
+
+> 上述快照来自旧的 `61440 cached + 4096 new = 65536 input_len` shape，
+> 不属于本策略当前的 65536-token 纯历史目标。更新参数后必须重新运行 baseline
+> 与 KDA；只有日志确认 `65536 cached + 4096 new` 的样本才能进入新目标的
+> 性能报告。
