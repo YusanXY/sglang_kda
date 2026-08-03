@@ -725,13 +725,16 @@ class C4IndexerBackendMixin:
             else:
                 if self.dsv4_huge_mode:
                     q = q_indexer.unsqueeze(1)
+                    schedule = indexer_metadata.ensure_deep_gemm_metadata()
+                else:
+                    schedule = indexer_metadata.deep_gemm_metadata
                 logits = fn(
                     q,
                     c4_indexer_kv_cache,
                     weights,
                     _c4sl,
                     page_table,
-                    indexer_metadata.deep_gemm_metadata,
+                    schedule,
                     indexer_metadata.max_c4_seq_len,
                     False,
                 )

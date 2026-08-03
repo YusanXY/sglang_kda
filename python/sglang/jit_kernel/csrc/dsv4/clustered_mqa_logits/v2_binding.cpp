@@ -110,13 +110,14 @@ void launch_blockq8_tmem2(
     CUtensorMap tensor_map_weights,
     cudaStream_t stream);
 
-torch::Tensor v2_forward(
+torch::Tensor v2_forward_out(
         const torch::Tensor& q,
         const torch::Tensor& fused_kv,
         const torch::Tensor& weights,
         const torch::Tensor& context_lens,
         const torch::Tensor& block_table,
         const torch::Tensor& schedule_meta,
+        const torch::Tensor& logits_full,
         int64_t max_context_len) {
     TORCH_CHECK(q.is_cuda(), "q must be CUDA");
     c10::cuda::CUDAGuard device_guard(q.device());
@@ -125,6 +126,7 @@ torch::Tensor v2_forward(
     TORCH_CHECK(context_lens.device() == q.device(), "context_lens device mismatch");
     TORCH_CHECK(block_table.device() == q.device(), "block_table device mismatch");
     TORCH_CHECK(schedule_meta.device() == q.device(), "schedule_meta device mismatch");
+    TORCH_CHECK(logits_full.device() == q.device(), "logits workspace device mismatch");
 
     TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn, "q must be float8_e4m3fn");
     TORCH_CHECK(fused_kv.scalar_type() == at::kByte, "fused_kv must be uint8");
@@ -132,6 +134,7 @@ torch::Tensor v2_forward(
     TORCH_CHECK(context_lens.scalar_type() == at::kInt, "context_lens must be int32");
     TORCH_CHECK(block_table.scalar_type() == at::kInt, "block_table must be int32");
     TORCH_CHECK(schedule_meta.scalar_type() == at::kInt, "schedule_meta must be int32");
+    TORCH_CHECK(logits_full.scalar_type() == at::kFloat, "logits workspace must be float32");
 
     TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
     TORCH_CHECK(fused_kv.is_contiguous(), "fused_kv must be contiguous");
@@ -139,6 +142,7 @@ torch::Tensor v2_forward(
     TORCH_CHECK(context_lens.is_contiguous(), "context_lens must be contiguous");
     TORCH_CHECK(block_table.stride(1) == 1, "block_table inner dimension must be contiguous");
     TORCH_CHECK(schedule_meta.is_contiguous(), "schedule_meta must be contiguous");
+    TORCH_CHECK(logits_full.is_contiguous(), "logits workspace must be contiguous");
 
     TORCH_CHECK(q.dim() == 3, "q must have [M,H,D] layout");
     TORCH_CHECK(q.size(0) > 0 && q.size(0) % 16 == 0 &&
@@ -171,6 +175,11 @@ torch::Tensor v2_forward(
     TORCH_CHECK(max_context_len > 0 &&
                 max_context_len <= block_table.size(1) * 64,
                 "max_context_len is outside block-table capacity");
+    TORCH_CHECK(logits_full.dim() == 2 &&
+                logits_full.size(0) == q.size(0) &&
+                logits_full.size(1) >= max_context_len &&
+                logits_full.size(1) % 256 == 0,
+                "logits workspace must be [M, aligned_context>=max_context]");
 
     constexpr int kHeadDim = 128;
     constexpr int kHeads = 64;
@@ -183,10 +192,7 @@ torch::Tensor v2_forward(
 
     const auto total_q = static_cast<int>(q.size(0));
     const auto num_pages = static_cast<int>(fused_kv.size(0));
-    const auto padded_context = static_cast<int>((max_context_len + 255) / 256 * 256);
-    auto logits_full = torch::empty(
-        {total_q, padded_context},
-        q.options().dtype(torch::kFloat32));
+    const auto padded_context = static_cast<int>(logits_full.size(1));
 
     auto* fused_base = static_cast<uint8_t*>(fused_kv.data_ptr());
     auto tensor_map_q = make_tma_2d(
@@ -250,6 +256,34 @@ torch::Tensor v2_forward(
     return logits_full.narrow(1, 0, max_context_len);
 }
 
+torch::Tensor v2_forward(
+        const torch::Tensor& q,
+        const torch::Tensor& fused_kv,
+        const torch::Tensor& weights,
+        const torch::Tensor& context_lens,
+        const torch::Tensor& block_table,
+        const torch::Tensor& schedule_meta,
+        int64_t max_context_len) {
+    TORCH_CHECK(q.dim() == 3 && q.size(0) > 0, "q must have nonempty [M,H,D] layout");
+    const auto padded_context = static_cast<int>((max_context_len + 255) / 256 * 256);
+    auto logits_full = torch::empty(
+        {q.size(0), padded_context},
+        q.options().dtype(torch::kFloat32));
+    return v2_forward_out(
+        q,
+        fused_kv,
+        weights,
+        context_lens,
+        block_table,
+        schedule_meta,
+        logits_full,
+        max_context_len);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &v2_forward, "cluster2 Q16 cta_group::2 KV SM100 paged MQA logits");
+    m.def(
+        "forward_out",
+        &v2_forward_out,
+        "cluster2 Q16 paged MQA logits into a persistent device workspace");
 }

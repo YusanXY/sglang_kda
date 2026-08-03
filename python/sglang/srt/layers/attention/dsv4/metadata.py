@@ -113,6 +113,7 @@ class PagedIndexerMetadata:
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
     use_prefill_cuda_graph: bool = False
+    prefer_clustered_mqa: bool = False
     deep_gemm_metadata: Any = field(init=False, repr=False)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -120,34 +121,14 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
+        if self.prefer_clustered_mqa or (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or is_xpu()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
         ):
             self.deep_gemm_metadata = None
         else:
-            import deep_gemm
-
-            use_jit_indexer = (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
-            )
-            if use_jit_indexer:
-                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
-            else:
-                from deep_gemm import get_paged_mqa_logits_metadata
-
-            _c4 = self.c4_seq_lens.to(torch.int32)
-            if _c4.dim() == 1:
-                _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
-
-            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+            self.deep_gemm_metadata = self._build_deep_gemm_metadata()
 
         from sglang.jit_kernel.dsv4 import plan_topk_v2
 
@@ -157,6 +138,38 @@ class PagedIndexerMetadata:
             self.topk_metadata = torch.empty((0,))
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
+
+    def _build_deep_gemm_metadata(self) -> torch.Tensor:
+        import deep_gemm
+
+        use_jit_indexer = (
+            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+            or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+        )
+        if use_jit_indexer:
+            from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
+        else:
+            from deep_gemm import get_paged_mqa_logits_metadata
+
+        c4_seq_lens = self.c4_seq_lens.to(torch.int32)
+        if c4_seq_lens.dim() == 1:
+            c4_seq_lens = c4_seq_lens.unsqueeze(-1)
+        metadata = get_paged_mqa_logits_metadata(
+            c4_seq_lens,
+            self.c4_page_size,
+            deep_gemm.get_num_sms(),
+        )
+        assert isinstance(metadata, torch.Tensor)
+        return metadata
+
+    def ensure_deep_gemm_metadata(self) -> torch.Tensor:
+        """Lazily plan only the non-Q16 Huge tail specialization."""
+
+        if self.deep_gemm_metadata is None:
+            if not self.prefer_clustered_mqa:
+                raise RuntimeError("DeepGEMM indexer metadata is unavailable")
+            self.deep_gemm_metadata = self._build_deep_gemm_metadata()
+        return self.deep_gemm_metadata
 
     @property
     def c4_page_size(self) -> int:
@@ -181,7 +194,11 @@ class PagedIndexerMetadata:
         copy_metadata(
             src=other,
             dst=self,
-            check_eq_fields=["page_size", "use_prefill_cuda_graph"],
+            check_eq_fields=[
+                "page_size",
+                "use_prefill_cuda_graph",
+                "prefer_clustered_mqa",
+            ],
             copy_fields=copy_fields,
             assign_fields=assign_fields,
         )

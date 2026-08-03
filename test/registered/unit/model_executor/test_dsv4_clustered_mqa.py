@@ -7,6 +7,7 @@ import torch
 from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
     prepare_clustered_mqa_metadata,
 )
+from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 
 
 def test_grouped_metadata_is_built_once_without_copying_page_rows():
@@ -44,6 +45,8 @@ def test_grouped_metadata_is_built_once_without_copying_page_rows():
     assert torch.equal(metadata.page_table[1], page_table[16])
     assert metadata.schedule is schedule
     assert metadata.extension is extension
+    assert metadata.logits_workspace.shape == (32, 512)
+    assert metadata.logits_workspace.dtype == torch.float32
     deep_gemm.get_paged_mqa_logits_metadata.assert_called_once_with(
         metadata.seq_lens, 64, 74
     )
@@ -62,3 +65,21 @@ def test_non_q16_request_uses_explicit_deepgemm_cuda_specialization():
         )
         is None
     )
+
+
+def test_huge_q16_skips_stock_schedule_until_cuda_tail_needs_it():
+    metadata = object.__new__(PagedIndexerMetadata)
+    metadata.prefer_clustered_mqa = True
+    metadata.deep_gemm_metadata = None
+    schedule = torch.tensor([[3, 5]], dtype=torch.int32)
+
+    with mock.patch.object(
+        PagedIndexerMetadata,
+        "_build_deep_gemm_metadata",
+        return_value=schedule,
+    ) as build:
+        assert metadata.deep_gemm_metadata is None
+        assert metadata.ensure_deep_gemm_metadata() is schedule
+        assert metadata.ensure_deep_gemm_metadata() is schedule
+
+    build.assert_called_once_with()

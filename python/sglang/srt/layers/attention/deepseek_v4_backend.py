@@ -660,6 +660,7 @@ class DeepseekV4AttnBackend(
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
+            prefer_clustered_mqa=self.dsv4_huge_mode,
         )
 
     def init_forward_metadata_decode(

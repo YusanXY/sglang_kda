@@ -42,6 +42,7 @@ class ClusteredMqaMetadata:
     seq_lens: torch.Tensor
     page_table: torch.Tensor
     schedule: torch.Tensor
+    logits_workspace: torch.Tensor
     max_context: int
     total_q: int
     extension: Any
@@ -149,10 +150,20 @@ def prepare_clustered_mqa_metadata(
         PAGE_SIZE,
         deep_gemm.get_num_sms() // 2,
     )
+    padded_context = (indexer_metadata.max_c4_seq_len + 255) // 256 * 256
+    # Decoder layers execute serially on the current stream.  Keep one device
+    # buffer alive for the whole ForwardBatch instead of entering the PyTorch
+    # allocator once per C4 layer (21 times for DSV4 Flash).
+    logits_workspace = torch.empty(
+        (total_q, padded_context),
+        dtype=torch.float32,
+        device=c4_seq_lens.device,
+    )
     return ClusteredMqaMetadata(
         seq_lens=grouped_lens,
         page_table=grouped_page_table,
         schedule=schedule,
+        logits_workspace=logits_workspace,
         max_context=int(indexer_metadata.max_c4_seq_len),
         total_q=total_q,
         extension=load_clustered_mqa_extension(),
@@ -172,13 +183,14 @@ def clustered_fp8_paged_mqa_logits(
         raise RuntimeError(
             f"clustered DSV4 MQA Q must be [M,64,128], got {tuple(q.shape)}"
         )
-    return metadata.extension.forward(
+    return metadata.extension.forward_out(
         q,
         kv_cache,
         weights,
         metadata.seq_lens,
         metadata.page_table,
         metadata.schedule,
+        metadata.logits_workspace,
         metadata.max_context,
     )
 
