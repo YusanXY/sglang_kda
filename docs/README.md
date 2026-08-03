@@ -8,11 +8,14 @@
 1. [根目录 README](../README.md)：项目定位、支持范围和快速开始。
 2. [实现结构与接入逻辑](kda-architecture-and-integration.md)：启动生命周期、
    router、Linear 静态绑定、模型专用调用点、失败语义和 adapter 接入步骤。
-3. [部署与 benchmark 示例](../examples/kda/README.md)：可以直接复用的启动和
+3. [DeepSeek V4 增量 chunked prefill benchmark](kda-incremental-prefill-benchmark.md)：
+   使用 `one_batch_server --cache-hit-rate` 构造历史 KV、固定 4096-token
+   增量 chunk，并比较 native 与 KDA profile。
+4. [部署与 benchmark 示例](../examples/kda/README.md)：可以直接复用的启动和
    benchmark 命令。
-4. [Adapter 关键字协议](../python/sglang/srt/kda/ADAPTER_PROTOCOL.md)：每个
+5. [Adapter 关键字协议](../python/sglang/srt/kda/ADAPTER_PROTOCOL.md)：每个
    slot 的精确 callable 参数和返回值约定。
-5. [YAML 配置模板](../examples/kda/kda-routes.yaml)：DeepSeek V4 与 GLM-5.2
+6. [YAML 配置模板](../examples/kda/kda-routes.yaml)：DeepSeek V4 与 GLM-5.2
    profile 示例。
 
 ## 核心原则

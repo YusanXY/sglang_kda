@@ -111,10 +111,20 @@ operator_export/
 
 `off` 不读取 YAML，也不会导入 adapter。切换 profile 需要重启 worker/server。
 
+### 长上下文增量 prefill 对比
+
+DeepSeek V4 的长上下文对比使用
+`python -m sglang.benchmark.one_batch_server --cache-hit-rate`，先建立历史 KV，
+再只计时未命中的 suffix。已验证的 64K case 固定为
+`61440 cached + 4096 new = 65536 context`、batch size 1、output 1；不要把
+`--context-length` 容量参数误认为历史长度。完整 baseline/KDA 命令、日志验收和
+指标计算见 [增量 chunked prefill benchmark 策略](docs/kda-incremental-prefill-benchmark.md)。
+
 ## 文档导航
 
 - [KDA 文档索引](docs/README.md)
 - [实现结构与接入逻辑](docs/kda-architecture-and-integration.md)
+- [增量 chunked prefill benchmark 策略](docs/kda-incremental-prefill-benchmark.md)
 - [部署与 benchmark 示例](examples/kda/README.md)
 - [Adapter 关键字协议](python/sglang/srt/kda/ADAPTER_PROTOCOL.md)
 - [YAML 配置模板](examples/kda/kda-routes.yaml)
