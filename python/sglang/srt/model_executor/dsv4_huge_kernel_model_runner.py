@@ -66,17 +66,20 @@ def validate_dsv4_huge_kernel_startup(
             if device_name is not None
             else torch.cuda.get_device_name(gpu_id)
         )
-        if "B200" not in resolved_device_name.upper():
-            errors.append(f"GPU must be NVIDIA B200, got {resolved_device_name!r}")
         resolved_capability = (
             device_capability
             if device_capability is not None
             else torch.cuda.get_device_capability(gpu_id)
         )
-        if resolved_capability != (10, 0):
+        device_name_upper = resolved_device_name.upper()
+        supported_gpu = (
+            "B200" in device_name_upper and resolved_capability == (10, 0)
+        ) or ("B300" in device_name_upper and resolved_capability == (10, 3))
+        if not supported_gpu:
             errors.append(
-                "GPU compute capability must be (10, 0) for B200, "
-                f"got {resolved_capability!r}"
+                "GPU must be a matching NVIDIA B200/SM100 or B300/SM103, "
+                f"got name={resolved_device_name!r}, "
+                f"capability={resolved_capability!r}"
             )
 
     expected_values = {
@@ -205,26 +208,39 @@ class Dsv4HugeKernelModelRunner(ModelRunner):
             is_draft_worker=kwargs.get("is_draft_worker", False),
         )
         self._huge_kernel_layers_bound = False
+        self._dsv4_whole_layer_runtime = None
         super().__init__(*args, **kwargs)
 
     def init_attention_backends(self):
         super().init_attention_backends()
         if self._huge_kernel_layers_bound:
             return
-        from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+        from sglang.srt.models.dsv4_whole_layer_runtime import (
+            DSV4WholeLayerRuntime,
+        )
 
-        installed = 0
-        for module in self.model.modules():
-            if isinstance(module, DeepseekV4DecoderLayer):
-                module.enable_huge_kernel_runner()
-                installed += 1
+        runtime = DSV4WholeLayerRuntime(
+            config=self.model.config,
+            server_args=self.server_args,
+        )
+        handles = runtime.bind_after_weight_load(
+            self.model.model.layers,
+            start_layer=self.model.model.start_layer,
+            end_layer=self.model.model.end_layer,
+        )
+        installed = len(handles)
         if installed != self.model_config.num_hidden_layers:
             raise RuntimeError(
                 "dsv4 huge_kernel must own every decoder layer; "
                 f"installed={installed}, expected={self.model_config.num_hidden_layers}"
             )
+        self.model.model._dsv4_whole_layer_runtime = runtime
+        self._dsv4_whole_layer_runtime = runtime
         self._huge_kernel_layers_bound = True
-        logger.info("Installed dsv4 huge_kernel dispatch on %d layers", installed)
+        logger.info(
+            "Installed strict dsv4 C0/C4/C128 huge dispatch on %d layers",
+            installed,
+        )
 
     def forward(self, forward_batch: ForwardBatch, *args, **kwargs):
         if not self._huge_kernel_layers_bound:

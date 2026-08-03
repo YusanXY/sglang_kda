@@ -27,6 +27,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
+    inverse_rope_fp8_wo_a_ue8m0,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
@@ -1083,11 +1084,46 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         x_quant=None,
+        e2e_handle: Optional[Any] = None,
+        e2e_descriptor: Optional[Any] = None,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             return x
 
-        attn_backend = get_attn_backend()
+        huge_mode = e2e_handle is not None or e2e_descriptor is not None
+        if (e2e_handle is None) != (e2e_descriptor is None):
+            raise RuntimeError(
+                "DSV4 huge attention requires both the static layer handle and "
+                "the per-forward descriptor"
+            )
+        if huge_mode:
+            if e2e_handle.layer.self_attn is not self:
+                raise RuntimeError(
+                    f"layer {self.layer_id}: foreign DSV4 huge layer handle"
+                )
+            if int(e2e_handle.compress_ratio) != int(self.compress_ratio):
+                raise RuntimeError(
+                    f"layer {self.layer_id}: static ratio handle no longer matches "
+                    f"the module ({e2e_handle.compress_ratio} != {self.compress_ratio})"
+                )
+            if e2e_descriptor.positions is not positions:
+                raise RuntimeError(
+                    f"layer {self.layer_id}: positions differ from the active "
+                    "DSV4 forward descriptor"
+                )
+            if e2e_descriptor.forward_batch is not forward_batch:
+                raise RuntimeError(
+                    f"layer {self.layer_id}: ForwardBatch differs from the active "
+                    "DSV4 forward descriptor"
+                )
+            attn_backend = e2e_descriptor.attn_backend
+            if get_attn_backend() is not attn_backend:
+                raise RuntimeError(
+                    f"layer {self.layer_id}: active attention backend changed "
+                    "inside the DSV4 huge forward"
+                )
+        else:
+            attn_backend = get_attn_backend()
         if TYPE_CHECKING:
             assert isinstance(
                 attn_backend,
@@ -1210,24 +1246,49 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
-        if _is_npu:
-            v4_rope_inplace_npu(
-                o[..., -self.qk_rope_head_dim :],
-                None,
+        o_fp8 = o_s = None
+        if huge_mode:
+            if _is_npu or not _FP8_WO_A_GEMM:
+                raise RuntimeError(
+                    "DSV4 huge output fusion requires the NVIDIA FP8 WO_A path"
+                )
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+                raise RuntimeError(
+                    "DSV4 huge output fusion requires Blackwell UE8M0 scales"
+                )
+            # First Stage-2 GPU fusion: remove the inverse-RoPE BF16 write/read
+            # and the following WO_A activation-quant launch.  The kernel keeps
+            # the historical BF16 rounding boundary before FP8 conversion.
+            o = o.view(o.shape[0], self.n_local_groups, -1)
+            o_fp8, o_s = inverse_rope_fp8_wo_a_ue8m0(
+                o,
                 self.freqs_cis,
                 positions,
-                inverse=True,
+                e2e_descriptor.wo_a_output_q,
+                e2e_descriptor.wo_a_output_s_storage,
             )
         else:
-            fused_rope_inplace(
-                o[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-                inverse=True,
-            )
-
-        o = o.view(o.shape[0], self.n_local_groups, -1)
+            # Native backend is intentionally unchanged and never enters the
+            # fused JIT primitive.
+            if _is_npu:
+                v4_rope_inplace_npu(
+                    o[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions,
+                    inverse=True,
+                )
+            else:
+                fused_rope_inplace(
+                    o[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions=positions,
+                    inverse=True,
+                )
+            o = o.view(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
@@ -1238,7 +1299,8 @@ class MQALayer(MqaAttentionBase):
             R = self.o_lora_rank
             if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
                 # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.
-                o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                if not huge_mode:
+                    o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                 recipe = (1, 1, 128)
             else:
                 # sm90 (Hopper): fp32 scales.
@@ -1250,6 +1312,10 @@ class MQALayer(MqaAttentionBase):
                 o_fp8 = o_fp8.view(T, G, D)
                 o_s = o_s.view(T, G, -1)
                 recipe = (1, 128, 128)
+            if o_fp8 is None or o_s is None:
+                raise RuntimeError(
+                    "DSV4 huge output fusion did not produce WO_A FP8 operands"
+                )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
@@ -1378,16 +1444,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.post_attention_layernorm.weight.data.bfloat16().contiguous()
         )
 
-    def enable_huge_kernel_runner(self) -> None:
-        if self._whole_layer_runner is not None:
-            raise RuntimeError(
-                f"whole-layer runner already installed on layer {self.layer_id}"
-            )
+    def enable_huge_kernel_runner(self, runtime, handle) -> None:
         from sglang.srt.model_executor.dsv4_huge_kernel_whole_layer_runner import (
             Dsv4HugeKernelWholeLayerRunner,
         )
 
-        self._whole_layer_runner = Dsv4HugeKernelWholeLayerRunner(self)
+        if self._whole_layer_runner is None:
+            self._whole_layer_runner = Dsv4HugeKernelWholeLayerRunner(
+                self,
+                runtime,
+                handle,
+            )
+        else:
+            self._whole_layer_runner.rebind(runtime, handle)
 
     def hc_pre(
         self,
@@ -2151,6 +2220,8 @@ class DeepseekV4Model(nn.Module):
             self.cp_size = get_parallel().attn_cp_size
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
+        # Set only by Dsv4HugeKernelModelRunner after attention backend init.
+        self._dsv4_whole_layer_runtime = None
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -2345,10 +2416,16 @@ class DeepseekV4Model(nn.Module):
                 "of them: DSpark static-verify is CP-off for v1."
             )
         dspark_aux_hidden_states: List[torch.Tensor] = []
+        huge_runtime = self._dsv4_whole_layer_runtime
+        if huge_runtime is not None and capture_dspark:
+            raise RuntimeError("DSV4 huge runtime does not support DSpark capture")
+        can_run_tbo = self._can_run_tbo(forward_batch)
+        if huge_runtime is not None and can_run_tbo:
+            raise RuntimeError("DSV4 huge runtime does not support TBO execution")
         # DSpark aux capture needs the per-layer eager loop (TBO's overlapped
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
-        if self._can_run_tbo(forward_batch) and not capture_dspark:
+        if can_run_tbo and not capture_dspark:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
             # disabled here (each layer self-contained), so no trailing hc_post.
             hidden_states = self._forward_layers_tbo(
@@ -2357,40 +2434,60 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            use_fused = self.use_fused_mhc_post_pre
-            prev_residual, prev_post, prev_comb = None, None, None
-            last_layer = None
-            for i in range(self.start_layer, self.end_layer):
-                layer = self.layers[i]
-                last_layer = layer
-                ctx = (
-                    nullcontext()
-                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                    else get_global_expert_distribution_recorder().with_current_layer(i)
+            huge_descriptor = None
+            if huge_runtime is not None:
+                huge_descriptor = huge_runtime.begin_forward(
+                    forward_batch=forward_batch,
+                    positions=positions,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
                 )
-                with ctx:
-                    hidden_states, prev_residual, prev_post, prev_comb = layer(
-                        positions=positions,
-                        hidden_states=hidden_states,
-                        forward_batch=forward_batch,
-                        input_ids=input_ids,
-                        input_ids_global=input_ids_global,
-                        prev_residual=prev_residual,
-                        prev_post=prev_post,
-                        prev_comb=prev_comb,
-                    )
-                if capture_dspark and i in self.dspark_layers_to_capture:
-                    if use_fused:
-                        completed = layer.hc_post(
-                            hidden_states, prev_residual, prev_post, prev_comb
+            try:
+                use_fused = self.use_fused_mhc_post_pre
+                prev_residual, prev_post, prev_comb = None, None, None
+                last_layer = None
+                for i in range(self.start_layer, self.end_layer):
+                    layer = self.layers[i]
+                    last_layer = layer
+                    ctx = (
+                        nullcontext()
+                        if check_cuda_graph_backend(
+                            Phase.PREFILL, Backend.TC_PIECEWISE
                         )
-                    else:
-                        completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
-            if use_fused and last_layer is not None:
-                hidden_states = last_layer.hc_post(
-                    hidden_states, prev_residual, prev_post, prev_comb
-                )
+                        else get_global_expert_distribution_recorder().with_current_layer(
+                            i
+                        )
+                    )
+                    with ctx:
+                        hidden_states, prev_residual, prev_post, prev_comb = layer(
+                            positions=positions,
+                            hidden_states=hidden_states,
+                            forward_batch=forward_batch,
+                            input_ids=input_ids,
+                            input_ids_global=input_ids_global,
+                            prev_residual=prev_residual,
+                            prev_post=prev_post,
+                            prev_comb=prev_comb,
+                        )
+                    if capture_dspark and i in self.dspark_layers_to_capture:
+                        if use_fused:
+                            completed = layer.hc_post(
+                                hidden_states, prev_residual, prev_post, prev_comb
+                            )
+                        else:
+                            completed = hidden_states
+                        dspark_aux_hidden_states.append(completed.mean(dim=1))
+                if use_fused and last_layer is not None:
+                    hidden_states = last_layer.hc_post(
+                        hidden_states, prev_residual, prev_post, prev_comb
+                    )
+            except BaseException:
+                if huge_descriptor is not None:
+                    huge_runtime.abort_forward(huge_descriptor)
+                raise
+            else:
+                if huge_descriptor is not None:
+                    huge_runtime.end_forward(huge_descriptor)
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
@@ -2637,6 +2734,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             ):
                 self_attn.indexer.compressor.apply_ape_hotfix()
             layer.refresh_mhc_norm_weight_cache()
+        runtime = self.model._dsv4_whole_layer_runtime
+        if runtime is not None:
+            runtime.bind_after_weight_load(
+                self.model.layers,
+                start_layer=self.model.start_layer,
+                end_layer=self.model.end_layer,
+            )
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(

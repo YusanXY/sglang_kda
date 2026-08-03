@@ -72,6 +72,16 @@ def test_startup_contract_accepts_flash_b200_tp4_ep4():
     )
 
 
+def test_startup_contract_accepts_flash_b300_tp4_ep4():
+    validate_dsv4_huge_kernel_startup(
+        server_args=_server_args(),
+        model_config=_flash_model_config(),
+        gpu_id=0,
+        device_name="NVIDIA B300 SXM6 AC",
+        device_capability=(10, 3),
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -94,14 +104,24 @@ def test_startup_contract_rejects_unsupported_config(field, value):
         )
 
 
-def test_startup_contract_rejects_non_b200_without_fallback():
-    with pytest.raises(ValueError, match="B200"):
+@pytest.mark.parametrize(
+    ("device_name", "device_capability"),
+    [
+        ("NVIDIA H200", (9, 0)),
+        ("NVIDIA B200", (10, 3)),
+        ("NVIDIA B300 SXM6 AC", (10, 0)),
+    ],
+)
+def test_startup_contract_rejects_unsupported_or_mismatched_gpu_without_fallback(
+    device_name, device_capability
+):
+    with pytest.raises(ValueError, match="B200/SM100 or B300/SM103"):
         validate_dsv4_huge_kernel_startup(
             server_args=_server_args(),
             model_config=_flash_model_config(),
             gpu_id=0,
-            device_name="NVIDIA H200",
-            device_capability=(9, 0),
+            device_name=device_name,
+            device_capability=device_capability,
         )
 
 
@@ -186,16 +206,45 @@ def test_factory_selects_explicit_backend_only():
         get_model_runner_class(_server_args(dsv4_worker_backend="typo"))
 
 
-def test_whole_layer_runner_calls_bound_reference_body():
+def test_whole_layer_runner_calls_ratio_handle_not_native_body():
     calls = []
 
     class FakeLayer:
         layer_id = 7
 
         def _forward_native(self, **kwargs):
-            calls.append(kwargs)
+            raise AssertionError("huge runner must never enter _forward_native")
+
+    descriptor = SimpleNamespace(
+        positions=object(),
+        forward_batch=object(),
+        input_ids=object(),
+        input_ids_global=object(),
+    )
+
+    class FakeRuntime:
+        active_descriptor = descriptor
+
+        def execute_layer(self, handle, actual_descriptor, hidden_states):
+            calls.append((handle, actual_descriptor, hidden_states))
             return "sentinel"
 
-    runner = Dsv4HugeKernelWholeLayerRunner(FakeLayer())
-    assert runner(token_count=4096) == "sentinel"
-    assert calls == [{"token_count": 4096}]
+    runtime = FakeRuntime()
+    handle = SimpleNamespace(layer_id=7)
+    hidden_states = object()
+    runner = Dsv4HugeKernelWholeLayerRunner(FakeLayer(), runtime, handle)
+    assert (
+        runner(
+            positions=descriptor.positions,
+            forward_batch=descriptor.forward_batch,
+            input_ids=descriptor.input_ids,
+            input_ids_global=descriptor.input_ids_global,
+            hidden_states=hidden_states,
+            prev_residual=None,
+            prev_post=None,
+            prev_comb=None,
+        )
+        == "sentinel"
+    )
+    assert calls == [(handle, descriptor, hidden_states)]
+    assert not hasattr(runner, "_impl")
