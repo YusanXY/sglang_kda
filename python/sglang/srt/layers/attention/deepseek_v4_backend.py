@@ -5,6 +5,7 @@ import functools
 import logging
 from dataclasses import dataclass, field
 from typing import (
+    Any,
     TYPE_CHECKING,
     Dict,
     List,
@@ -391,6 +392,11 @@ class DSV4Metadata:
     # metadata is refreshed so replay rebuilds it from the live batch.
     sparse_prefill_cache: Optional[SparsePrefillChunkCache] = None
 
+    # Huge-only Q16 clustered MQA schedule. It is created once by the
+    # model-scoped runtime and reused by all C4 layers in this ForwardBatch.
+    # Native metadata construction never populates this field.
+    clustered_mqa_metadata: Optional[Any] = None
+
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
         return self.core_attn_metadata
@@ -403,6 +409,7 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
         self.sparse_prefill_cache = None
+        self.clustered_mqa_metadata = None
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -422,6 +429,7 @@ class DSV4Metadata:
                 src=static_metadata.c128_compress_metadata,
             )
         self.sparse_prefill_cache = None
+        self.clustered_mqa_metadata = None
 
 
 @dataclass

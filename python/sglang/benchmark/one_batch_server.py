@@ -117,6 +117,7 @@ class BenchArgs:
     profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_start_step: Optional[int] = None
     profile_steps: int = 5
+    profile_stop_after_request: bool = False
     profile_by_stage: bool = False
     profile_prefix: Optional[str] = None
     profile_output_dir: Optional[str] = None
@@ -208,6 +209,15 @@ class BenchArgs:
         )
         parser.add_argument(
             "--profile-steps", type=int, default=BenchArgs.profile_steps
+        )
+        parser.add_argument(
+            "--profile-stop-after-request",
+            action="store_true",
+            help=(
+                "Explicitly stop and flush the profiler after the measured request. "
+                "This is required for prefill-only runs that have no later forward "
+                "step to trigger the automatic num_steps stop condition."
+            ),
         )
         parser.add_argument("--profile-by-stage", action="store_true")
         parser.add_argument(
@@ -617,6 +627,7 @@ def run_one_case(
     profile_activities: Tuple[str] = ("CPU", "GPU"),
     profile_start_step: Optional[int] = None,
     profile_steps: int = BenchArgs.profile_steps,
+    profile_stop_after_request: bool = False,
     profile_by_stage: bool = False,
     profile_prefix: Optional[str] = BenchArgs.profile_prefix,
     profile_output_dir: Optional[str] = BenchArgs.profile_output_dir,
@@ -865,6 +876,10 @@ def run_one_case(
                     )
                     if data["meta_info"]["completion_tokens"] == 1:
                         last_ttft = time.perf_counter() - tic
+
+    if profile and profile_stop_after_request:
+        response = requests.post(url + "/stop_profile", timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
 
     # Compute metrics
     latency = time.perf_counter() - tic
@@ -1301,6 +1316,9 @@ def run_benchmark_internal(
                             profile_activities=bench_args.profile_activities,
                             profile_start_step=bench_args.profile_start_step,
                             profile_steps=bench_args.profile_steps,
+                            profile_stop_after_request=(
+                                bench_args.profile_stop_after_request
+                            ),
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,
                             profile_output_dir=bench_args.profile_output_dir,

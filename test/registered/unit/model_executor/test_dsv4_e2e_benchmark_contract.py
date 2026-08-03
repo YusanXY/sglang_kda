@@ -117,10 +117,10 @@ def test_runner_pins_exact_workload_and_order():
         "PYTHON=${PYTHON_BIN:-",
         "GPU_IDS=0,1,2,3",
         'export CUDA_VISIBLE_DEVICES="$GPU_IDS"',
-        'CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.2}',
-        'export CUDA_HOME',
+        "CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.2}",
+        "export CUDA_HOME",
         'export CPATH="$CUDA_CCCL_INCLUDE${CPATH:+:$CPATH}"',
-        'printf \'cuda_home=%s\\ncuda_cccl_include=%s\\n\'',
+        "printf 'cuda_home=%s\\ncuda_cccl_include=%s\\n'",
         'nvidia-smi --id="$GPU_IDS" --query-compute-apps=pid',
         '--dsv4-worker-backend "$backend"',
         "--skip-server-warmup",
@@ -131,8 +131,16 @@ def test_runner_pins_exact_workload_and_order():
     ):
         assert fragment in source
 
-    nvidia_smi_lines = [
-        line for line in source.splitlines() if "nvidia-smi" in line
-    ]
+    nvidia_smi_lines = [line for line in source.splitlines() if "nvidia-smi" in line]
     assert nvidia_smi_lines
     assert all('--id="$GPU_IDS"' in line for line in nvidia_smi_lines)
+
+
+def test_one_batch_profiler_can_flush_after_prefill_only_request():
+    source = (REPO_ROOT / "python/sglang/benchmark/one_batch_server.py").read_text(
+        encoding="utf-8"
+    )
+    assert "--profile-stop-after-request" in source
+    assert 'requests.post(url + "/stop_profile"' in source
+    assert "profile_stop_after_request=(" in source
+    assert "bench_args.profile_stop_after_request" in source

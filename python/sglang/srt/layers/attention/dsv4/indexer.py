@@ -597,6 +597,9 @@ class C4IndexerBackendMixin:
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 
+        if self.dsv4_huge_mode and use_fp4_indexer:
+            raise RuntimeError("dsv4 huge C4 indexer requires the FP8 cache ABI")
+
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
             assert len(q_fp4.shape) == 3
@@ -604,11 +607,14 @@ class C4IndexerBackendMixin:
             q = (q_fp4.unsqueeze(1), q_sf.unsqueeze(1))
         else:
             assert len(q_indexer.shape) == 3
-            q = q_indexer.unsqueeze(1)
+            # The Huge clustered kernel consumes [M,H,D] directly. Native and
+            # the explicit non-Q16 CUDA specialization retain DeepGEMM's
+            # [M,1,H,D] ABI.
+            q = q_indexer if self.dsv4_huge_mode else q_indexer.unsqueeze(1)
 
         kda_paged_mqa_logits = (
             None
-            if use_fp4_indexer
+            if use_fp4_indexer or self.dsv4_huge_mode
             else get_kda_operator("deepseek_v4.paged_mqa_logits")
         )
         if kda_paged_mqa_logits is None:
@@ -691,7 +697,21 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            if kda_paged_mqa_logits is not None:
+            clustered_metadata = metadata.clustered_mqa_metadata
+            if self.dsv4_huge_mode and clustered_metadata is not None:
+                if not isinstance(q_indexer, torch.Tensor):
+                    raise RuntimeError("dsv4 huge clustered MQA requires FP8 Q")
+                from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
+                    clustered_fp8_paged_mqa_logits,
+                )
+
+                logits = clustered_fp8_paged_mqa_logits(
+                    q=q_indexer,
+                    kv_cache=c4_indexer_kv_cache,
+                    weights=weights,
+                    metadata=clustered_metadata,
+                )
+            elif kda_paged_mqa_logits is not None:
                 logits = kda_paged_mqa_logits(
                     q=q,
                     kv_cache=c4_indexer_kv_cache,
@@ -703,6 +723,8 @@ class C4IndexerBackendMixin:
                     q_offset=query_rows,
                 )
             else:
+                if self.dsv4_huge_mode:
+                    q = q_indexer.unsqueeze(1)
                 logits = fn(
                     q,
                     c4_indexer_kv_cache,

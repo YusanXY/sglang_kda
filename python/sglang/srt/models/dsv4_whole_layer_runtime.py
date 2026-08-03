@@ -173,6 +173,13 @@ class DSV4WholeLayerRuntime:
 
         if self._active is not None:
             raise RuntimeError("cannot rebind DSV4 layer handles during a forward")
+        # Compile/load the C4 CUDA module at binding time. The first live
+        # request must never encounter a per-layer JIT or a hidden fallback.
+        from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
+            load_clustered_mqa_extension,
+        )
+
+        load_clustered_mqa_extension()
         self._generation += 1
         generation = self._generation
         handles: list[DSV4LayerHandle] = []
@@ -254,6 +261,21 @@ class DSV4WholeLayerRuntime:
         attn_backend = get_attn_backend()
         metadata = attn_backend.forward_metadata
         core = metadata.core_attn_metadata
+        indexer_metadata = metadata.indexer_metadata
+        if indexer_metadata is None:
+            raise RuntimeError(
+                "DSV4 huge runtime requires C4 indexer metadata for every EXTEND"
+            )
+        from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
+            prepare_clustered_mqa_metadata,
+        )
+
+        # One GPU schedule and strided page-table view for the whole batch;
+        # all 21 C4 layers consume these exact objects without replanning.
+        metadata.clustered_mqa_metadata = prepare_clustered_mqa_metadata(
+            indexer_metadata=indexer_metadata,
+            extend_lens_cpu=extend_lens,
+        )
         (
             attention_q_padded,
             output_q,
