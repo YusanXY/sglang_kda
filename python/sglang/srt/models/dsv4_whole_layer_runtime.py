@@ -502,6 +502,11 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError(
                 f"layer {layer_id}: huge WO_A fusion requires FP8 wo_a weights"
             )
+        if layer._post_attention_layernorm_weight_bf16 is None:
+            raise RuntimeError(
+                f"layer {layer_id}: huge mHC fusion requires the cached BF16 "
+                "post-attention RMSNorm weight from post_load_weights"
+            )
         if layer.use_fused_mhc_post_pre:
             raise RuntimeError(
                 "DSV4 huge runtime v1 forbids cross-layer mHC fusion; each "
@@ -553,18 +558,31 @@ def _execute_common(
         e2e_descriptor=descriptor,
     )
 
-    hidden_states = layer.hc_post(hidden_states, residual, post, comb)
-    residual = hidden_states
-    hidden_states, post, comb, norm_fused = layer.hc_pre(
-        hidden_states,
-        layer.hc_ffn_fn,
-        layer.hc_ffn_scale,
-        layer.hc_ffn_base,
-        norm=layer.post_attention_layernorm,
-        forward_batch=descriptor.forward_batch,
-    )
-    if not norm_fused:
-        hidden_states = layer.post_attention_layernorm(hidden_states)
+    # Keep the attention-to-FFN boundary inside one GPU-oriented mHC entry.
+    # For M=4096 this retains the Tensor Core prenorm GEMM, while eliminating
+    # the separate Python hc_post/hc_pre scheduling boundary and allowing the
+    # PDL-enabled CUDA kernels to be submitted as one fused operation chain.
+    if descriptor.num_tokens > 32:
+        residual, post, comb, hidden_states = _fused_mhc_post_ffn_pre(
+            layer=layer,
+            hidden_states=hidden_states,
+            residual=residual,
+            post=post,
+            comb=comb,
+        )
+    else:
+        # The scalar-FMA implementation used by mhc_fused_post_pre at tiny M
+        # changes reduction order enough to accumulate visible model-level
+        # logit drift. Keep the original CUDA primitives for this non-target
+        # shape; this remains inside Huge execution and never calls native.
+        residual, post, comb, hidden_states = _separate_mhc_post_ffn_pre(
+            layer=layer,
+            descriptor=descriptor,
+            hidden_states=hidden_states,
+            residual=residual,
+            post=post,
+            comb=comb,
+        )
 
     hidden_states = layer._run_moe_ffn_dp_sync(
         hidden_states,
@@ -574,6 +592,73 @@ def _execute_common(
     )
     hidden_states = layer.hc_post(hidden_states, residual, post, comb)
     return hidden_states, None, None, None
+
+
+def _fused_mhc_post_ffn_pre(
+    *,
+    layer: Any,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse attention mHC-post with FFN mHC-pre and its RMSNorm.
+
+    The BF16 norm weight is materialized once by ``post_load_weights``.  A
+    missing cache is a binding bug, not permission to cast/allocate in the hot
+    path or to fall back to the native decoder implementation.
+    """
+
+    norm_weight = layer._post_attention_layernorm_weight_bf16
+    if norm_weight is None:
+        raise RuntimeError(
+            f"layer {layer.layer_id}: Huge mHC fusion requires the cached "
+            "BF16 post-attention RMSNorm weight"
+        )
+
+    from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre
+
+    return mhc_fused_post_pre(
+        hidden_states,
+        residual,
+        post.unsqueeze(-1) if post.ndim == 2 else post,
+        comb,
+        layer.hc_ffn_fn,
+        layer.hc_ffn_scale,
+        layer.hc_ffn_base,
+        layer.rms_norm_eps,
+        layer.hc_eps,
+        layer.hc_eps,
+        2.0,
+        layer.hc_sinkhorn_iters,
+        norm_weight=norm_weight,
+        norm_eps=layer.post_attention_layernorm.variance_epsilon,
+    )
+
+
+def _separate_mhc_post_ffn_pre(
+    *,
+    layer: Any,
+    descriptor: DSV4ForwardDescriptor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Numerically stable Huge CUDA path for non-target tiny-M batches."""
+
+    residual = layer.hc_post(hidden_states, residual, post, comb)
+    hidden_states, post, comb, norm_fused = layer.hc_pre(
+        residual,
+        layer.hc_ffn_fn,
+        layer.hc_ffn_scale,
+        layer.hc_ffn_base,
+        norm=layer.post_attention_layernorm,
+        forward_batch=descriptor.forward_batch,
+    )
+    if not norm_fused:
+        hidden_states = layer.post_attention_layernorm(hidden_states)
+    return residual, post, comb, hidden_states
 
 
 def _execute_c0(

@@ -16,6 +16,7 @@ from sglang.srt.model_executor.dsv4_huge_kernel_whole_layer_runner import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.models import dsv4_whole_layer_runtime
 
 
 def test_whole_layer_runner_propagates_cuda_impl_failure_without_native_fallback():
@@ -83,3 +84,29 @@ def test_model_runner_rejects_invalid_forward_before_native_runner_executes():
             Dsv4HugeKernelModelRunner.forward(runner, invalid)
 
     native_forward.assert_not_called()
+
+
+def test_whole_layer_executor_fuses_attention_post_with_ffn_pre():
+    source = textwrap.dedent(
+        inspect.getsource(dsv4_whole_layer_runtime._execute_common)
+    )
+    tree = ast.parse(source)
+    call_attrs = [
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    call_names = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+    # Attention input keeps its own hc_pre and the FFN result keeps its final
+    # hc_post.  The former attention hc_post + FFN hc_pre pair is one fused
+    # GPU entry and cannot silently re-enter the native layer body.
+    assert call_attrs.count("hc_pre") == 1
+    assert call_attrs.count("hc_post") == 1
+    assert "_fused_mhc_post_ffn_pre" in call_names
+    assert "_separate_mhc_post_ffn_pre" in call_names
+    assert "_forward_native" not in call_attrs
