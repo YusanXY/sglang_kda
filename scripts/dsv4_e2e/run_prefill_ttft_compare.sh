@@ -62,6 +62,7 @@ export SGLANG_DSV4_FP4_EXPERTS=1
   printf 'model=%s\npairs=%s\nbatch_size=1\n' "$MODEL" "$PAIRS"
   printf 'cached_history=%s\nnew_chunk=%s\ninput_len=%s\n' "$CACHED_HISTORY" "$NEW_CHUNK" "$INPUT_LEN"
   printf 'output_len=1\ncontext_capacity=%s\ncache_hit_rate=%s\n' "$CONTEXT_CAPACITY" "$CACHE_HIT_RATE"
+  printf 'watchdog_timeout_seconds=2400\nrequest_timeout_seconds=2400\n'
   printf 'order=native,huge_kernel repeated by pair\n'
 } | tee "$RUN_ROOT/experiment.txt"
 
@@ -130,6 +131,7 @@ run_one() {
     --chunked-prefill-size "$NEW_CHUNK"
     --cuda-graph-backend-decode disabled
     --cuda-graph-backend-prefill disabled
+    --watchdog-timeout 2400 --request-timeout 2400
     --skip-server-warmup
     --disable-overlap-schedule --enable-metrics --random-seed 42
     --run-name "pair${pair}_${backend}"
