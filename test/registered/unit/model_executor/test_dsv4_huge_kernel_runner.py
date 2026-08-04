@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.srt.model_executor.dsv4_huge_kernel_model_runner import (
+    DSV4_HUGE_MAX_TOTAL_TOKENS,
     validate_dsv4_huge_kernel_bench_args,
     validate_dsv4_huge_kernel_forward,
     validate_dsv4_huge_kernel_startup,
@@ -86,7 +87,7 @@ def test_startup_contract_accepts_req128_high_load_capacity():
     validate_dsv4_huge_kernel_startup(
         server_args=_server_args(
             max_running_requests=128,
-            max_total_tokens=128 * (16384 + 4096 + 1),
+            max_total_tokens=DSV4_HUGE_MAX_TOTAL_TOKENS,
         ),
         model_config=_flash_model_config(),
         gpu_id=0,
@@ -101,7 +102,7 @@ def test_startup_contract_accepts_req128_high_load_capacity():
         ("tp_size", 8),
         ("ep_size", 1),
         ("max_running_requests", 129),
-        ("max_total_tokens", 128 * (16384 + 4096 + 1) + 1),
+        ("max_total_tokens", DSV4_HUGE_MAX_TOTAL_TOKENS + 1),
         ("disable_overlap_schedule", False),
         ("page_size", 1),
         ("moe_runner_backend", "auto"),

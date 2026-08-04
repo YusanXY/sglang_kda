@@ -21,9 +21,20 @@ logger = logging.getLogger(__name__)
 DSV4_HUGE_CONTEXT_CAPACITY = 73728
 DSV4_HUGE_MAX_EXTEND_TOKENS = 4096
 DSV4_HUGE_MAX_REQUESTS = 128
+DSV4_HUGE_PAGE_SIZE = 256
 # req=128 high-load target: 16384 cached + 4096 new tokens per request.
+# Include one generated token, then round each request to a complete KV page.
 # Chunked prefill still caps each individual ForwardBatch at aggregate M=4096.
-DSV4_HUGE_MAX_TOTAL_TOKENS = 128 * (16384 + 4096 + 1)
+_DSV4_HUGE_HIGH_LOAD_TOKENS_PER_REQUEST = 16384 + 4096 + 1
+DSV4_HUGE_MAX_TOTAL_TOKENS = DSV4_HUGE_MAX_REQUESTS * (
+    (
+        _DSV4_HUGE_HIGH_LOAD_TOKENS_PER_REQUEST
+        + DSV4_HUGE_PAGE_SIZE
+        - 1
+    )
+    // DSV4_HUGE_PAGE_SIZE
+    * DSV4_HUGE_PAGE_SIZE
+)
 DSV4_HUGE_TP_SIZE = 4
 DSV4_HUGE_EP_SIZE = 4
 DSV4_FLASH_COMPRESS_RATIOS = (0, 0) + (4, 128) * 20 + (4,)
@@ -95,7 +106,7 @@ def validate_dsv4_huge_kernel_startup(
         "dcp_size": 1,
         "nnodes": 1,
         "chunked_prefill_size": DSV4_HUGE_MAX_EXTEND_TOKENS,
-        "page_size": 256,
+        "page_size": DSV4_HUGE_PAGE_SIZE,
         "moe_runner_backend": "flashinfer_mxfp4",
         "enable_two_batch_overlap": False,
         "enable_hisparse": False,
