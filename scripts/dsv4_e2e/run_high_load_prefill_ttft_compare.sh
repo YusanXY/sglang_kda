@@ -17,15 +17,21 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 VALIDATOR=$SCRIPT_DIR/validate_prefill_ttft_result.py
 SUMMARIZER=$SCRIPT_DIR/summarize_prefill_ttft.py
 
-BATCH_SIZE=16
+BATCH_SIZE=${DSV4_HIGH_LOAD_REQUESTS:-16}
 CACHED_PER_REQUEST=16384
-NEW_PER_REQUEST=256
+NEW_PER_REQUEST=4096
 AGGREGATE_NEW=$((BATCH_SIZE * NEW_PER_REQUEST))
 AGGREGATE_CACHED=$((BATCH_SIZE * CACHED_PER_REQUEST))
 INPUT_LEN=$((CACHED_PER_REQUEST + NEW_PER_REQUEST))
 CONTEXT_CAPACITY=73728
-MAX_TOTAL_TOKENS=294912
-CACHE_HIT_RATE=0.9846153846153847
+MAX_TOTAL_TOKENS=$((BATCH_SIZE * (INPUT_LEN + 1)))
+CHUNKED_PREFILL_SIZE=4096
+CACHE_HIT_RATE=0.8
+
+if [[ "$BATCH_SIZE" != 16 && "$BATCH_SIZE" != 128 ]]; then
+  echo "DSV4_HIGH_LOAD_REQUESTS must be 16 or 128; got $BATCH_SIZE" >&2
+  exit 2
+fi
 
 if (( PAIRS < 5 )); then
   echo "PAIRS must be at least 5 for a formal comparison; got $PAIRS" >&2
@@ -64,6 +70,7 @@ export SGLANG_DSV4_FP4_EXPERTS=1
   printf 'model=%s\npairs=%s\nbatch_size=%s\n' "$MODEL" "$PAIRS" "$BATCH_SIZE"
   printf 'cached_per_request=%s\nnew_per_request=%s\n' "$CACHED_PER_REQUEST" "$NEW_PER_REQUEST"
   printf 'aggregate_cached=%s\naggregate_new=%s\n' "$AGGREGATE_CACHED" "$AGGREGATE_NEW"
+  printf 'chunked_prefill_size=%s\n' "$CHUNKED_PREFILL_SIZE"
   printf 'input_len=%s\noutput_len=1\ncontext_capacity=%s\n' "$INPUT_LEN" "$CONTEXT_CAPACITY"
   printf 'cache_hit_rate=%s\norder=native,huge_kernel repeated by pair\n' "$CACHE_HIT_RATE"
 } | tee "$RUN_ROOT/experiment.txt"
@@ -128,9 +135,9 @@ run_one() {
     --attention-backend dsv4 --moe-runner-backend flashinfer_mxfp4
     --disable-flashinfer-autotune --dsv4-worker-backend "$backend"
     --context-length "$CONTEXT_CAPACITY" --max-total-tokens "$MAX_TOTAL_TOKENS"
-    --max-running-requests "$BATCH_SIZE" --max-prefill-tokens "$AGGREGATE_NEW"
+    --max-running-requests "$BATCH_SIZE" --max-prefill-tokens "$CHUNKED_PREFILL_SIZE"
     --mem-fraction-static 0.88 --page-size 256 --swa-full-tokens-ratio 0.1
-    --chunked-prefill-size "$AGGREGATE_NEW"
+    --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled
     --skip-server-warmup --skip-warmup --disable-overlap-schedule
     --enable-metrics --random-seed 42 --watchdog-timeout 2400

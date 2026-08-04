@@ -22,7 +22,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_m
 CompressRatio = Literal[0, 4, 128]
 
 _MAX_FORWARD_TOKENS = 4096
-_MAX_FORWARD_REQUESTS = 16
+_MAX_FORWARD_REQUESTS = 128
 
 # This is model identity, not a generic V4 default.  Fail rather than silently
 # running a different architecture through a shape-specialized executor.
@@ -134,7 +134,7 @@ class DSV4WholeLayerRuntime:
         self._generation = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
         self._active: Optional[DSV4ForwardDescriptor] = None
-        # One fixed-capacity allocation serves both req=1 and req<=16. Views are
+        # One fixed-capacity allocation serves req=1 through req=128. Views are
         # exact-T and contiguous, so changing the per-request split never calls
         # the CUDA allocator or changes any layer ABI.
         self._wo_a_workspace: Optional[
@@ -234,7 +234,7 @@ class DSV4WholeLayerRuntime:
         num_tokens = int(positions.shape[0])
         if not 1 <= batch_size <= _MAX_FORWARD_REQUESTS:
             raise RuntimeError(
-                "DSV4 huge runtime requires 1..16 requests per EXTEND, "
+                "DSV4 huge runtime requires 1..128 requests per EXTEND, "
                 f"got {batch_size}"
             )
         if not 1 <= num_tokens <= _MAX_FORWARD_TOKENS:

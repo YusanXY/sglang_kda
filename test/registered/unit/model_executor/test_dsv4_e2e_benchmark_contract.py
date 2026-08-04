@@ -136,6 +136,25 @@ def test_runner_pins_exact_workload_and_order():
     assert all('--id="$GPU_IDS"' in line for line in nvidia_smi_lines)
 
 
+def test_high_load_runner_uses_per_request_4k_and_req16_or_req128():
+    source = (
+        SCRIPT_DIR / "run_high_load_prefill_ttft_compare.sh"
+    ).read_text(encoding="utf-8")
+    for fragment in (
+        "BATCH_SIZE=${DSV4_HIGH_LOAD_REQUESTS:-16}",
+        "CACHED_PER_REQUEST=16384",
+        "NEW_PER_REQUEST=4096",
+        "CHUNKED_PREFILL_SIZE=4096",
+        "CACHE_HIT_RATE=0.8",
+        '[[ "$BATCH_SIZE" != 16 && "$BATCH_SIZE" != 128 ]]',
+        'MAX_TOTAL_TOKENS=$((BATCH_SIZE * (INPUT_LEN + 1)))',
+        '--max-prefill-tokens "$CHUNKED_PREFILL_SIZE"',
+        '--chunked-prefill-size "$CHUNKED_PREFILL_SIZE"',
+        '--new-tokens-per-request "$NEW_PER_REQUEST"',
+    ):
+        assert fragment in source
+
+
 def test_one_batch_profiler_can_flush_after_prefill_only_request():
     source = (REPO_ROOT / "python/sglang/benchmark/one_batch_server.py").read_text(
         encoding="utf-8"

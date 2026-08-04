@@ -112,11 +112,18 @@ struct TopKLaunchParams {
   }
   SGL_DEVICE uint32_t query_owner(uint32_t batch_id) const {
     const int32_t base = query_start_loc[0];
-#pragma unroll 16
-    for (uint32_t req = 0; req < num_reqs; ++req) {
-      if (batch_id < static_cast<uint32_t>(query_start_loc[req + 1] - base)) return req;
+    uint32_t lo = 0;
+    uint32_t hi = num_reqs;
+    while (lo < hi) {
+      const uint32_t mid = (lo + hi) >> 1;
+      if (batch_id <
+          static_cast<uint32_t>(query_start_loc[mid + 1] - base)) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
     }
-    return num_reqs - 1;
+    return lo < num_reqs ? lo : num_reqs - 1;
   }
   SGL_DEVICE void sparse_prefill_epilogue(uint32_t batch_id) const {
     if (combined_indices == nullptr) return;
@@ -500,8 +507,8 @@ struct TopKKernel {
       TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(combined_lens.value());
       RuntimeCheck(query_start_loc.value().shape()[0] == R.unwrap() + 1,
                    "query_start_loc must have num_reqs + 1 entries");
-      RuntimeCheck(R.unwrap() > 0 && R.unwrap() <= 16,
-                   "sparse-prefill topk supports 1..16 requests");
+      RuntimeCheck(R.unwrap() > 0 && R.unwrap() <= 128,
+                   "sparse-prefill topk supports 1..128 requests");
       RuntimeCheck(combined_indices.value().shape()[1] >= K.unwrap() + kSparsePrefillSWAWindow,
                    "combined_indices row is too narrow");
       positions_ptr = static_cast<const int32_t*>(positions.value().data_ptr());

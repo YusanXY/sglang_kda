@@ -20,8 +20,10 @@ logger = logging.getLogger(__name__)
 
 DSV4_HUGE_CONTEXT_CAPACITY = 73728
 DSV4_HUGE_MAX_EXTEND_TOKENS = 4096
-DSV4_HUGE_MAX_REQUESTS = 16
-DSV4_HUGE_MAX_TOTAL_TOKENS = 393216
+DSV4_HUGE_MAX_REQUESTS = 128
+# req=128 high-load target: 16384 cached + 4096 new tokens per request.
+# Chunked prefill still caps each individual ForwardBatch at aggregate M=4096.
+DSV4_HUGE_MAX_TOTAL_TOKENS = 128 * (16384 + 4096 + 1)
 DSV4_HUGE_TP_SIZE = 4
 DSV4_HUGE_EP_SIZE = 4
 DSV4_FLASH_COMPRESS_RATIOS = (0, 0) + (4, 128) * 20 + (4,)
@@ -232,12 +234,9 @@ def validate_dsv4_huge_kernel_bench_args(bench_args) -> None:
             "every --input-len must be in [1, 4096], got "
             f"{invalid_input_lens}"
         )
-    if (
-        len(batch_sizes) == 1
-        and bench_args.input_len
-        and batch_sizes[0] * max(bench_args.input_len) > DSV4_HUGE_MAX_EXTEND_TOKENS
-    ):
-        errors.append("bench_one_batch must keep aggregate M=batch*input_len <= 4096")
+    # input_len is per request. The scheduler is required to split a large
+    # request batch into aggregate-M<=4096 ForwardBatch chunks, which are
+    # validated independently by validate_dsv4_huge_kernel_forward.
     if errors:
         details = "\n  - ".join(errors)
         raise ValueError(

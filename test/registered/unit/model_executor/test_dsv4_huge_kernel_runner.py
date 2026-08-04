@@ -82,13 +82,26 @@ def test_startup_contract_accepts_flash_b300_tp4_ep4():
     )
 
 
+def test_startup_contract_accepts_req128_high_load_capacity():
+    validate_dsv4_huge_kernel_startup(
+        server_args=_server_args(
+            max_running_requests=128,
+            max_total_tokens=128 * (16384 + 4096 + 1),
+        ),
+        model_config=_flash_model_config(),
+        gpu_id=0,
+        device_name="NVIDIA B200",
+        device_capability=(10, 0),
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("tp_size", 8),
         ("ep_size", 1),
-        ("max_running_requests", 17),
-        ("max_total_tokens", 393217),
+        ("max_running_requests", 129),
+        ("max_total_tokens", 128 * (16384 + 4096 + 1) + 1),
         ("disable_overlap_schedule", False),
         ("page_size", 1),
         ("moe_runner_backend", "auto"),
@@ -152,14 +165,20 @@ def test_dynamic_contract_accepts_incremental_cache_build(num_tokens):
     )
 
 
-def test_dynamic_contract_accepts_batch16_aggregate_m4096():
+@pytest.mark.parametrize(
+    ("batch_size", "extend_lens"),
+    ((16, [256] * 16), (128, [32] * 128)),
+)
+def test_dynamic_contract_accepts_high_load_aggregate_m4096(
+    batch_size, extend_lens
+):
     validate_dsv4_huge_kernel_forward(
         SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             global_forward_mode=ForwardMode.EXTEND,
-            batch_size=16,
+            batch_size=batch_size,
             extend_num_tokens=4096,
-            extend_seq_lens_cpu=[256] * 16,
+            extend_seq_lens_cpu=extend_lens,
         )
     )
 
@@ -212,16 +231,21 @@ def test_bench_contract_requires_single_prefill_ttft_point():
         )
     validate_dsv4_huge_kernel_bench_args(
         SimpleNamespace(
-            batch_size=(16,),
-            input_len=(256,),
+            batch_size=(16,), input_len=(4096,), output_len=(1,), correctness_test=False
+        )
+    )
+    validate_dsv4_huge_kernel_bench_args(
+        SimpleNamespace(
+            batch_size=(128,),
+            input_len=(4096,),
             output_len=(1,),
             correctness_test=False,
         )
     )
-    with pytest.raises(ValueError, match="aggregate M"):
+    with pytest.raises(ValueError, match="batch-size"):
         validate_dsv4_huge_kernel_bench_args(
             SimpleNamespace(
-                batch_size=(16,),
+                batch_size=(129,),
                 input_len=(4096,),
                 output_len=(1,),
                 correctness_test=False,

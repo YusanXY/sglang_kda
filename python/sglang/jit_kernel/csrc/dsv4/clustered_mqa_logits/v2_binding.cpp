@@ -365,8 +365,8 @@ void v2_forward_topk(
     TORCH_CHECK(full_seq_lens.dim() == 1 && full_seq_lens.is_contiguous(),
                 "full_seq_lens must be contiguous [R]");
     const auto num_reqs = full_seq_lens.size(0);
-    TORCH_CHECK(num_reqs > 0 && num_reqs <= 16,
-                "clustered sparse-prefill supports 1..16 requests");
+    TORCH_CHECK(num_reqs > 0 && num_reqs <= 128,
+                "clustered sparse-prefill supports 1..128 requests");
     TORCH_CHECK(query_start_loc.dim() == 1 && query_start_loc.size(0) == num_reqs + 1 &&
                 query_start_loc.is_contiguous(),
                 "query_start_loc must be contiguous [R+1]");

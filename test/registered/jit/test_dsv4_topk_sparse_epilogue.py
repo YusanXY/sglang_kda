@@ -16,17 +16,29 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     reason="DSV4 fused top-k sparse epilogue requires Blackwell CUDA",
 )
 @pytest.mark.parametrize("version", ("v1", "v2"))
-def test_topk_sparse_epilogue_matches_standalone_combiner(version):
+@pytest.mark.parametrize("num_reqs", (2, 128))
+def test_topk_sparse_epilogue_matches_standalone_combiner(version, num_reqs):
     device = torch.device("cuda")
     torch.manual_seed(7)
 
-    query_lens = (3, 5)
-    query_start_loc = torch.tensor((0, 3, 8), dtype=torch.int32, device=device)
-    positions = torch.tensor(
-        (2048, 2049, 2050, 4094, 4095, 4096, 4097, 4098),
-        dtype=torch.int32,
-        device=device,
-    )
+    if num_reqs == 2:
+        query_lens = (3, 5)
+        query_start_loc = torch.tensor(
+            (0, 3, 8), dtype=torch.int32, device=device
+        )
+        positions = torch.tensor(
+            (2048, 2049, 2050, 4094, 4095, 4096, 4097, 4098),
+            dtype=torch.int32,
+            device=device,
+        )
+    else:
+        query_lens = (1,) * num_reqs
+        query_start_loc = torch.arange(
+            num_reqs + 1, dtype=torch.int32, device=device
+        )
+        positions = torch.arange(
+            2048, 2048 + num_reqs, dtype=torch.int32, device=device
+        )
     compressed_seq_lens = ((positions + 1) // 4).to(torch.int32)
     max_compressed_len = int(compressed_seq_lens.max().item())
     scores = torch.randn(
@@ -35,11 +47,13 @@ def test_topk_sparse_epilogue_matches_standalone_combiner(version):
 
     page_size = 256
     num_pages = (max_compressed_len + page_size - 1) // page_size
-    per_req_pages = torch.tensor(
-        ([13, 29, 47, 61, 79], [101, 127, 149, 167, 191]),
-        dtype=torch.int32,
-        device=device,
-    )[:, :num_pages]
+    per_req_pages = (
+        torch.arange(
+            num_reqs * num_pages, dtype=torch.int32, device=device
+        ).view(num_reqs, num_pages)
+        * 17
+        + 13
+    )
     page_table = per_req_pages.repeat_interleave(
         torch.tensor(query_lens, device=device), dim=0
     ).contiguous()
@@ -73,13 +87,16 @@ def test_topk_sparse_epilogue_matches_standalone_combiner(version):
 
     transform(page_ref, raw_ref)
 
-    full_seq_lens = torch.tensor((2051, 4099), dtype=torch.int32, device=device)
-    gather_lens = torch.tensor((130, 132), dtype=torch.int32, device=device)
+    last_query = query_start_loc[1:].to(torch.int64) - 1
+    full_seq_lens = positions.index_select(0, last_query) + 1
+    gather_lens = torch.minimum(full_seq_lens, torch.full_like(full_seq_lens, 132))
     c4_max = max_compressed_len
-    compressed_base = torch.tensor((0, c4_max), dtype=torch.int32, device=device)
-    swa_base = torch.tensor(
-        (2 * c4_max, 2 * c4_max + 130), dtype=torch.int32, device=device
+    compressed_base = (
+        torch.arange(num_reqs, dtype=torch.int32, device=device) * c4_max
     )
+    swa_offsets = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+    swa_offsets[1:] = torch.cumsum(gather_lens[:-1], dim=0)
+    swa_base = num_reqs * c4_max + swa_offsets
     page_out = torch.empty_like(page_ref)
     raw_out = torch.empty_like(raw_ref)
     combined_out = torch.full(
