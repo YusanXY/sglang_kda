@@ -54,6 +54,43 @@ def test_grouped_metadata_is_built_once_without_copying_page_rows():
     )
 
 
+def test_grouped_metadata_reuses_prebound_logits_workspace():
+    c4_seq_lens = torch.arange(1, 33, dtype=torch.int32)
+    indexer_metadata = SimpleNamespace(
+        c4_seq_lens=c4_seq_lens,
+        page_table=torch.arange(32 * 5, dtype=torch.int32).view(32, 5),
+        max_c4_seq_len=320,
+    )
+    workspace = torch.empty((64, 768), dtype=torch.float32)
+    deep_gemm = SimpleNamespace(
+        get_num_sms=lambda: 148,
+        get_paged_mqa_logits_metadata=lambda *_: torch.empty(
+            (1, 2), dtype=torch.int32
+        ),
+    )
+
+    with (
+        mock.patch.dict("sys.modules", {"deep_gemm": deep_gemm}),
+        mock.patch(
+            "sglang.jit_kernel.dsv4.clustered_mqa_logits.load_clustered_mqa_extension",
+            return_value=object(),
+        ),
+    ):
+        metadata = prepare_clustered_mqa_metadata(
+            indexer_metadata=indexer_metadata,
+            extend_lens_cpu=[16, 16],
+            logits_workspace=workspace,
+        )
+
+    assert metadata is not None
+    assert metadata.logits_workspace.shape == (32, 768)
+    assert metadata.logits_workspace.is_contiguous()
+    assert (
+        metadata.logits_workspace.untyped_storage().data_ptr()
+        == workspace.untyped_storage().data_ptr()
+    )
+
+
 def test_non_q16_request_uses_explicit_deepgemm_cuda_specialization():
     indexer_metadata = SimpleNamespace(
         c4_seq_lens=torch.ones(17, dtype=torch.int32),

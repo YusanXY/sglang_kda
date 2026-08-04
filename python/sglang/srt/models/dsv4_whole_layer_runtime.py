@@ -134,6 +134,7 @@ class DSV4WholeLayerRuntime:
         self._generation = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
         self._active: Optional[DSV4ForwardDescriptor] = None
+        self._clustered_logits_workspace: Optional[torch.Tensor] = None
         # One fixed-capacity allocation serves req=1 through req=128. Views are
         # exact-T and contiguous, so changing the per-request split never calls
         # the CUDA allocator or changes any layer ABI.
@@ -176,10 +177,25 @@ class DSV4WholeLayerRuntime:
         # Compile/load the C4 CUDA module at binding time. The first live
         # request must never encounter a per-layer JIT or a hidden fallback.
         from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
+            MAX_C4_CONTEXT,
+            MAX_TOTAL_Q,
             load_clustered_mqa_extension,
         )
 
         load_clustered_mqa_extension()
+        workspace_device = layers[start_layer].self_attn.wo_a.weight.device
+        if (
+            self._clustered_logits_workspace is None
+            or self._clustered_logits_workspace.device != workspace_device
+        ):
+            # Bind the full strict-runtime capacity once.  Prefix construction
+            # and the measured incremental request then reuse one GPU address,
+            # so neither allocator growth nor a new TMA row stride enters TTFT.
+            self._clustered_logits_workspace = torch.empty(
+                (MAX_TOTAL_Q, MAX_C4_CONTEXT),
+                dtype=torch.float32,
+                device=workspace_device,
+            )
         self._generation += 1
         generation = self._generation
         handles: list[DSV4LayerHandle] = []
@@ -275,6 +291,7 @@ class DSV4WholeLayerRuntime:
         metadata.clustered_mqa_metadata = prepare_clustered_mqa_metadata(
             indexer_metadata=indexer_metadata,
             extend_lens_cpu=extend_lens,
+            logits_workspace=self._clustered_logits_workspace,
         )
         (
             attention_q_padded,

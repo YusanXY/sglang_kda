@@ -23,6 +23,8 @@ HEADS = 64
 HEAD_DIM = 128
 PAGE_SIZE = 64
 QUERIES_PER_CLUSTER = 16
+MAX_TOTAL_Q = 4096
+MAX_C4_CONTEXT = 18432
 
 _HERE = Path(__file__).resolve().parent
 _SOURCE_DIR = _HERE.parent / "csrc" / "dsv4" / "clustered_mqa_logits"
@@ -129,7 +131,10 @@ def load_clustered_mqa_extension():
 
 
 def prepare_clustered_mqa_metadata(
-    *, indexer_metadata: Any, extend_lens_cpu: Sequence[int]
+    *,
+    indexer_metadata: Any,
+    extend_lens_cpu: Sequence[int],
+    logits_workspace: torch.Tensor | None = None,
 ) -> ClusteredMqaMetadata | None:
     """Build one grouped device schedule when requests have complete Q16 groups.
 
@@ -172,14 +177,32 @@ def prepare_clustered_mqa_metadata(
         deep_gemm.get_num_sms() // 2,
     )
     padded_context = (indexer_metadata.max_c4_seq_len + 255) // 256 * 256
-    # Decoder layers execute serially on the current stream.  Keep one device
-    # buffer alive for the whole ForwardBatch instead of entering the PyTorch
-    # allocator once per C4 layer (21 times for DSV4 Flash).
-    logits_workspace = torch.empty(
-        (total_q, padded_context),
-        dtype=torch.float32,
-        device=c4_seq_lens.device,
-    )
+    if logits_workspace is None:
+        # Standalone/operator callers retain the old allocation contract.
+        logits_workspace = torch.empty(
+            (total_q, padded_context),
+            dtype=torch.float32,
+            device=c4_seq_lens.device,
+        )
+    else:
+        if (
+            logits_workspace.device != c4_seq_lens.device
+            or logits_workspace.dtype != torch.float32
+            or logits_workspace.ndim != 2
+            or logits_workspace.shape[0] < total_q
+            or logits_workspace.shape[1] < padded_context
+            or logits_workspace.shape[1] % 256 != 0
+            or not logits_workspace.is_contiguous()
+        ):
+            raise RuntimeError(
+                "clustered DSV4 MQA requires a contiguous FP32 prebound "
+                f"workspace covering [{total_q},{padded_context}], got "
+                f"shape={tuple(logits_workspace.shape)}, "
+                f"dtype={logits_workspace.dtype}, device={logits_workspace.device}"
+            )
+        # Slice rows only and preserve the fixed full-context row stride.  This
+        # remains contiguous and avoids a new allocator request when M changes.
+        logits_workspace = logits_workspace[:total_q]
     return ClusteredMqaMetadata(
         seq_lens=grouped_lens,
         page_table=grouped_page_table,
@@ -265,6 +288,8 @@ def clustered_fp8_paged_mqa_topk(
 
 __all__ = [
     "ClusteredMqaMetadata",
+    "MAX_C4_CONTEXT",
+    "MAX_TOTAL_Q",
     "clustered_fp8_paged_mqa_logits",
     "clustered_fp8_paged_mqa_topk",
     "load_clustered_mqa_extension",

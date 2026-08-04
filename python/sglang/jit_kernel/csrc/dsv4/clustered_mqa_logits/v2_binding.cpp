@@ -6,10 +6,79 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace {
+
+constexpr size_t kMaxCachedTmaDescriptorsPerRank = 4096;
+
+inline size_t hash_combine(size_t seed, uint64_t value) {
+    return seed ^ (std::hash<uint64_t>{}(value) + 0x9e3779b97f4a7c15ULL +
+                   (seed << 6) + (seed >> 2));
+}
+
+struct Tma2DKey {
+    uintptr_t base;
+    uint64_t dim0;
+    uint64_t dim1;
+    uint64_t stride1_bytes;
+    uint32_t box0;
+    uint32_t box1;
+    uint32_t dtype;
+    uint32_t swizzle;
+
+    bool operator==(const Tma2DKey&) const = default;
+};
+
+struct Tma3DKey {
+    uintptr_t base;
+    uint64_t dim0;
+    uint64_t dim1;
+    uint64_t dim2;
+    uint64_t stride1_bytes;
+    uint64_t stride2_bytes;
+    uint32_t box0;
+    uint32_t box1;
+    uint32_t box2;
+    uint32_t dtype;
+    uint32_t swizzle;
+
+    bool operator==(const Tma3DKey&) const = default;
+};
+
+struct Tma2DHash {
+    size_t operator()(const Tma2DKey& key) const {
+        size_t hash = 0;
+        hash = hash_combine(hash, key.base);
+        hash = hash_combine(hash, key.dim0);
+        hash = hash_combine(hash, key.dim1);
+        hash = hash_combine(hash, key.stride1_bytes);
+        hash = hash_combine(hash, key.box0);
+        hash = hash_combine(hash, key.box1);
+        hash = hash_combine(hash, key.dtype);
+        return hash_combine(hash, key.swizzle);
+    }
+};
+
+struct Tma3DHash {
+    size_t operator()(const Tma3DKey& key) const {
+        size_t hash = 0;
+        hash = hash_combine(hash, key.base);
+        hash = hash_combine(hash, key.dim0);
+        hash = hash_combine(hash, key.dim1);
+        hash = hash_combine(hash, key.dim2);
+        hash = hash_combine(hash, key.stride1_bytes);
+        hash = hash_combine(hash, key.stride2_bytes);
+        hash = hash_combine(hash, key.box0);
+        hash = hash_combine(hash, key.box1);
+        hash = hash_combine(hash, key.box2);
+        hash = hash_combine(hash, key.dtype);
+        return hash_combine(hash, key.swizzle);
+    }
+};
 
 void check_cu(CUresult result, const char* what) {
     if (result == CUDA_SUCCESS) {
@@ -34,6 +103,20 @@ CUtensorMap make_tma_2d(
         uint32_t box0,
         uint32_t box1,
         CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE) {
+    const Tma2DKey key{
+        .base = reinterpret_cast<uintptr_t>(base),
+        .dim0 = dim0,
+        .dim1 = dim1,
+        .stride1_bytes = stride1_bytes,
+        .box0 = box0,
+        .box1 = box1,
+        .dtype = static_cast<uint32_t>(dtype),
+        .swizzle = static_cast<uint32_t>(swizzle),
+    };
+    thread_local std::unordered_map<Tma2DKey, CUtensorMap, Tma2DHash> cache;
+    if (const auto it = cache.find(key); it != cache.end()) {
+        return it->second;
+    }
     CUtensorMap map{};
     const cuuint64_t global_dims[2] = {dim0, dim1};
     const cuuint64_t global_strides[1] = {stride1_bytes};
@@ -54,6 +137,9 @@ CUtensorMap make_tma_2d(
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
         "cuTensorMapEncodeTiled(2D)");
+    if (cache.size() < kMaxCachedTmaDescriptorsPerRank) {
+        cache.emplace(key, map);
+    }
     return map;
 }
 
@@ -69,6 +155,23 @@ CUtensorMap make_tma_3d(
         uint32_t box1,
         uint32_t box2,
         CUtensorMapSwizzle swizzle = CU_TENSOR_MAP_SWIZZLE_NONE) {
+    const Tma3DKey key{
+        .base = reinterpret_cast<uintptr_t>(base),
+        .dim0 = dim0,
+        .dim1 = dim1,
+        .dim2 = dim2,
+        .stride1_bytes = stride1_bytes,
+        .stride2_bytes = stride2_bytes,
+        .box0 = box0,
+        .box1 = box1,
+        .box2 = box2,
+        .dtype = static_cast<uint32_t>(dtype),
+        .swizzle = static_cast<uint32_t>(swizzle),
+    };
+    thread_local std::unordered_map<Tma3DKey, CUtensorMap, Tma3DHash> cache;
+    if (const auto it = cache.find(key); it != cache.end()) {
+        return it->second;
+    }
     CUtensorMap map{};
     const cuuint64_t global_dims[3] = {dim0, dim1, dim2};
     const cuuint64_t global_strides[2] = {stride1_bytes, stride2_bytes};
@@ -89,6 +192,9 @@ CUtensorMap make_tma_3d(
             CU_TENSOR_MAP_L2_PROMOTION_NONE,
             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
         "cuTensorMapEncodeTiled(3D)");
+    if (cache.size() < kMaxCachedTmaDescriptorsPerRank) {
+        cache.emplace(key, map);
+    }
     return map;
 }
 
