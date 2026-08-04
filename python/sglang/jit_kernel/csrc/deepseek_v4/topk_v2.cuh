@@ -30,6 +30,7 @@ using impl::TopKProblem;
 
 using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
 using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
+using Register5 = impl::TopKRegister<5>;  // <= 20480, register-resident, 1 read
 using Streaming = impl::TopKStreaming;
 using Cluster = impl::TopKCluster<8>;
 
@@ -39,6 +40,7 @@ constexpr uint32_t kMaxTopK = impl::TopKConfig::kMaxTopK;
 constexpr uint32_t kClusterSize = Cluster::kClusterSize;
 constexpr uint32_t kReg2MaxSeqLen = Register2::kMaxSeqLen;  // 8192
 constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
+constexpr uint32_t kReg5MaxSeqLen = Register5::kMaxSeqLen;  // 20480
 
 #define TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, kOccupancy)
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
@@ -220,7 +222,7 @@ SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
  * \tparam kLevel:
  * - Level 0: max_seq_len <= 8192           -> trivial + register<2>
  * - Level 1: max_seq_len <= 16384          -> trivial + register<4>
- * - Level 2: max_seq_len <= cluster_floor  -> trivial + register<4> + streaming
+ * - Level 2: max_seq_len <= cluster_floor  -> trivial + register<4/5> + streaming
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
 template <bool kPDL, int kLevel>
@@ -228,7 +230,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
-  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Register5::Smem, Streaming::Smem> smem;
   __shared__ SparsePrefillEpiloguePlan sparse_epilogue_plan;
   if (problem.seq_len <= problem.topk) {
     trivial_transform<kPDL>(problem);
@@ -264,6 +266,11 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
     constexpr bool kPDLFinal = kPDL && kHandleCluster;
     if (problem.seq_len <= kReg4MaxSeqLen) {
       Register4::forward<kPDLEarly>(problem, &smem);
+    } else if (problem.seq_len <= kReg5MaxSeqLen) {
+      // DSV4 Flash's strict C4 context tops out at 18432.  Keeping the fifth
+      // float4 vector resident avoids rereading the complete logits row in
+      // the streaming collect pass for the important 64K-prefix workload.
+      Register5::forward<kPDLEarly>(problem, &smem);
     } else if (problem.seq_len <= cluster_threshold) {
       Streaming::forward<kPDLEarly>(problem, &smem);
     } else {  // cluster path do nothing here
@@ -323,6 +330,8 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   // for small batch, we will fuse in the cluster case
   if (problem.seq_len <= kReg4MaxSeqLen) {
     if (blockIdx.y == worker_rank) Register4::forward<kPDL>(problem, &smem);
+  } else if (problem.seq_len <= kReg5MaxSeqLen) {
+    if (blockIdx.y == worker_rank) Register5::forward<kPDL>(problem, &smem);
   } else if (problem.seq_len <= params.cluster_floor) {
     if (blockIdx.y == worker_rank) Streaming::forward<kPDL>(problem, &smem);
   } else {
