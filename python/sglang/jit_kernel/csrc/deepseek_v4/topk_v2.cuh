@@ -125,19 +125,20 @@ struct TopKLaunchParams {
     }
     return lo < num_reqs ? lo : num_reqs - 1;
   }
-  SGL_DEVICE void sparse_prefill_epilogue(uint32_t batch_id) const {
+  SGL_DEVICE void sparse_prefill_epilogue(
+      uint32_t batch_id,
+      uint32_t req,
+      const int32_t* __restrict__ raw_indices_ptr) const {
     if (combined_indices == nullptr) return;
-    const uint32_t req = query_owner(batch_id);
     const uint32_t seq_len = static_cast<uint32_t>(seq_lens[batch_id]);
     const uint32_t topk_len = seq_len < topk ? seq_len : topk;
     const int32_t pos = positions[batch_id];
     const uint32_t pos_len = static_cast<uint32_t>(pos + 1);
     const uint32_t swa_len = pos_len < kSparsePrefillSWAWindow ? pos_len : kSparsePrefillSWAWindow;
     const int32_t gather_start = full_seq_lens[req] - swa_gather_lens[req];
-    const auto* raw_row = raw_indices + batch_id * static_cast<int64_t>(topk);
     auto* combined_row = combined_indices + batch_id * combined_indices_stride;
     for (uint32_t t = threadIdx.x; t < topk_len; t += blockDim.x) {
-      combined_row[t] = raw_row[t] + compressed_base[req];
+      combined_row[t] = raw_indices_ptr[t] + compressed_base[req];
     }
     for (uint32_t t = threadIdx.x; t < swa_len; t += blockDim.x) {
       combined_row[topk_len + t] =
@@ -213,14 +214,24 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+  __shared__ uint32_t sparse_query_owner;
   if (problem.seq_len <= problem.topk) {
     trivial_transform<kPDL>(problem);
+    if (params.combined_indices != nullptr && threadIdx.x == 0) {
+      sparse_query_owner = params.query_owner(blockIdx.x);
+    }
     __syncthreads();
-    params.sparse_prefill_epilogue(blockIdx.x);
+    if (params.combined_indices != nullptr) {
+      params.sparse_prefill_epilogue(
+          blockIdx.x,
+          sparse_query_owner,
+          params.raw_indices + blockIdx.x * static_cast<int64_t>(params.topk));
+    }
     return;
   }
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
+  const int32_t* epilogue_indices_ptr = topk_indices;
 
   constexpr bool kHandleCluster = (kLevel == 3);
   // non-trivial path: dispatch based on level and seq_len
@@ -242,6 +253,10 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
       Streaming::forward<kPDLEarly>(problem, &smem);
     } else {  // cluster path do nothing here
       problem.out = params.get_output_ptr(blockIdx.x);
+      // The persistent cluster kernel publishes its raw result in global
+      // output, so this CTA has no shared raw-index copy to reuse.
+      epilogue_indices_ptr =
+          params.raw_indices + blockIdx.x * static_cast<int64_t>(params.topk);
     }
     device::PDLWaitPrimary<kPDLFinal>();
   }
@@ -251,8 +266,14 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  if (params.combined_indices != nullptr && threadIdx.x == 0) {
+    sparse_query_owner = params.query_owner(blockIdx.x);
+  }
   __syncthreads();
-  params.sparse_prefill_epilogue(blockIdx.x);
+  if (params.combined_indices != nullptr) {
+    params.sparse_prefill_epilogue(
+        blockIdx.x, sparse_query_owner, epilogue_indices_ptr);
+  }
 }
 
 template <bool kPDL>
@@ -260,13 +281,22 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
+  __shared__ uint32_t sparse_query_owner;
   // One rank owns final output for both the trivial and clustered paths.
   const auto worker_rank = blockIdx.x % kClusterSize;
   if (problem.seq_len <= problem.topk) {
     if (blockIdx.y == worker_rank) {
       trivial_transform<kPDL>(problem);
+      if (params.combined_indices != nullptr && threadIdx.x == 0) {
+        sparse_query_owner = params.query_owner(blockIdx.x);
+      }
       __syncthreads();
-      params.sparse_prefill_epilogue(blockIdx.x);
+      if (params.combined_indices != nullptr) {
+        params.sparse_prefill_epilogue(
+            blockIdx.x,
+            sparse_query_owner,
+            params.raw_indices + blockIdx.x * static_cast<int64_t>(params.topk));
+      }
     }
     return;
   }
@@ -291,8 +321,14 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   __syncthreads();
   if (blockIdx.y == worker_rank) {
     problem_transform(problem, params.get_output_ptr(blockIdx.x));
+    if (params.combined_indices != nullptr && threadIdx.x == 0) {
+      sparse_query_owner = params.query_owner(blockIdx.x);
+    }
     __syncthreads();
-    params.sparse_prefill_epilogue(blockIdx.x);
+    if (params.combined_indices != nullptr) {
+      params.sparse_prefill_epilogue(
+          blockIdx.x, sparse_query_owner, topk_indices);
+    }
   }
 }
 
