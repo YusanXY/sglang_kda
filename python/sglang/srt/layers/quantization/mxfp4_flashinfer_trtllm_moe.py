@@ -44,6 +44,36 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
     "SGLANG_MXFP4_USE_OFFICIAL_SHUFFLE", default="true"
 )
 
+_DSV4_MOE_OVERLAP_INSTALLED = False
+
+
+def _install_dsv4_huge_moe_overlap() -> None:
+    """Select the Huge-only TRTLLM MoE module before FlashInfer builds it."""
+    global _DSV4_MOE_OVERLAP_INSTALLED
+
+    if get_server_args().dsv4_worker_backend != "huge_kernel":
+        return
+    if _DSV4_MOE_OVERLAP_INSTALLED:
+        return
+
+    from flashinfer.fused_moe import core as flashinfer_moe_core
+
+    cache_info = flashinfer_moe_core.get_trtllm_moe_sm100_module.cache_info()
+    if cache_info.currsize:
+        raise RuntimeError(
+            "DSV4 Huge MoE overlap must be installed before the FlashInfer "
+            "TRTLLM SM100 module is built"
+        )
+
+    from sglang.jit_kernel.dsv4_moe_overlap import (
+        gen_dsv4_trtllm_gen_fused_moe_sm100_module,
+    )
+
+    flashinfer_moe_core.gen_trtllm_gen_fused_moe_sm100_module = (
+        gen_dsv4_trtllm_gen_fused_moe_sm100_module
+    )
+    _DSV4_MOE_OVERLAP_INSTALLED = True
+
 
 class Mxfp4FlashinferTrtllmMoEMethod:
 
@@ -55,6 +85,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
+        _install_dsv4_huge_moe_overlap()
         self.moe_runner_config = moe_runner_config
 
         swiglu_limit = moe_runner_config.swiglu_limit
