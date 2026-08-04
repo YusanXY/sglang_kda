@@ -25,11 +25,17 @@ AGGREGATE_CACHED=$((BATCH_SIZE * CACHED_PER_REQUEST))
 INPUT_LEN=$((CACHED_PER_REQUEST + NEW_PER_REQUEST))
 CONTEXT_CAPACITY=73728
 MAX_TOTAL_TOKENS=$((BATCH_SIZE * (INPUT_LEN + 1)))
-CHUNKED_PREFILL_SIZE=4096
+FORWARD_BATCH_M=4096
+CHUNKED_PREFILL_SIZE=$FORWARD_BATCH_M
+EXPECTED_FORWARD_BATCHES=$((AGGREGATE_NEW / FORWARD_BATCH_M))
 CACHE_HIT_RATE=0.8
 
 if [[ "$BATCH_SIZE" != 16 && "$BATCH_SIZE" != 128 ]]; then
   echo "DSV4_HIGH_LOAD_REQUESTS must be 16 or 128; got $BATCH_SIZE" >&2
+  exit 2
+fi
+if (( AGGREGATE_NEW % FORWARD_BATCH_M != 0 )); then
+  echo "aggregate new tokens must be divisible by ForwardBatch M" >&2
   exit 2
 fi
 
@@ -70,6 +76,8 @@ export SGLANG_DSV4_FP4_EXPERTS=1
   printf 'model=%s\npairs=%s\nbatch_size=%s\n' "$MODEL" "$PAIRS" "$BATCH_SIZE"
   printf 'cached_per_request=%s\nnew_per_request=%s\n' "$CACHED_PER_REQUEST" "$NEW_PER_REQUEST"
   printf 'aggregate_cached=%s\naggregate_new=%s\n' "$AGGREGATE_CACHED" "$AGGREGATE_NEW"
+  printf 'forward_batch_m=%s\nexpected_forward_batches=%s\n' \
+    "$FORWARD_BATCH_M" "$EXPECTED_FORWARD_BATCHES"
   printf 'chunked_prefill_size=%s\n' "$CHUNKED_PREFILL_SIZE"
   printf 'input_len=%s\noutput_len=1\ncontext_capacity=%s\n' "$INPUT_LEN" "$CONTEXT_CAPACITY"
   printf 'cache_hit_rate=%s\norder=native,huge_kernel repeated by pair\n' "$CACHE_HIT_RATE"
@@ -199,6 +207,7 @@ run_one() {
     --cache-hit-tolerance "$CACHE_HIT_TOLERANCE" --batch-size "$BATCH_SIZE" \
     --cached-history-per-request "$CACHED_PER_REQUEST" \
     --new-tokens-per-request "$NEW_PER_REQUEST" --output-len 1 \
+    --forward-batch-m "$FORWARD_BATCH_M" \
     --require-shape-warmup | tee "$validation"
   printf '%s\t%s\t%s\t%s\t%s\n' "$pair" "$ordinal" "$backend" "$result" "$log" >> "$MANIFEST"
   wait_gpu_idle
@@ -216,7 +225,8 @@ set +e
 "$PYTHON" "$SUMMARIZER" --manifest "$MANIFEST" --output-dir "$RUN_ROOT" \
   --min-pairs "$PAIRS" --cache-hit-tolerance "$CACHE_HIT_TOLERANCE" \
   --batch-size "$BATCH_SIZE" --cached-history-per-request "$CACHED_PER_REQUEST" \
-  --new-tokens-per-request "$NEW_PER_REQUEST" --output-len 1 --require-shape-warmup
+  --new-tokens-per-request "$NEW_PER_REQUEST" --output-len 1 \
+  --forward-batch-m "$FORWARD_BATCH_M" --require-shape-warmup
 summary_status=$?
 set -e
 if (( summary_status != 0 )); then

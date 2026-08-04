@@ -89,6 +89,95 @@ def test_validator_requires_scheduler_and_metrics_semantics(tmp_path):
         validator.validate(result, log, "huge_kernel", 0.01)
 
 
+@pytest.mark.parametrize("batch_size", [16, 128])
+def test_high_load_validator_requires_m4096_forward_batches(tmp_path, batch_size):
+    cached_per_request = 16384
+    new_per_request = 4096
+    input_len = cached_per_request + new_per_request
+    aggregate_cached = batch_size * cached_per_request
+    result = tmp_path / f"req{batch_size}.jsonl"
+    log = tmp_path / f"req{batch_size}.log"
+    result.write_text(
+        json.dumps(
+            {
+                "batch_size": batch_size,
+                "input_len": input_len,
+                "output_len": 1,
+                "latency": 2.0,
+                "input_throughput": batch_size * input_len,
+                "last_ttft": 1.0,
+                "cache_hit_rate": 0.8,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    marker = {
+        "batch_size": batch_size,
+        "cached_tokens_per_request": cached_per_request,
+        "input_len": input_len,
+        "new_tokens_per_request": new_per_request,
+        "output_len": 1,
+    }
+    scheduler_lines = [
+        "Prefill batch, "
+        f"#new-seq: {batch_size if index == 0 else 0}, "
+        "#new-token: 4096, "
+        f"#cached-token: {aggregate_cached if index == 0 else 0},"
+        for index in range(batch_size)
+    ]
+    log.write_text(
+        "Warming up cache with 80.0% hit rate "
+        "(16384 tokens per request)\n"
+        "Cache warmup completed\n"
+        "Warming exact cached-prefill shape with a non-matching suffix "
+        f"({batch_size} requests, {batch_size * new_per_request} new tokens)\n"
+        "Cached-prefill shape warmup completed\n"
+        "DSV4 worker backend active: huge_kernel\n"
+        + validator.MEASURED_REQUEST_BEGIN
+        + json.dumps(marker, sort_keys=True)
+        + "\n"
+        + "\n".join(scheduler_lines)
+        + "\nSGLANG_BENCH_MEASURED_REQUEST_END\n",
+        encoding="utf-8",
+    )
+
+    checked = validator.validate(
+        result,
+        log,
+        "huge_kernel",
+        0.01,
+        expected_batch_size=batch_size,
+        expected_cached_history=cached_per_request,
+        expected_new_per_request=new_per_request,
+        expected_forward_batch_m=4096,
+        require_shape_warmup=True,
+    )
+    assert checked["new_tokens_per_request"] == 4096
+    assert checked["aggregate_new_tokens"] == batch_size * 4096
+    assert checked["forward_batch_m"] == 4096
+    assert checked["forward_batch_count"] == batch_size
+
+    log.write_text(
+        log.read_text(encoding="utf-8").replace(
+            "#new-token: 4096", "#new-token: 8192", 1
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="ForwardBatch"):
+        validator.validate(
+            result,
+            log,
+            "huge_kernel",
+            0.01,
+            expected_batch_size=batch_size,
+            expected_cached_history=cached_per_request,
+            expected_new_per_request=new_per_request,
+            expected_forward_batch_m=4096,
+            require_shape_warmup=True,
+        )
+
+
 def test_five_of_five_wins_pass_formal_gate(tmp_path):
     summary = summarizer.summarize(_manifest(tmp_path, [0.8] * 5), 5, 0.01)
     assert summary["status"] == "PASS"
@@ -144,13 +233,16 @@ def test_high_load_runner_uses_per_request_4k_and_req16_or_req128():
         "BATCH_SIZE=${DSV4_HIGH_LOAD_REQUESTS:-16}",
         "CACHED_PER_REQUEST=16384",
         "NEW_PER_REQUEST=4096",
-        "CHUNKED_PREFILL_SIZE=4096",
+        "FORWARD_BATCH_M=4096",
+        'EXPECTED_FORWARD_BATCHES=$((AGGREGATE_NEW / FORWARD_BATCH_M))',
+        'CHUNKED_PREFILL_SIZE=$FORWARD_BATCH_M',
         "CACHE_HIT_RATE=0.8",
         '[[ "$BATCH_SIZE" != 16 && "$BATCH_SIZE" != 128 ]]',
         'MAX_TOTAL_TOKENS=$((BATCH_SIZE * (INPUT_LEN + 1)))',
         '--max-prefill-tokens "$CHUNKED_PREFILL_SIZE"',
         '--chunked-prefill-size "$CHUNKED_PREFILL_SIZE"',
         '--new-tokens-per-request "$NEW_PER_REQUEST"',
+        '--forward-batch-m "$FORWARD_BATCH_M"',
     ):
         assert fragment in source
 

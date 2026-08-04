@@ -830,6 +830,19 @@ def run_one_case(
     # Get metrics before the request (for cache hit rate calculation)
     metrics_before = get_cache_tokens_from_metrics(url)
 
+    measured_request = {
+        "batch_size": batch_size,
+        "cached_tokens_per_request": int(input_len * cache_hit_rate),
+        "input_len": input_len,
+        "new_tokens_per_request": input_len - int(input_len * cache_hit_rate),
+        "output_len": output_len,
+    }
+    print(
+        "SGLANG_BENCH_MEASURED_REQUEST_BEGIN "
+        + json.dumps(measured_request, sort_keys=True),
+        flush=True,
+    )
+
     # Run the request
     tic = time.perf_counter()
     with requests.post(
@@ -876,6 +889,8 @@ def run_one_case(
                     )
                     if data["meta_info"]["completion_tokens"] == 1:
                         last_ttft = time.perf_counter() - tic
+
+    print("SGLANG_BENCH_MEASURED_REQUEST_END", flush=True)
 
     if profile and profile_stop_after_request:
         response = requests.post(url + "/stop_profile", timeout=DEFAULT_TIMEOUT)
