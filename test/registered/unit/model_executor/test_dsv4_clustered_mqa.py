@@ -211,5 +211,10 @@ def test_topk_cuda_deterministically_sorts_raw_indices_before_sparse_epilogue():
     assert "cub::BlockRadixSort<int32_t, kBlockSize, 1>" in source
     assert "cub::BlockRadixSort<int32_t, kBlockSize, 2>" in source
     assert ".Sort(source_index, 0, end_bit);" in source
+    assert "problem_transform_bitset512" in source
+    assert "IndexBitsetScan" in source
+    assert "atomicOr(" in source
+    assert ".ExclusiveSum(__popc(bits), write_base);" in source
+    assert "problem.topk == kHugeIndexSortTopK" in source
     assert "Sparse attention accumulates in that order" in source
     assert "params.raw_indices + blockIdx.x" in source

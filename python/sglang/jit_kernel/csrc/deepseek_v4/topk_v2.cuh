@@ -20,6 +20,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_scan.cuh>
 
 #include <bit>
 #include <cstdint>
@@ -53,6 +54,16 @@ constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
 constexpr uint32_t kSparsePrefillSWAWindow = 128;
 using IndexSort1 = cub::BlockRadixSort<int32_t, kBlockSize, 1>;
 using IndexSort2 = cub::BlockRadixSort<int32_t, kBlockSize, 2>;
+constexpr uint32_t kHugeIndexSortTopK = 512;
+constexpr uint32_t kHugeIndexSortMaxSeqLen = Register5::kMaxSeqLen;
+constexpr uint32_t kHugeIndexSortWords =
+    (kHugeIndexSortMaxSeqLen + 31) / 32;
+using IndexBitsetScan = cub::BlockScan<uint32_t, kBlockSize>;
+
+struct IndexBitsetSortStorage {
+  uint32_t words[kHugeIndexSortWords];
+  IndexBitsetScan::TempStorage scan;
+};
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -211,6 +222,42 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem) {
   });
 }
 
+SGL_DEVICE void problem_transform_bitset512(
+    TopKProblem& problem,
+    const int32_t* source_ptr,
+    IndexBitsetSortStorage* storage) {
+  const uint32_t tx = threadIdx.x;
+  for (uint32_t word = tx; word < kHugeIndexSortWords;
+       word += kBlockSize) {
+    storage->words[word] = 0;
+  }
+  __syncthreads();
+
+  if (tx < kHugeIndexSortTopK) {
+    const int32_t raw = source_ptr[tx];
+    if (raw >= 0 && static_cast<uint32_t>(raw) < problem.seq_len) {
+      atomicOr(
+          &storage->words[static_cast<uint32_t>(raw) >> 5],
+          1u << (static_cast<uint32_t>(raw) & 31));
+    }
+  }
+  __syncthreads();
+
+  const uint32_t bits =
+      tx < kHugeIndexSortWords ? storage->words[tx] : 0;
+  uint32_t write_base = 0;
+  IndexBitsetScan(storage->scan).ExclusiveSum(__popc(bits), write_base);
+
+  if (tx < kHugeIndexSortWords) {
+    uint32_t remaining = bits;
+    while (remaining != 0) {
+      const uint32_t bit = static_cast<uint32_t>(__ffs(remaining) - 1);
+      problem.transform_output(write_base++, static_cast<int32_t>(tx * 32 + bit));
+      remaining &= remaining - 1;
+    }
+  }
+}
+
 SGL_DEVICE void problem_transform(
     TopKProblem& problem, int32_t* output_ptr, void* sort_smem) {
   static_assert(kMaxTopK % kBlockSize == 0);
@@ -224,6 +271,14 @@ SGL_DEVICE void problem_transform(
   constexpr int32_t kInvalid = std::numeric_limits<int32_t>::max();
   const auto source_ptr = problem.out;
   problem.out = output_ptr;
+  if (problem.topk == kHugeIndexSortTopK &&
+      problem.seq_len <= kHugeIndexSortMaxSeqLen) {
+    problem_transform_bitset512(
+        problem,
+        source_ptr,
+        static_cast<IndexBitsetSortStorage*>(sort_smem));
+    return;
+  }
   if (problem.topk <= kBlockSize) {
     int32_t source_index[1] = {
         threadIdx.x < problem.topk ? source_ptr[threadIdx.x] : kInvalid};
@@ -268,6 +323,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
       Register4::Smem,
       Register5::Smem,
       Streaming::Smem,
+      IndexBitsetSortStorage,
       IndexSort1::TempStorage,
       IndexSort2::TempStorage>
       smem;
@@ -348,6 +404,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   __shared__ impl::MaxSmem<
       Streaming::Smem,
       Cluster::Smem,
+      IndexBitsetSortStorage,
       IndexSort1::TempStorage,
       IndexSort2::TempStorage>
       smem;

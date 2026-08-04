@@ -141,3 +141,107 @@ def test_topk_sparse_epilogue_matches_standalone_combiner(version, num_reqs):
     )
     torch.testing.assert_close(lens_out, lens_ref, rtol=0, atol=0)
     torch.testing.assert_close(combined_out, combined_ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="DSV4 Huge bitset top-k requires Blackwell CUDA",
+)
+def test_topk_v2_huge_bitset_range_is_exact_sorted_and_deterministic():
+    """Cover the K=512, Register5-range deterministic bitset compactor."""
+
+    device = torch.device("cuda")
+    torch.manual_seed(29)
+    batch = 8
+    width = 17408
+    scores = torch.randn((batch, width), dtype=torch.float32, device=device)
+    seq_lens = torch.tensor(
+        (16385, 16512, 16640, 16896, 17024, 17152, 17280, 17408),
+        dtype=torch.int32,
+        device=device,
+    )
+    page_size = 64
+    num_pages = (width + page_size - 1) // page_size
+    page_table = torch.arange(
+        num_pages, dtype=torch.int32, device=device
+    ).expand(batch, -1).contiguous()
+    page_indices = torch.full(
+        (batch, 512), -1, dtype=torch.int32, device=device
+    )
+    raw_indices = torch.full_like(page_indices, -1)
+    metadata = plan_topk_v2(seq_lens)
+
+    topk_transform_512_v2(
+        scores,
+        seq_lens,
+        page_table,
+        page_indices,
+        page_size,
+        metadata,
+        raw_indices,
+    )
+    torch.cuda.synchronize()
+
+    reference = torch.stack(
+        [
+            torch.topk(scores[row, : int(seq_lens[row])], 512, sorted=False)
+            .indices.sort()
+            .values.to(torch.int32)
+            for row in range(batch)
+        ]
+    )
+    torch.testing.assert_close(raw_indices, reference, rtol=0, atol=0)
+    # With an identity page table the transformed slots equal the raw slots.
+    torch.testing.assert_close(page_indices, raw_indices, rtol=0, atol=0)
+
+    first_raw = raw_indices.clone()
+    first_pages = page_indices.clone()
+    for _ in range(8):
+        topk_transform_512_v2(
+            scores,
+            seq_lens,
+            page_table,
+            page_indices,
+            page_size,
+            metadata,
+            raw_indices,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(raw_indices, first_raw, rtol=0, atol=0)
+        torch.testing.assert_close(page_indices, first_pages, rtol=0, atol=0)
+
+    # Tie-heavy inputs exercise the uniqueness precondition of the bitset
+    # compactor. The selected set may differ from torch.topk's arbitrary tie
+    # choice and from another launch, but every launch must contain exactly 512
+    # unique, in-range sorted slots.
+    scores.zero_()
+    topk_transform_512_v2(
+        scores,
+        seq_lens,
+        page_table,
+        page_indices,
+        page_size,
+        metadata,
+        raw_indices,
+    )
+    torch.cuda.synchronize()
+    assert torch.all(raw_indices[:, 1:] > raw_indices[:, :-1])
+    assert torch.all(raw_indices >= 0)
+    assert torch.all(raw_indices < seq_lens[:, None])
+    torch.testing.assert_close(page_indices, raw_indices, rtol=0, atol=0)
+
+    for _ in range(8):
+        topk_transform_512_v2(
+            scores,
+            seq_lens,
+            page_table,
+            page_indices,
+            page_size,
+            metadata,
+            raw_indices,
+        )
+        torch.cuda.synchronize()
+        assert torch.all(raw_indices[:, 1:] > raw_indices[:, :-1])
+        assert torch.all(raw_indices >= 0)
+        assert torch.all(raw_indices < seq_lens[:, None])
+        torch.testing.assert_close(page_indices, raw_indices, rtol=0, atol=0)
