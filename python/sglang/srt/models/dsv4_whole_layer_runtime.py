@@ -575,31 +575,19 @@ def _execute_common(
         e2e_descriptor=descriptor,
     )
 
-    # Keep the attention-to-FFN boundary inside one GPU-oriented mHC entry.
-    # For M=4096 this retains the Tensor Core prenorm GEMM, while eliminating
-    # the separate Python hc_post/hc_pre scheduling boundary and allowing the
-    # PDL-enabled CUDA kernels to be submitted as one fused operation chain.
-    if descriptor.num_tokens > 32:
-        residual, post, comb, hidden_states = _fused_mhc_post_ffn_pre(
-            layer=layer,
-            hidden_states=hidden_states,
-            residual=residual,
-            post=post,
-            comb=comb,
-        )
-    else:
-        # The scalar-FMA implementation used by mhc_fused_post_pre at tiny M
-        # changes reduction order enough to accumulate visible model-level
-        # logit drift. Keep the original CUDA primitives for this non-target
-        # shape; this remains inside Huge execution and never calls native.
-        residual, post, comb, hidden_states = _separate_mhc_post_ffn_pre(
-            layer=layer,
-            descriptor=descriptor,
-            hidden_states=hidden_states,
-            residual=residual,
-            post=post,
-            comb=comb,
-        )
+    # Keep the numerically stable GPU primitives until the single-entry mHC
+    # implementation reproduces their reduction order.  The fused scalar-FMA
+    # path passes per-operator 2e-2 tolerance, but at M=4096 its small error
+    # accumulates across 43 layers and fails the model-level cosine gate.
+    # This is still a strict Huge CUDA path and never enters _forward_native.
+    residual, post, comb, hidden_states = _separate_mhc_post_ffn_pre(
+        layer=layer,
+        descriptor=descriptor,
+        hidden_states=hidden_states,
+        residual=residual,
+        post=post,
+        comb=comb,
+    )
 
     hidden_states = layer._run_moe_ffn_dp_sync(
         hidden_states,

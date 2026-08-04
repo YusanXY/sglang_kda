@@ -86,7 +86,7 @@ def test_model_runner_rejects_invalid_forward_before_native_runner_executes():
     native_forward.assert_not_called()
 
 
-def test_whole_layer_executor_fuses_attention_post_with_ffn_pre():
+def test_whole_layer_executor_uses_stable_gpu_attention_to_ffn_boundary():
     source = textwrap.dedent(
         inspect.getsource(dsv4_whole_layer_runtime._execute_common)
     )
@@ -103,10 +103,10 @@ def test_whole_layer_executor_fuses_attention_post_with_ffn_pre():
     }
 
     # Attention input keeps its own hc_pre and the FFN result keeps its final
-    # hc_post.  The former attention hc_post + FFN hc_pre pair is one fused
-    # GPU entry and cannot silently re-enter the native layer body.
+    # hc_post. The middle boundary remains explicit GPU work until the fused
+    # implementation passes the model-level M=4096 cosine gate.
     assert call_attrs.count("hc_pre") == 1
     assert call_attrs.count("hc_post") == 1
-    assert "_fused_mhc_post_ffn_pre" in call_names
+    assert "_fused_mhc_post_ffn_pre" not in call_names
     assert "_separate_mhc_post_ffn_pre" in call_names
     assert "_forward_native" not in call_attrs
