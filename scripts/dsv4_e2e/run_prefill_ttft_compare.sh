@@ -84,12 +84,33 @@ wait_gpu_idle() {
   done
 }
 
+gpu_pids() {
+  nvidia-smi --id="$GPU_IDS" --query-compute-apps=pid \
+    --format=csv,noheader,nounits 2>/dev/null | sed '/^[[:space:]]*$/d' || true
+}
+
+foreign_gpu_processes() {
+  local pid owner args
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    owner=$(ps -o user= -p "$pid" 2>/dev/null | xargs || true)
+    if [[ -n "$owner" && "$owner" != "$(id -un)" ]]; then
+      args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      printf '%s\t%s\t%s\n' "$pid" "$owner" "$args"
+    fi
+  done < <(
+    fuser /dev/nvidia0 /dev/nvidia1 /dev/nvidia2 /dev/nvidia3 2>/dev/null \
+      | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | sort -u || true
+  )
+}
+
 run_one() {
-  local pair=$1 ordinal=$2 backend=$3 stem result log validation
+  local pair=$1 ordinal=$2 backend=$3 stem result log validation audit
   stem=$(printf '%02d_pair%02d_%s' "$ordinal" "$pair" "$backend")
   result=$RUN_ROOT/$stem.jsonl
   log=$RUN_ROOT/$stem.log
   validation=$RUN_ROOT/$stem.validation.json
+  audit=$RUN_ROOT/$stem.gpu-process-audit.tsv
 
   wait_gpu_idle
   nvidia-smi --id="$GPU_IDS" --query-gpu=timestamp,index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits > "$RUN_ROOT/$stem.gpu-before.csv"
@@ -123,12 +144,45 @@ run_one() {
     printf 'COMMAND'; printf ' %q' "${cmd[@]}"; printf '\n'
   } | tee "$log"
   set +e
-  "${cmd[@]}" 2>&1 | tee -a "$log"
-  local status=${PIPESTATUS[0]}
+  "${cmd[@]}" > >(tee -a "$log") 2>&1 &
+  local server_pid=$! audit_failed=0 foreign status
+  while kill -0 "$server_pid" 2>/dev/null; do
+    foreign=$(foreign_gpu_processes)
+    if [[ -n "$foreign" ]]; then
+      audit_failed=1
+      {
+        printf 'utc\tpid\tuser\tcommand\n'
+        while IFS= read -r line; do
+          printf '%s\t%s\n' "$(date -u +%FT%TZ)" "$line"
+        done <<< "$foreign"
+      } | tee "$audit" -a "$log"
+      kill -TERM "$server_pid" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+  done
+  wait "$server_pid"
+  status=$?
+  foreign=$(foreign_gpu_processes)
+  if [[ -n "$foreign" ]]; then
+    audit_failed=1
+    {
+      [[ -s "$audit" ]] || printf 'utc\tpid\tuser\tcommand\n'
+      while IFS= read -r line; do
+        printf '%s\t%s\n' "$(date -u +%FT%TZ)" "$line"
+      done <<< "$foreign"
+    } | tee -a "$audit" "$log"
+  fi
+  if (( audit_failed )); then
+    status=125
+  fi
   set -e
   printf 'END pair=%s ordinal=%s backend=%s status=%s utc=%s\n' "$pair" "$ordinal" "$backend" "$status" "$(date -u +%FT%TZ)" | tee -a "$log"
   nvidia-smi --id="$GPU_IDS" --query-gpu=timestamp,index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw --format=csv,noheader,nounits > "$RUN_ROOT/$stem.gpu-after.csv" || true
   if (( status != 0 )); then
+    if (( status == 125 )); then
+      echo "Benchmark rejected because a foreign GPU process appeared: $stem" >&2
+    fi
     echo "Benchmark failed: $stem (status=$status)" >&2
     return "$status"
   fi
