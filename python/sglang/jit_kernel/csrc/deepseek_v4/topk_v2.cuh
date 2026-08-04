@@ -60,6 +60,13 @@ struct alignas(8) PlanItem {
 };
 static_assert(sizeof(GlobalMetadata) == 2 * sizeof(int32_t) && sizeof(PlanItem) == sizeof(GlobalMetadata));
 
+struct alignas(16) SparsePrefillEpiloguePlan {
+  uint32_t topk_len;
+  uint32_t swa_len;
+  int32_t compressed_offset;
+  int32_t swa_offset;
+};
+
 struct TopKLaunchParams {
   const float* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;
@@ -125,27 +132,35 @@ struct TopKLaunchParams {
     }
     return lo < num_reqs ? lo : num_reqs - 1;
   }
-  SGL_DEVICE void sparse_prefill_epilogue(
-      uint32_t batch_id,
-      uint32_t req,
-      const int32_t* __restrict__ raw_indices_ptr) const {
-    if (combined_indices == nullptr) return;
+  SGL_DEVICE void prepare_sparse_prefill_epilogue(
+      uint32_t batch_id, SparsePrefillEpiloguePlan* plan) const {
+    const uint32_t req = query_owner(batch_id);
     const uint32_t seq_len = static_cast<uint32_t>(seq_lens[batch_id]);
-    const uint32_t topk_len = seq_len < topk ? seq_len : topk;
+    plan->topk_len = seq_len < topk ? seq_len : topk;
     const int32_t pos = positions[batch_id];
     const uint32_t pos_len = static_cast<uint32_t>(pos + 1);
-    const uint32_t swa_len = pos_len < kSparsePrefillSWAWindow ? pos_len : kSparsePrefillSWAWindow;
+    plan->swa_len =
+        pos_len < kSparsePrefillSWAWindow ? pos_len : kSparsePrefillSWAWindow;
     const int32_t gather_start = full_seq_lens[req] - swa_gather_lens[req];
+    plan->compressed_offset = compressed_base[req];
+    plan->swa_offset = swa_base[req] + pos - static_cast<int32_t>(plan->swa_len) +
+        1 - gather_start;
+  }
+  SGL_DEVICE void sparse_prefill_epilogue(
+      uint32_t batch_id,
+      const SparsePrefillEpiloguePlan& plan,
+      const int32_t* __restrict__ raw_indices_ptr) const {
+    if (combined_indices == nullptr) return;
     auto* combined_row = combined_indices + batch_id * combined_indices_stride;
-    for (uint32_t t = threadIdx.x; t < topk_len; t += blockDim.x) {
-      combined_row[t] = raw_indices_ptr[t] + compressed_base[req];
+    for (uint32_t t = threadIdx.x; t < plan.topk_len; t += blockDim.x) {
+      combined_row[t] = raw_indices_ptr[t] + plan.compressed_offset;
     }
-    for (uint32_t t = threadIdx.x; t < swa_len; t += blockDim.x) {
-      combined_row[topk_len + t] =
-          swa_base[req] + static_cast<int32_t>(t) + pos -
-          static_cast<int32_t>(swa_len) + 1 - gather_start;
+    for (uint32_t t = threadIdx.x; t < plan.swa_len; t += blockDim.x) {
+      combined_row[plan.topk_len + t] = plan.swa_offset + static_cast<int32_t>(t);
     }
-    if (threadIdx.x == 0) combined_lens[batch_id] = static_cast<int32_t>(topk_len + swa_len);
+    if (threadIdx.x == 0) {
+      combined_lens[batch_id] = static_cast<int32_t>(plan.topk_len + plan.swa_len);
+    }
   }
 };
 
@@ -214,17 +229,17 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  __shared__ uint32_t sparse_query_owner;
+  __shared__ SparsePrefillEpiloguePlan sparse_epilogue_plan;
   if (problem.seq_len <= problem.topk) {
     trivial_transform<kPDL>(problem);
     if (params.combined_indices != nullptr && threadIdx.x == 0) {
-      sparse_query_owner = params.query_owner(blockIdx.x);
+      params.prepare_sparse_prefill_epilogue(blockIdx.x, &sparse_epilogue_plan);
     }
     __syncthreads();
     if (params.combined_indices != nullptr) {
       params.sparse_prefill_epilogue(
           blockIdx.x,
-          sparse_query_owner,
+          sparse_epilogue_plan,
           params.raw_indices + blockIdx.x * static_cast<int64_t>(params.topk));
     }
     return;
@@ -267,12 +282,12 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   __syncthreads();
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
   if (params.combined_indices != nullptr && threadIdx.x == 0) {
-    sparse_query_owner = params.query_owner(blockIdx.x);
+    params.prepare_sparse_prefill_epilogue(blockIdx.x, &sparse_epilogue_plan);
   }
   __syncthreads();
   if (params.combined_indices != nullptr) {
     params.sparse_prefill_epilogue(
-        blockIdx.x, sparse_query_owner, epilogue_indices_ptr);
+        blockIdx.x, sparse_epilogue_plan, epilogue_indices_ptr);
   }
 }
 
@@ -281,20 +296,20 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
-  __shared__ uint32_t sparse_query_owner;
+  __shared__ SparsePrefillEpiloguePlan sparse_epilogue_plan;
   // One rank owns final output for both the trivial and clustered paths.
   const auto worker_rank = blockIdx.x % kClusterSize;
   if (problem.seq_len <= problem.topk) {
     if (blockIdx.y == worker_rank) {
       trivial_transform<kPDL>(problem);
       if (params.combined_indices != nullptr && threadIdx.x == 0) {
-        sparse_query_owner = params.query_owner(blockIdx.x);
+        params.prepare_sparse_prefill_epilogue(blockIdx.x, &sparse_epilogue_plan);
       }
       __syncthreads();
       if (params.combined_indices != nullptr) {
         params.sparse_prefill_epilogue(
             blockIdx.x,
-            sparse_query_owner,
+            sparse_epilogue_plan,
             params.raw_indices + blockIdx.x * static_cast<int64_t>(params.topk));
       }
     }
@@ -322,12 +337,12 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   if (blockIdx.y == worker_rank) {
     problem_transform(problem, params.get_output_ptr(blockIdx.x));
     if (params.combined_indices != nullptr && threadIdx.x == 0) {
-      sparse_query_owner = params.query_owner(blockIdx.x);
+      params.prepare_sparse_prefill_epilogue(blockIdx.x, &sparse_epilogue_plan);
     }
     __syncthreads();
     if (params.combined_indices != nullptr) {
       params.sparse_prefill_epilogue(
-          blockIdx.x, sparse_query_owner, topk_indices);
+          blockIdx.x, sparse_epilogue_plan, topk_indices);
     }
   }
 }
