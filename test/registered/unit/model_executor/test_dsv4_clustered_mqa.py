@@ -1,5 +1,6 @@
 """Hermetic contracts for the Huge-only clustered paged-MQA path."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,6 +11,9 @@ from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
     prepare_clustered_mqa_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+
+
+REPO_ROOT = Path(__file__).parents[4]
 
 
 def test_grouped_metadata_is_built_once_without_copying_page_rows():
@@ -196,3 +200,16 @@ def test_clustered_topk_v2_submits_logits_and_epilogue_through_one_cpp_entry():
         metadata.max_context,
     )
     extension.forward_out.assert_not_called()
+
+
+def test_topk_cuda_deterministically_sorts_raw_indices_before_sparse_epilogue():
+    source = (
+        REPO_ROOT
+        / "python/sglang/jit_kernel/csrc/deepseek_v4/topk_v2.cuh"
+    ).read_text(encoding="utf-8")
+
+    assert "cub::BlockRadixSort<int32_t, kBlockSize, 1>" in source
+    assert "cub::BlockRadixSort<int32_t, kBlockSize, 2>" in source
+    assert ".Sort(source_index, 0, end_bit);" in source
+    assert "Sparse attention accumulates in that order" in source
+    assert "params.raw_indices + blockIdx.x" in source

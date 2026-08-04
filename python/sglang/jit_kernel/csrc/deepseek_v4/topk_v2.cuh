@@ -19,6 +19,8 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <cub/block/block_radix_sort.cuh>
+
 #include <bit>
 #include <cstdint>
 #include <iterator>
@@ -49,6 +51,8 @@ constexpr uint32_t kClusterFloor = 65536;
 constexpr uint32_t kClusterMaxBatch = 512;
 constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
 constexpr uint32_t kSparsePrefillSWAWindow = 128;
+using IndexSort1 = cub::BlockRadixSort<int32_t, kBlockSize, 1>;
+using IndexSort2 = cub::BlockRadixSort<int32_t, kBlockSize, 2>;
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -207,13 +211,42 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem) {
   });
 }
 
-SGL_DEVICE void problem_transform(TopKProblem& problem, int32_t* output_ptr) {
+SGL_DEVICE void problem_transform(
+    TopKProblem& problem, int32_t* output_ptr, void* sort_smem) {
   static_assert(kMaxTopK % kBlockSize == 0);
-  constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
-  int32_t source_index[kNumElems];
-  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { source_index[i] = problem.out[tx]; });
+  // The radix selector emits all elements above the threshold through an
+  // atomic counter. The selected set is exact, but its order depends on CTA
+  // scheduling. Sparse attention accumulates in that order, so the otherwise
+  // harmless permutation becomes model-level run-to-run drift. Sort the raw
+  // token indices in this existing transform CTA: this is deterministic and
+  // also turns paged-KV reads into increasing-address accesses.
+  const auto end_bit = 32 - __clz(problem.seq_len - 1);
+  constexpr int32_t kInvalid = std::numeric_limits<int32_t>::max();
+  const auto source_ptr = problem.out;
   problem.out = output_ptr;
-  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) { problem.transform_output(tx, source_index[i]); });
+  if (problem.topk <= kBlockSize) {
+    int32_t source_index[1] = {
+        threadIdx.x < problem.topk ? source_ptr[threadIdx.x] : kInvalid};
+    IndexSort1(*static_cast<IndexSort1::TempStorage*>(sort_smem))
+        .Sort(source_index, 0, end_bit);
+    if (threadIdx.x < problem.topk) {
+      problem.transform_output(threadIdx.x, source_index[0]);
+    }
+  } else {
+    int32_t source_index[2];
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+      const auto pos = threadIdx.x * 2 + i;
+      source_index[i] = pos < problem.topk ? source_ptr[pos] : kInvalid;
+    }
+    IndexSort2(*static_cast<IndexSort2::TempStorage*>(sort_smem))
+        .Sort(source_index, 0, end_bit);
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+      const auto pos = threadIdx.x * 2 + i;
+      if (pos < problem.topk) problem.transform_output(pos, source_index[i]);
+    }
+  }
 }
 
 /**
@@ -230,7 +263,14 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
-  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Register5::Smem, Streaming::Smem> smem;
+  __shared__ impl::MaxSmem<
+      Register2::Smem,
+      Register4::Smem,
+      Register5::Smem,
+      Streaming::Smem,
+      IndexSort1::TempStorage,
+      IndexSort2::TempStorage>
+      smem;
   __shared__ SparsePrefillEpiloguePlan sparse_epilogue_plan;
   if (problem.seq_len <= problem.topk) {
     trivial_transform<kPDL>(problem);
@@ -248,7 +288,10 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   }
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
-  const int32_t* epilogue_indices_ptr = topk_indices;
+  const int32_t* epilogue_indices_ptr =
+      params.raw_indices != nullptr
+      ? params.raw_indices + blockIdx.x * static_cast<int64_t>(params.topk)
+      : topk_indices;
 
   constexpr bool kHandleCluster = (kLevel == 3);
   // non-trivial path: dispatch based on level and seq_len
@@ -287,7 +330,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   // then trigger the dependent kernel only after the full output is written.
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
-  problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  problem_transform(problem, params.get_output_ptr(blockIdx.x), &smem);
   if (params.combined_indices != nullptr && threadIdx.x == 0) {
     params.prepare_sparse_prefill_epilogue(blockIdx.x, &sparse_epilogue_plan);
   }
@@ -302,7 +345,12 @@ template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
-  __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
+  __shared__ impl::MaxSmem<
+      Streaming::Smem,
+      Cluster::Smem,
+      IndexSort1::TempStorage,
+      IndexSort2::TempStorage>
+      smem;
   __shared__ SparsePrefillEpiloguePlan sparse_epilogue_plan;
   // One rank owns final output for both the trivial and clustered paths.
   const auto worker_rank = blockIdx.x % kClusterSize;
@@ -344,14 +392,16 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   device::PDLWaitPrimary<kPDL>();
   __syncthreads();
   if (blockIdx.y == worker_rank) {
-    problem_transform(problem, params.get_output_ptr(blockIdx.x));
+    problem_transform(problem, params.get_output_ptr(blockIdx.x), &smem);
     if (params.combined_indices != nullptr && threadIdx.x == 0) {
       params.prepare_sparse_prefill_epilogue(blockIdx.x, &sparse_epilogue_plan);
     }
     __syncthreads();
     if (params.combined_indices != nullptr) {
       params.sparse_prefill_epilogue(
-          blockIdx.x, sparse_epilogue_plan, topk_indices);
+          blockIdx.x,
+          sparse_epilogue_plan,
+          params.raw_indices + blockIdx.x * static_cast<int64_t>(params.topk));
     }
   }
 }
