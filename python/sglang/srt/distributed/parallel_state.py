@@ -270,7 +270,6 @@ class GroupCoordinator:
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
-        custom_allreduce_max_pull_size: Optional[int] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -405,15 +404,12 @@ class GroupCoordinator:
                 CAClass = dispatch_custom_allreduce(
                     group=self.cpu_group,
                     device=self.device,
-                    max_pull_size=custom_allreduce_max_pull_size,
                 )
                 self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
                 )
             except Exception as e:
-                if custom_allreduce_max_pull_size is not None:
-                    raise
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
                     "warning, specify --disable-custom-all-reduce explicitly."
@@ -1661,7 +1657,6 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
-    custom_allreduce_max_pull_size: Optional[int] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1687,7 +1682,6 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
-        custom_allreduce_max_pull_size=custom_allreduce_max_pull_size,
     )
 
 
@@ -2002,7 +1996,6 @@ def initialize_model_parallel(
     duplicate_tp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
-    custom_allreduce_max_pull_size: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -2103,7 +2096,6 @@ def initialize_model_parallel(
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
         recovered_rank=recovered_rank,
-        custom_allreduce_max_pull_size=custom_allreduce_max_pull_size,
     )
 
     if duplicate_tp_group:

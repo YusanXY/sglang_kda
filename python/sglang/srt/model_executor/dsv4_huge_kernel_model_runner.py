@@ -99,7 +99,6 @@ def validate_dsv4_huge_kernel_startup(
         "moe_runner_backend": "flashinfer_mxfp4",
         "enable_two_batch_overlap": False,
         "enable_hisparse": False,
-        "disable_custom_all_reduce": False,
     }
     for field, expected in expected_values.items():
         actual = getattr(server_args, field)
