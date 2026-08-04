@@ -63,7 +63,7 @@ export SGLANG_DSV4_FP4_EXPERTS=1
   printf 'cached_history=%s\nnew_chunk=%s\ninput_len=%s\n' "$CACHED_HISTORY" "$NEW_CHUNK" "$INPUT_LEN"
   printf 'output_len=1\ncontext_capacity=%s\ncache_hit_rate=%s\n' "$CONTEXT_CAPACITY" "$CACHE_HIT_RATE"
   printf 'watchdog_timeout_seconds=2400\nrequest_timeout_seconds=2400\n'
-  printf 'order=native,huge_kernel repeated by pair\n'
+  printf 'order=alternating native/huge_kernel first by pair\n'
 } | tee "$RUN_ROOT/experiment.txt"
 
 wait_gpu_idle() {
@@ -126,6 +126,7 @@ run_one() {
     --context-length "$CONTEXT_CAPACITY"
     --max-total-tokens "$CONTEXT_CAPACITY"
     --max-running-requests 1
+    --max-prefill-tokens "$NEW_CHUNK"
     --mem-fraction-static 0.75
     --page-size 256 --swa-full-tokens-ratio 0.1
     --chunked-prefill-size "$NEW_CHUNK"
@@ -137,6 +138,7 @@ run_one() {
     --run-name "pair${pair}_${backend}"
     --batch-size 1 --input-len "$INPUT_LEN" --output-len 1
     --dataset-name random-ids --cache-hit-rate "$CACHE_HIT_RATE" --seed 42
+    --share-cached-prefix-across-batch --warmup-cached-prefill-shape
     --skip-warmup --no-append-to-github-summary
     --result-filename "$result"
   )
@@ -190,6 +192,9 @@ run_one() {
   fi
   "$PYTHON" "$VALIDATOR" --result "$result" --log "$log" \
     --backend "$backend" --cache-hit-tolerance "$CACHE_HIT_TOLERANCE" \
+    --batch-size 1 --cached-history-per-request "$CACHED_HISTORY" \
+    --new-tokens-per-request "$NEW_CHUNK" --output-len 1 \
+    --forward-batch-m "$NEW_CHUNK" --require-shape-warmup \
     | tee "$validation"
   printf '%s\t%s\t%s\t%s\t%s\n' "$pair" "$ordinal" "$backend" "$result" "$log" >> "$MANIFEST"
   wait_gpu_idle
@@ -197,15 +202,23 @@ run_one() {
 
 ordinal=1
 for pair in $(seq 1 "$PAIRS"); do
-  run_one "$pair" "$ordinal" native
-  ordinal=$((ordinal + 1))
-  run_one "$pair" "$ordinal" huge_kernel
-  ordinal=$((ordinal + 1))
+  if (( pair % 2 == 1 )); then
+    order=(native huge_kernel)
+  else
+    order=(huge_kernel native)
+  fi
+  for backend in "${order[@]}"; do
+    run_one "$pair" "$ordinal" "$backend"
+    ordinal=$((ordinal + 1))
+  done
 done
 
 set +e
 "$PYTHON" "$SUMMARIZER" --manifest "$MANIFEST" --output-dir "$RUN_ROOT" \
-  --min-pairs "$PAIRS" --cache-hit-tolerance "$CACHE_HIT_TOLERANCE"
+  --min-pairs "$PAIRS" --cache-hit-tolerance "$CACHE_HIT_TOLERANCE" \
+  --batch-size 1 --cached-history-per-request "$CACHED_HISTORY" \
+  --new-tokens-per-request "$NEW_CHUNK" --output-len 1 \
+  --forward-batch-m "$NEW_CHUNK" --require-shape-warmup
 summary_status=$?
 set -e
 if (( summary_status != 0 )); then

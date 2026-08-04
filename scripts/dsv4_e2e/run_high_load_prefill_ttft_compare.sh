@@ -24,7 +24,12 @@ AGGREGATE_NEW=$((BATCH_SIZE * NEW_PER_REQUEST))
 AGGREGATE_CACHED=$((BATCH_SIZE * CACHED_PER_REQUEST))
 INPUT_LEN=$((CACHED_PER_REQUEST + NEW_PER_REQUEST))
 CONTEXT_CAPACITY=73728
-MAX_TOTAL_TOKENS=$((BATCH_SIZE * (INPUT_LEN + 1)))
+PAGE_SIZE=256
+TOKENS_PER_REQUEST_PAGED=$((((INPUT_LEN + 1 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE))
+MAX_TOTAL_TOKENS=$((BATCH_SIZE * TOKENS_PER_REQUEST_PAGED))
+if (( MAX_TOTAL_TOKENS < CONTEXT_CAPACITY )); then
+  MAX_TOTAL_TOKENS=$CONTEXT_CAPACITY
+fi
 FORWARD_BATCH_M=4096
 CHUNKED_PREFILL_SIZE=$FORWARD_BATCH_M
 EXPECTED_FORWARD_BATCHES=$((AGGREGATE_NEW / FORWARD_BATCH_M))
@@ -80,7 +85,9 @@ export SGLANG_DSV4_FP4_EXPERTS=1
     "$FORWARD_BATCH_M" "$EXPECTED_FORWARD_BATCHES"
   printf 'chunked_prefill_size=%s\n' "$CHUNKED_PREFILL_SIZE"
   printf 'input_len=%s\noutput_len=1\ncontext_capacity=%s\n' "$INPUT_LEN" "$CONTEXT_CAPACITY"
-  printf 'cache_hit_rate=%s\norder=native,huge_kernel repeated by pair\n' "$CACHE_HIT_RATE"
+  printf 'page_size=%s\ntokens_per_request_paged=%s\nmax_total_tokens=%s\n' \
+    "$PAGE_SIZE" "$TOKENS_PER_REQUEST_PAGED" "$MAX_TOTAL_TOKENS"
+  printf 'cache_hit_rate=%s\norder=alternating native/huge_kernel first by pair\n' "$CACHE_HIT_RATE"
 } | tee "$RUN_ROOT/experiment.txt"
 
 gpu_pids() {
@@ -144,7 +151,7 @@ run_one() {
     --disable-flashinfer-autotune --dsv4-worker-backend "$backend"
     --context-length "$CONTEXT_CAPACITY" --max-total-tokens "$MAX_TOTAL_TOKENS"
     --max-running-requests "$BATCH_SIZE" --max-prefill-tokens "$CHUNKED_PREFILL_SIZE"
-    --mem-fraction-static 0.88 --page-size 256 --swa-full-tokens-ratio 0.1
+    --mem-fraction-static 0.88 --page-size "$PAGE_SIZE" --swa-full-tokens-ratio 0.1
     --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
     --cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled
     --skip-server-warmup --skip-warmup --disable-overlap-schedule
@@ -215,10 +222,15 @@ run_one() {
 
 ordinal=1
 for pair in $(seq 1 "$PAIRS"); do
-  run_one "$pair" "$ordinal" native
-  ordinal=$((ordinal + 1))
-  run_one "$pair" "$ordinal" huge_kernel
-  ordinal=$((ordinal + 1))
+  if (( pair % 2 == 1 )); then
+    order=(native huge_kernel)
+  else
+    order=(huge_kernel native)
+  fi
+  for backend in "${order[@]}"; do
+    run_one "$pair" "$ordinal" "$backend"
+    ordinal=$((ordinal + 1))
+  done
 done
 
 set +e

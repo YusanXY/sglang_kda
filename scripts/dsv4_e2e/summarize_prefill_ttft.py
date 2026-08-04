@@ -67,22 +67,17 @@ def summarize(
     ordinals = [int(row["ordinal"]) for row in rows]
     if ordinals != list(range(1, len(rows) + 1)):
         raise ValueError(f"ordinals are not contiguous: {ordinals}")
-    backends = [row["backend"] for row in rows]
-    expected_order = [
-        backend
-        for _ in range(len(rows) // 2)
-        for backend in ("native", "huge_kernel")
-    ]
-    if backends != expected_order:
-        raise ValueError(
-            "runs must alternate native,huge_kernel for every pair; "
-            f"got {backends}"
-        )
-
     by_pair: dict[int, dict[str, dict]] = defaultdict(dict)
     by_backend: dict[str, list[float]] = defaultdict(list)
     samples = []
     for row in rows:
+        if row["backend"] not in {"native", "huge_kernel"}:
+            raise ValueError(f"unsupported backend in manifest: {row['backend']}")
+        pair_id = int(row["pair"])
+        if row["backend"] in by_pair[pair_id]:
+            raise ValueError(
+                f"duplicate {row['backend']} sample for pair {pair_id}"
+            )
         checked = validate(
             Path(row["result"]),
             Path(row["log"]),
@@ -95,14 +90,19 @@ def summarize(
             expected_forward_batch_m=expected_forward_batch_m,
             require_shape_warmup=require_shape_warmup,
         )
-        checked["pair"] = int(row["pair"])
+        checked["pair"] = pair_id
         checked["ordinal"] = int(row["ordinal"])
-        by_pair[checked["pair"]][row["backend"]] = checked
+        by_pair[pair_id][row["backend"]] = checked
         by_backend[row["backend"]].append(checked["last_ttft"])
         samples.append(checked)
 
     if len(by_pair) < min_pairs:
         raise ValueError(f"need at least {min_pairs} complete pairs, got {len(by_pair)}")
+    expected_pair_ids = list(range(1, len(by_pair) + 1))
+    if sorted(by_pair) != expected_pair_ids:
+        raise ValueError(
+            f"pair ids must be contiguous from 1; got {sorted(by_pair)}"
+        )
     if any(set(pair) != {"native", "huge_kernel"} for pair in by_pair.values()):
         raise ValueError("every pair must contain exactly native and huge_kernel")
 

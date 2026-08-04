@@ -57,11 +57,16 @@ def _sample(root, ordinal, backend, *, huge_ttft=0.8, hit_rate=0.9412):
     return result, log
 
 
-def _manifest(root, huge_ttfts):
+def _manifest(root, huge_ttfts, *, reverse_even=False):
     rows = ["pair\tordinal\tbackend\tresult\tlog"]
     ordinal = 1
     for pair, huge_ttft in enumerate(huge_ttfts, 1):
-        for backend in ("native", "huge_kernel"):
+        order = (
+            ("huge_kernel", "native")
+            if reverse_even and pair % 2 == 0
+            else ("native", "huge_kernel")
+        )
+        for backend in order:
             result, log = _sample(root, ordinal, backend, huge_ttft=huge_ttft)
             rows.append(f"{pair}\t{ordinal}\t{backend}\t{result}\t{log}")
             ordinal += 1
@@ -194,6 +199,14 @@ def test_three_of_five_wins_fail_formal_gate(tmp_path):
     assert summary["acceptance_gate"]["win_count"] == 3
 
 
+def test_summarizer_accepts_reversed_order_inside_pairs(tmp_path):
+    summary = summarizer.summarize(
+        _manifest(tmp_path, [0.8] * 5, reverse_even=True), 5, 0.01
+    )
+    assert summary["status"] == "PASS"
+    assert summary["acceptance_gate"]["win_count"] == 5
+
+
 def test_runner_pins_exact_workload_and_order():
     source = (SCRIPT_DIR / "run_prefill_ttft_compare.sh").read_text(encoding="utf-8")
     for fragment in (
@@ -214,8 +227,11 @@ def test_runner_pins_exact_workload_and_order():
         '--dsv4-worker-backend "$backend"',
         "--skip-server-warmup",
         "--skip-warmup",
-        'run_one "$pair" "$ordinal" native',
-        'run_one "$pair" "$ordinal" huge_kernel',
+        "order=(native huge_kernel)",
+        "order=(huge_kernel native)",
+        'run_one "$pair" "$ordinal" "$backend"',
+        "--warmup-cached-prefill-shape",
+        "--require-shape-warmup",
         "PAIRS must be at least 5",
     ):
         assert fragment in source
@@ -238,7 +254,11 @@ def test_high_load_runner_uses_per_request_4k_and_req16_or_req128():
         'CHUNKED_PREFILL_SIZE=$FORWARD_BATCH_M',
         "CACHE_HIT_RATE=0.8",
         '[[ "$BATCH_SIZE" != 16 && "$BATCH_SIZE" != 128 ]]',
-        'MAX_TOTAL_TOKENS=$((BATCH_SIZE * (INPUT_LEN + 1)))',
+        "PAGE_SIZE=256",
+        'TOKENS_PER_REQUEST_PAGED=$((((INPUT_LEN + 1 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE))',
+        'MAX_TOTAL_TOKENS=$((BATCH_SIZE * TOKENS_PER_REQUEST_PAGED))',
+        "order=(native huge_kernel)",
+        "order=(huge_kernel native)",
         '--max-prefill-tokens "$CHUNKED_PREFILL_SIZE"',
         '--chunked-prefill-size "$CHUNKED_PREFILL_SIZE"',
         '--new-tokens-per-request "$NEW_PER_REQUEST"',
