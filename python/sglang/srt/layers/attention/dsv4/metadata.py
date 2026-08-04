@@ -130,12 +130,16 @@ class PagedIndexerMetadata:
         else:
             self.deep_gemm_metadata = self._build_deep_gemm_metadata()
 
-        from sglang.jit_kernel.dsv4 import plan_topk_v2
+        if envs.SGLANG_OPT_USE_TOPK_V2.get() and not self.prefer_clustered_mqa:
+            from sglang.jit_kernel.dsv4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
-            self.topk_metadata = torch.empty((0,))
+            # Strict Huge uses the preplanned clustered-MQA + top-k v2 CUDA
+            # entry for Q16 groups and the v1 CUDA epilogue for an explicit
+            # non-Q16 tail.  Neither path consumes generic v2 routing metadata,
+            # so avoid one allocation and one plan kernel per ForwardBatch.
+            self.topk_metadata = self.c4_seq_lens.new_empty((0,))
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
 

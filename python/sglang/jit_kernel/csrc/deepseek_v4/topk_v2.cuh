@@ -46,6 +46,7 @@ constexpr uint32_t kReg4MaxSeqLen = Register4::kMaxSeqLen;  // 16384
 constexpr uint32_t kClusterFloor = 65536;
 constexpr uint32_t kClusterMaxBatch = 512;
 constexpr uint32_t kNumPersistentClusters = 15 * kOccupancy;
+constexpr uint32_t kSparsePrefillSWAWindow = 128;
 
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
@@ -65,12 +66,22 @@ struct TopKLaunchParams {
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
   int32_t* __restrict__ raw_indices;      // optional raw (pre-transform) indices output; nullptr if unused
+  const int32_t* __restrict__ positions;  // optional sparse-prefill epilogue
+  const int32_t* __restrict__ query_start_loc;
+  const int32_t* __restrict__ full_seq_lens;
+  const int32_t* __restrict__ swa_gather_lens;
+  const int32_t* __restrict__ compressed_base;
+  const int32_t* __restrict__ swa_base;
+  int32_t* __restrict__ combined_indices;
+  int32_t* __restrict__ combined_lens;
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
   int64_t page_table_stride;
+  int64_t combined_indices_stride;
   uint32_t topk;
   uint32_t page_bits;
   uint32_t cluster_floor;  // seq_len > this routes to the cluster path (batch-aware, host-set)
+  uint32_t num_reqs;
 
   SGL_DEVICE const GlobalMetadata& global() const {
     return *reinterpret_cast<const GlobalMetadata*>(metadata);
@@ -98,6 +109,35 @@ struct TopKLaunchParams {
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id) const {
     return this->problem(batch_id, static_cast<uint32_t>(seq_lens[batch_id]));
+  }
+  SGL_DEVICE uint32_t query_owner(uint32_t batch_id) const {
+    const int32_t base = query_start_loc[0];
+#pragma unroll 16
+    for (uint32_t req = 0; req < num_reqs; ++req) {
+      if (batch_id < static_cast<uint32_t>(query_start_loc[req + 1] - base)) return req;
+    }
+    return num_reqs - 1;
+  }
+  SGL_DEVICE void sparse_prefill_epilogue(uint32_t batch_id) const {
+    if (combined_indices == nullptr) return;
+    const uint32_t req = query_owner(batch_id);
+    const uint32_t seq_len = static_cast<uint32_t>(seq_lens[batch_id]);
+    const uint32_t topk_len = seq_len < topk ? seq_len : topk;
+    const int32_t pos = positions[batch_id];
+    const uint32_t pos_len = static_cast<uint32_t>(pos + 1);
+    const uint32_t swa_len = pos_len < kSparsePrefillSWAWindow ? pos_len : kSparsePrefillSWAWindow;
+    const int32_t gather_start = full_seq_lens[req] - swa_gather_lens[req];
+    const auto* raw_row = raw_indices + batch_id * static_cast<int64_t>(topk);
+    auto* combined_row = combined_indices + batch_id * combined_indices_stride;
+    for (uint32_t t = threadIdx.x; t < topk_len; t += blockDim.x) {
+      combined_row[t] = raw_row[t] + compressed_base[req];
+    }
+    for (uint32_t t = threadIdx.x; t < swa_len; t += blockDim.x) {
+      combined_row[topk_len + t] =
+          swa_base[req] + static_cast<int32_t>(t) + pos -
+          static_cast<int32_t>(swa_len) + 1 - gather_start;
+    }
+    if (threadIdx.x == 0) combined_lens[batch_id] = static_cast<int32_t>(topk_len + swa_len);
   }
 };
 
@@ -166,7 +206,12 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  if (problem.seq_len <= problem.topk) {
+    trivial_transform<kPDL>(problem);
+    __syncthreads();
+    params.sparse_prefill_epilogue(blockIdx.x);
+    return;
+  }
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
@@ -199,6 +244,8 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  __syncthreads();
+  params.sparse_prefill_epilogue(blockIdx.x);
 }
 
 template <bool kPDL>
@@ -206,12 +253,20 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   __shared__ impl::MaxSmem<Streaming::Smem, Cluster::Smem> smem;
-  if (problem.seq_len <= problem.topk) return trivial_transform<kPDL>(problem);
+  // One rank owns final output for both the trivial and clustered paths.
+  const auto worker_rank = blockIdx.x % kClusterSize;
+  if (problem.seq_len <= problem.topk) {
+    if (blockIdx.y == worker_rank) {
+      trivial_transform<kPDL>(problem);
+      __syncthreads();
+      params.sparse_prefill_epilogue(blockIdx.x);
+    }
+    return;
+  }
   __shared__ int32_t topk_indices[kMaxTopK];
   problem.out = topk_indices;
 
   // randomly elect one worker rank to avoid workload imbalance
-  const auto worker_rank = blockIdx.x % kClusterSize;
 
   // for small batch, we will fuse in the cluster case
   if (problem.seq_len <= kReg4MaxSeqLen) {
@@ -227,7 +282,11 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
 
   device::PDLWaitPrimary<kPDL>();
   __syncthreads();
-  if (blockIdx.y == worker_rank) problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  if (blockIdx.y == worker_rank) {
+    problem_transform(problem, params.get_output_ptr(blockIdx.x));
+    __syncthreads();
+    params.sparse_prefill_epilogue(blockIdx.x);
+  }
 }
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
@@ -313,6 +372,8 @@ __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
   }
 }
 
+#ifndef SGLANG_DSV4_TOPK_DEVICE_ONLY
+
 struct TopKKernel {
   static void plan(  //
       const tvm::ffi::TensorView seq_lens,
@@ -351,7 +412,15 @@ struct TopKKernel {
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
       const tvm::ffi::TensorView metadata,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> positions,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> query_start_loc,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> full_seq_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> swa_gather_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> compressed_base,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> swa_base,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> combined_indices,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> combined_lens) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto Bp1 = SymbolicSize{"batch_size_plus_1"};
@@ -391,6 +460,62 @@ struct TopKKernel {
       raw_indices_ptr = static_cast<int32_t*>(raw_indices.value().data_ptr());
     }
 
+    const bool sparse_epilogue = combined_indices.has_value();
+    RuntimeCheck(
+        sparse_epilogue == positions.has_value() &&
+            sparse_epilogue == query_start_loc.has_value() &&
+            sparse_epilogue == full_seq_lens.has_value() &&
+            sparse_epilogue == swa_gather_lens.has_value() &&
+            sparse_epilogue == compressed_base.has_value() &&
+            sparse_epilogue == swa_base.has_value() &&
+            sparse_epilogue == combined_lens.has_value(),
+        "sparse-prefill topk epilogue tensors must be provided together");
+    RuntimeCheck(!sparse_epilogue || raw_indices_ptr != nullptr,
+                 "sparse-prefill topk epilogue requires raw_indices output");
+
+    const int32_t* positions_ptr = nullptr;
+    const int32_t* query_start_loc_ptr = nullptr;
+    const int32_t* full_seq_lens_ptr = nullptr;
+    const int32_t* swa_gather_lens_ptr = nullptr;
+    const int32_t* compressed_base_ptr = nullptr;
+    const int32_t* swa_base_ptr = nullptr;
+    int32_t* combined_indices_ptr = nullptr;
+    int32_t* combined_lens_ptr = nullptr;
+    int64_t combined_indices_stride = 0;
+    uint32_t num_reqs = 0;
+    if (sparse_epilogue) {
+      auto R = SymbolicSize{"num_reqs"};
+      auto C = SymbolicSize{"combined_stride"};
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(positions.value());
+      TensorMatcher({-1}).with_dtype<int32_t>().with_device(device_).verify(query_start_loc.value());
+      TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(full_seq_lens.value());
+      TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(swa_gather_lens.value());
+      TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(compressed_base.value());
+      TensorMatcher({R}).with_dtype<int32_t>().with_device(device_).verify(swa_base.value());
+      TensorMatcher({B, -1})
+          .with_strides({C, 1})
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(combined_indices.value());
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(combined_lens.value());
+      RuntimeCheck(query_start_loc.value().shape()[0] == R.unwrap() + 1,
+                   "query_start_loc must have num_reqs + 1 entries");
+      RuntimeCheck(R.unwrap() > 0 && R.unwrap() <= 16,
+                   "sparse-prefill topk supports 1..16 requests");
+      RuntimeCheck(combined_indices.value().shape()[1] >= K.unwrap() + kSparsePrefillSWAWindow,
+                   "combined_indices row is too narrow");
+      positions_ptr = static_cast<const int32_t*>(positions.value().data_ptr());
+      query_start_loc_ptr = static_cast<const int32_t*>(query_start_loc.value().data_ptr());
+      full_seq_lens_ptr = static_cast<const int32_t*>(full_seq_lens.value().data_ptr());
+      swa_gather_lens_ptr = static_cast<const int32_t*>(swa_gather_lens.value().data_ptr());
+      compressed_base_ptr = static_cast<const int32_t*>(compressed_base.value().data_ptr());
+      swa_base_ptr = static_cast<const int32_t*>(swa_base.value().data_ptr());
+      combined_indices_ptr = static_cast<int32_t*>(combined_indices.value().data_ptr());
+      combined_lens_ptr = static_cast<int32_t*>(combined_lens.value().data_ptr());
+      combined_indices_stride = C.unwrap();
+      num_reqs = static_cast<uint32_t>(R.unwrap());
+    }
+
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
     RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
@@ -415,12 +540,22 @@ struct TopKKernel {
         .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .raw_indices = raw_indices_ptr,
+        .positions = positions_ptr,
+        .query_start_loc = query_start_loc_ptr,
+        .full_seq_lens = full_seq_lens_ptr,
+        .swa_gather_lens = swa_gather_lens_ptr,
+        .compressed_base = compressed_base_ptr,
+        .swa_base = swa_base_ptr,
+        .combined_indices = combined_indices_ptr,
+        .combined_lens = combined_lens_ptr,
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
+        .combined_indices_stride = combined_indices_stride,
         .topk = topk,
         .page_bits = page_bits,
         .cluster_floor = (batch_size <= kSmallBatchLowFloor) ? kClusterFloorSmall : kClusterFloor,
+        .num_reqs = num_reqs,
     };
 
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
@@ -454,5 +589,7 @@ struct TopKKernel {
     }
   }
 };
+
+#endif  // SGLANG_DSV4_TOPK_DEVICE_ONLY
 
 }  // namespace

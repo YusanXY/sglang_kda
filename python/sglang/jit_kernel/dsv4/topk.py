@@ -125,6 +125,15 @@ def topk_transform_512_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    *,
+    positions: Optional[torch.Tensor] = None,
+    query_start_loc: Optional[torch.Tensor] = None,
+    full_seq_lens: Optional[torch.Tensor] = None,
+    swa_gather_lens: Optional[torch.Tensor] = None,
+    compressed_base: Optional[torch.Tensor] = None,
+    swa_base: Optional[torch.Tensor] = None,
+    combined_indices: Optional[torch.Tensor] = None,
+    combined_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -137,6 +146,24 @@ def topk_transform_512_v2(
     the valid way to express "no tokens": the row takes the trivial path and
     the output is all -1.
     """
+    sparse_args = (
+        positions,
+        query_start_loc,
+        full_seq_lens,
+        swa_gather_lens,
+        compressed_base,
+        swa_base,
+        combined_indices,
+        combined_lens,
+    )
+    if any(value is not None for value in sparse_args) and not all(
+        value is not None for value in sparse_args
+    ):
+        raise ValueError(
+            "sparse-prefill topk epilogue tensors must all be provided together"
+        )
+    if combined_indices is not None and out_raw_indices is None:
+        raise ValueError("sparse-prefill topk epilogue requires raw indices")
     module = _jit_topk_v2_module()
     module.topk_transform(
         scores,
@@ -146,4 +173,5 @@ def topk_transform_512_v2(
         page_size,
         metadata,
         out_raw_indices,
+        *sparse_args,
     )

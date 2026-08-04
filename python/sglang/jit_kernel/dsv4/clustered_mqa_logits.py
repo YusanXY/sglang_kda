@@ -27,14 +27,14 @@ QUERIES_PER_CLUSTER = 16
 _HERE = Path(__file__).resolve().parent
 _SOURCE_DIR = _HERE.parent / "csrc" / "dsv4" / "clustered_mqa_logits"
 _SOURCES = (_SOURCE_DIR / "v2_binding.cpp", _SOURCE_DIR / "v2_kernel.cu")
-_TOPK_V1 = _HERE.parent / "csrc" / "deepseek_v4" / "topk_v1.cuh"
+_TOPK_V2 = _HERE.parent / "csrc" / "deepseek_v4" / "topk_v2.cuh"
 _TOPK_IMPL = _HERE.parent / "include" / "sgl_kernel" / "deepseek_v4" / "topk_impl.cuh"
 _DEPENDENCIES = (
     *_SOURCES,
     _SOURCE_DIR / "v2_mqa_logits_layout.cuh",
     _SOURCE_DIR / "v2_sm100_mqa_logits.cuh",
     _SOURCE_DIR / "v2_sm100_paged_mqa_logits.cuh",
-    _TOPK_V1,
+    _TOPK_V2,
     _TOPK_IMPL,
 )
 
@@ -87,9 +87,11 @@ def load_clustered_mqa_extension():
             f"sm{capability[0]}{capability[1]}"
         )
     import deep_gemm
+    import tvm_ffi
     from torch.utils.cpp_extension import load
 
     deep_gemm_include = Path(deep_gemm.__file__).resolve().parent / "include"
+    tvm_ffi_include = Path(tvm_ffi.__file__).resolve().parent / "include"
     arch = "10.0a" if capability == (10, 0) else "10.3a"
     module_name = f"sglang_dsv4_clustered_mqa_{_source_digest()}"
     with _torch_arch(arch):
@@ -100,6 +102,7 @@ def load_clustered_mqa_extension():
                 str(_SOURCE_DIR),
                 str(deep_gemm_include),
                 str(_HERE.parent / "include"),
+                str(tvm_ffi_include),
             ],
             extra_cflags=["-O3", "-std=c++20"],
             extra_cuda_cflags=[
@@ -109,6 +112,15 @@ def load_clustered_mqa_extension():
                 f"-DSGL_CUDA_ARCH={capability[0] * 100 + capability[1] * 10}",
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
+                # torch.utils.cpp_extension disables CUDA half/bfloat
+                # conversions globally.  The exact v2 radix kernel uses a
+                # deliberate FP32 -> FP16 coarse-bin conversion, matching its
+                # standalone TVM-FFI build, so restore the CUDA operators for
+                # this translation unit.
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
             ],
             extra_ldflags=["-lcuda"],
             with_cuda=True,
@@ -222,7 +234,7 @@ def clustered_fp8_paged_mqa_topk(
     combined_indices: torch.Tensor,
     combined_lens: torch.Tensor,
 ) -> None:
-    """Submit clustered logits and exact radix top-k through one C++ entry."""
+    """Submit clustered logits and exact v2 top-k through one C++ entry."""
 
     if q.shape != (metadata.total_q, HEADS, HEAD_DIM):
         raise RuntimeError(

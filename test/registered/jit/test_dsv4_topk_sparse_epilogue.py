@@ -1,7 +1,11 @@
 import pytest
 import torch
 
-from sglang.jit_kernel.dsv4 import topk_transform_512
+from sglang.jit_kernel.dsv4 import (
+    plan_topk_v2,
+    topk_transform_512,
+    topk_transform_512_v2,
+)
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     combine_topk_swa_indices,
 )
@@ -11,7 +15,8 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="DSV4 fused top-k sparse epilogue requires Blackwell CUDA",
 )
-def test_topk_sparse_epilogue_matches_standalone_combiner():
+@pytest.mark.parametrize("version", ("v1", "v2"))
+def test_topk_sparse_epilogue_matches_standalone_combiner(version):
     device = torch.device("cuda")
     torch.manual_seed(7)
 
@@ -41,14 +46,32 @@ def test_topk_sparse_epilogue_matches_standalone_combiner():
 
     page_ref = torch.empty((len(positions), 512), dtype=torch.int32, device=device)
     raw_ref = torch.empty_like(page_ref)
-    topk_transform_512(
-        scores,
-        compressed_seq_lens,
-        page_table,
-        page_ref,
-        page_size,
-        raw_ref,
-    )
+    metadata = plan_topk_v2(compressed_seq_lens) if version == "v2" else None
+
+    def transform(page_indices, raw_indices, **kwargs):
+        if version == "v2":
+            topk_transform_512_v2(
+                scores,
+                compressed_seq_lens,
+                page_table,
+                page_indices,
+                page_size,
+                metadata,
+                raw_indices,
+                **kwargs,
+            )
+        else:
+            topk_transform_512(
+                scores,
+                compressed_seq_lens,
+                page_table,
+                page_indices,
+                page_size,
+                raw_indices,
+                **kwargs,
+            )
+
+    transform(page_ref, raw_ref)
 
     full_seq_lens = torch.tensor((2051, 4099), dtype=torch.int32, device=device)
     gather_lens = torch.tensor((130, 132), dtype=torch.int32, device=device)
@@ -63,12 +86,8 @@ def test_topk_sparse_epilogue_matches_standalone_combiner():
         (len(positions), 640), -1, dtype=torch.int32, device=device
     )
     lens_out = torch.empty(len(positions), dtype=torch.int32, device=device)
-    topk_transform_512(
-        scores,
-        compressed_seq_lens,
-        page_table,
+    transform(
         page_out,
-        page_size,
         raw_out,
         positions=positions,
         query_start_loc=query_start_loc,

@@ -1,38 +1,13 @@
-#include <cstdint>
-
-#ifdef SGLANG_DSV4_TOPK_DEVICE_ONLY
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-
-#ifndef SGL_DEVICE
-#define SGL_DEVICE __forceinline__ __device__
-#define SGLANG_DSV4_TOPK_LOCAL_DEVICE_UTILS
-namespace device {
-template <bool kUsePDL>
-SGL_DEVICE void PDLWaitPrimary() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  if constexpr (kUsePDL) asm volatile("griddepcontrol.wait;" ::: "memory");
-#endif
-}
-
-template <bool kUsePDL>
-SGL_DEVICE void PDLTriggerSecondary() {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  if constexpr (kUsePDL) asm volatile("griddepcontrol.launch_dependents;" :::);
-#endif
-}
-}  // namespace device
-#endif
-#else
-#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <bit>
-#endif
+#include <cstdint>
 
 namespace {
 
@@ -361,8 +336,6 @@ __global__ void topk_transform_kernel(const __grid_constant__ TopKParams params)
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
-#ifndef SGLANG_DSV4_TOPK_DEVICE_ONLY
-
 template <auto* f, size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(host::DebugInfo where = {}) {
   [[maybe_unused]]
@@ -514,11 +487,4 @@ struct TopKKernel {
   }
 };
 
-#endif  // SGLANG_DSV4_TOPK_DEVICE_ONLY
-
 }  // namespace
-
-#ifdef SGLANG_DSV4_TOPK_LOCAL_DEVICE_UTILS
-#undef SGLANG_DSV4_TOPK_LOCAL_DEVICE_UTILS
-#undef SGL_DEVICE
-#endif

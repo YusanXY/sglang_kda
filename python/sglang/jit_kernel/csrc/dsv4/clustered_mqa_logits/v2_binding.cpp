@@ -113,6 +113,7 @@ void launch_blockq8_tmem2(
 void launch_topk512_sparse_prefill(
     int batch_size,
     int num_reqs,
+    int max_context_len,
     int logits_stride,
     int page_table_stride,
     int combined_indices_stride,
@@ -384,6 +385,7 @@ void v2_forward_topk(
     launch_topk512_sparse_prefill(
         static_cast<int>(total_q),
         static_cast<int>(num_reqs),
+        static_cast<int>(max_context_len),
         static_cast<int>(logits.stride(0)),
         static_cast<int>(page_table.stride(0)),
         static_cast<int>(combined_indices.stride(0)),

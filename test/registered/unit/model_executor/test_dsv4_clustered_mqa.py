@@ -87,7 +87,27 @@ def test_huge_q16_skips_stock_schedule_until_cuda_tail_needs_it():
     build.assert_called_once_with()
 
 
-def test_clustered_topk_submits_logits_and_epilogue_through_one_cpp_entry():
+def test_huge_clustered_metadata_skips_unused_generic_topk_v2_plan():
+    with (
+        mock.patch(
+            "sglang.srt.layers.attention.dsv4.metadata.envs.SGLANG_OPT_USE_TOPK_V2.get",
+            return_value=True,
+        ),
+        mock.patch("sglang.jit_kernel.dsv4.plan_topk_v2") as plan,
+    ):
+        metadata = PagedIndexerMetadata(
+            page_size=256,
+            page_table=torch.zeros((16, 2), dtype=torch.int32),
+            c4_seq_lens=torch.ones(16, dtype=torch.int32),
+            prefer_clustered_mqa=True,
+        )
+
+    plan.assert_not_called()
+    assert metadata.topk_metadata.numel() == 0
+    assert metadata.topk_metadata.device == metadata.c4_seq_lens.device
+
+
+def test_clustered_topk_v2_submits_logits_and_epilogue_through_one_cpp_entry():
     extension = mock.Mock()
     q = torch.empty((2, 64, 128))
     metadata = ClusteredMqaMetadata(

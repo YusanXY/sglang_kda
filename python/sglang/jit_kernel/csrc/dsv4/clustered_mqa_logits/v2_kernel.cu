@@ -6,7 +6,7 @@
 
 #include "v2_sm100_mqa_logits.cuh"
 #define SGLANG_DSV4_TOPK_DEVICE_ONLY
-#include "../../deepseek_v4/topk_v1.cuh"
+#include "../../deepseek_v4/topk_v2.cuh"
 #undef SGLANG_DSV4_TOPK_DEVICE_ONLY
 
 void launch_blockq8_tmem2(
@@ -89,6 +89,7 @@ void launch_blockq8_tmem2(
 void launch_topk512_sparse_prefill(
     int batch_size,
     int num_reqs,
+    int max_context_len,
     int logits_stride,
     int page_table_stride,
     int combined_indices_stride,
@@ -106,45 +107,69 @@ void launch_topk512_sparse_prefill(
     int* combined_indices,
     int* combined_lens,
     cudaStream_t stream) {
-    static_assert(kTopK == 512 && kTopKBlockSize == 512);
-    constexpr auto kernel = topk_transform_kernel<false>;
-    constexpr int smem_bytes = kSMEM + sizeof(int32_t);
-    static const auto setup_status = cudaFuncSetAttribute(
-        kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        smem_bytes);
-    if (setup_status != cudaSuccess) {
+    // The strict Huge runtime caps the raw context at 73728 tokens.  C4
+    // therefore never exceeds 18432 positions and cannot enter v2's >64K
+    // cluster route.  Keeping the launch inside this extension removes the
+    // second Python/C++ submission and makes routing a static three-way CUDA
+    // specialization without requiring the generic plan tensor.
+    constexpr uint32_t kTopK = 512;
+    constexpr uint32_t kPageBits = 6;
+    constexpr uint32_t kHugeMaxC4Context = 18432;
+    if (max_context_len <= 0 ||
+        max_context_len > static_cast<int>(kHugeMaxC4Context) ||
+        logits_stride < max_context_len || logits_stride % 256 != 0) {
         throw std::runtime_error(
-            std::string("top-k cudaFuncSetAttribute failed: ") +
-            cudaGetErrorString(setup_status));
+            "Huge C4 top-k v2 requires 0 < context <= 18432 and a 256-aligned logits stride");
     }
-
-    const auto params = TopKParams{
-        logits,
-        seq_lens,
-        page_table,
-        page_indices,
-        raw_indices,
-        positions,
-        query_start_loc,
-        full_seq_lens,
-        swa_gather_lens,
-        compressed_base,
-        swa_base,
-        combined_indices,
-        combined_lens,
-        logits_stride,
-        page_table_stride,
-        combined_indices_stride,
-        static_cast<uint32_t>(num_reqs),
-        6,
+    const auto params = TopKLaunchParams{
+        .scores = logits,
+        .seq_lens = seq_lens,
+        .page_table = page_table,
+        .page_indices = page_indices,
+        .raw_indices = raw_indices,
+        .positions = positions,
+        .query_start_loc = query_start_loc,
+        .full_seq_lens = full_seq_lens,
+        .swa_gather_lens = swa_gather_lens,
+        .compressed_base = compressed_base,
+        .swa_base = swa_base,
+        .combined_indices = combined_indices,
+        .combined_lens = combined_lens,
+        .metadata = nullptr,
+        .score_stride = logits_stride,
+        .page_table_stride = page_table_stride,
+        .combined_indices_stride = combined_indices_stride,
+        .topk = kTopK,
+        .page_bits = kPageBits,
+        .cluster_floor = kClusterFloor,
+        .num_reqs = static_cast<uint32_t>(num_reqs),
     };
-    topk_transform_kernel<false>
-        <<<batch_size, kTopKBlockSize, smem_bytes, stream>>>(params);
-    const auto status = cudaGetLastError();
+
+    cudaLaunchAttribute pdl_attr{};
+    pdl_attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    pdl_attr.val.programmaticStreamSerializationAllowed = true;
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(batch_size, 1, 1);
+    config.blockDim = dim3(kBlockSize, 1, 1);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    config.attrs = &pdl_attr;
+    config.numAttrs = 1;
+
+    cudaError_t status;
+    if (max_context_len <= static_cast<int>(kReg2MaxSeqLen)) {
+        status = cudaLaunchKernelEx(
+            &config, topk_main_kernel<true, 0>, params);
+    } else if (max_context_len <= static_cast<int>(kReg4MaxSeqLen)) {
+        status = cudaLaunchKernelEx(
+            &config, topk_main_kernel<true, 1>, params);
+    } else {
+        status = cudaLaunchKernelEx(
+            &config, topk_main_kernel<true, 2>, params);
+    }
     if (status != cudaSuccess) {
         throw std::runtime_error(
-            std::string("clustered MQA top-k launch failed: ") +
+            std::string("clustered MQA top-k v2 launch failed: ") +
             cudaGetErrorString(status));
     }
 }
