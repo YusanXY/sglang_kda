@@ -47,6 +47,7 @@ def _server_args(**overrides):
         moe_runner_backend="flashinfer_mxfp4",
         enable_two_batch_overlap=False,
         enable_hisparse=False,
+        disable_custom_all_reduce=False,
         speculative_algorithm=None,
         disable_overlap_schedule=True,
         cuda_graph_config=SimpleNamespace(
@@ -105,6 +106,7 @@ def test_startup_contract_accepts_req128_high_load_capacity():
         ("disable_overlap_schedule", False),
         ("page_size", 1),
         ("moe_runner_backend", "auto"),
+        ("disable_custom_all_reduce", True),
     ],
 )
 def test_startup_contract_rejects_unsupported_config(field, value):

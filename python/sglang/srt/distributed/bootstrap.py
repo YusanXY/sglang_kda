@@ -246,6 +246,11 @@ def _init_parallel_groups(
         duplicate_tp_group=server_args.enable_pdmux,
         enable_symm_mem=server_args.enable_symm_mem,
         recovered_rank=server_args.elastic_ep_rejoin,
+        custom_allreduce_max_pull_size=(
+            64 * 1024 * 1024
+            if server_args.dsv4_worker_backend == "huge_kernel"
+            else None
+        ),
     )
     initialize_dp_attention(
         server_args=server_args,

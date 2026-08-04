@@ -344,6 +344,7 @@ class CustomAllreduce:
 def dispatch_custom_allreduce(
     group: ProcessGroup,
     device: torch.device,
+    max_pull_size: Optional[int] = None,
 ):
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
 
@@ -363,7 +364,14 @@ def dispatch_custom_allreduce(
 
         if can_use_custom_all_reduce_v2(group=group, device=device):
             logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")
+            if max_pull_size is not None:
+                return partial(CustomAllReduceV2, max_pull_size=max_pull_size)
             return CustomAllReduceV2
+
+    if max_pull_size is not None:
+        raise RuntimeError(
+            "A custom max_pull_size requires CUDA CustomAllReduceV2"
+        )
 
     if _is_cuda or _is_musa:
         return CustomAllreduce
