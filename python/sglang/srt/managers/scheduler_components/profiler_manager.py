@@ -245,8 +245,15 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
+            # The CUDA profiler session is process-global, but the TP schedulers
+            # reach this callback independently.  Align them on the CPU group so
+            # no rank can enter the measured forward before the base rank has
+            # enabled collection.  A second barrier publishes the completed
+            # start without adding a CUDA/NCCL kernel to the captured range.
+            torch.distributed.barrier(self.dp_tp_cpu_group)
             if self.ps.gpu_id == get_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
+            torch.distributed.barrier(self.dp_tp_cpu_group)
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -355,8 +362,13 @@ class SchedulerProfilerManager:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
+            # Keep every rank inside the capture until all measured GPU work has
+            # been submitted.  This prevents the base rank from truncating a
+            # slower rank's tail and makes multi-process Nsight reports complete.
+            torch.distributed.barrier(self.dp_tp_cpu_group)
             if self.ps.gpu_id == get_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
+            torch.distributed.barrier(self.dp_tp_cpu_group)
 
         merge_message = self._merge_profile_traces()
 

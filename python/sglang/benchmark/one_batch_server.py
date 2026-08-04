@@ -198,8 +198,12 @@ class BenchArgs:
             type=str,
             nargs="+",
             default=("CPU", "GPU"),
-            choices=["CPU", "GPU", "XPU"],
-            help="Profiler activities: CPU, GPU, XPU. use torch profiler.",
+            choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
+            help=(
+                "Profiler activities: CPU, GPU, XPU, CUDA_PROFILER. "
+                "CPU/GPU/XPU use torch profiler; CUDA_PROFILER controls an "
+                "external profiler capture range."
+            ),
         )
         parser.add_argument(
             "--profile-start-step",
