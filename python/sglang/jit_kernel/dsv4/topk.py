@@ -48,7 +48,7 @@ def _jit_topk_v2_huge_module():
     # warp-shuffle bitset scan.  This preserves deterministic attention
     # accumulation while avoiding the generic 1024-thread CUB BlockScan.
     return load_jit(
-        make_name("topk_v2_huge_warp_bitset_sort"),
+        make_name("topk_v2_huge_warp_bitset_sort_l0_req16_v2"),
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=[("topk_transform", "TopKKernel::transform")],
         extra_cuda_cflags=["-DSGLANG_DSV4_TOPK_WARP_BITSET_SORT=1"],

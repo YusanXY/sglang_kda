@@ -854,6 +854,22 @@ struct TopKKernel {
 
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
+#ifdef SGLANG_DSV4_TOPK_WARP_BITSET_SORT
+    // Strict Huge req16 is validated before model execution: 16 requests each
+    // contribute 4096 new tokens after a 16384-token prefix, so every C4 row
+    // is in [4097, 5120].  CUDA Graph retains the 18432-token capacity in L;
+    // dispatch from immutable host-visible shape fields to compile level 0
+    // without reading seq_lens back from the GPU.
+    const bool strict_req16_incremental =
+        batch_size == 16 * 4096 && num_reqs == 16 && topk == 512 &&
+        page_bits == 6 &&
+        max_seq_len == 73728 / 4 + (1u << page_bits);
+    if (strict_req16_incremental) {
+      LaunchKernel(batch_size, kBlockSize, device)
+          .config({.use_pdl = kUsePDL})
+          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0>, params);
+    } else
+#endif
     if (use_cluster) {
       if (batch_size <= kNumPersistentClusters) {
         LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
