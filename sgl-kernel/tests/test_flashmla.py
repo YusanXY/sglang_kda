@@ -377,8 +377,9 @@ def test_flashmla_prefill(
 
 
 @pytest.mark.skipif(not is_sm100_supported(), reason="SM100 required")
+@pytest.mark.parametrize("indices_pattern", ["valid", "mixed", "all_invalid"])
 @torch.inference_mode()
-def test_flashmla_prefill_output_only():
+def test_flashmla_prefill_output_only(indices_pattern):
     s_q, s_kv, h_q, d_qk, topk = 64, 512, 64, 512, 128
     q = torch.randn((s_q, h_q, d_qk), dtype=torch.bfloat16, device="cuda") / 10
     kv = torch.randn((s_kv, 1, d_qk), dtype=torch.bfloat16, device="cuda") / 10
@@ -387,6 +388,13 @@ def test_flashmla_prefill_output_only():
     )
     attn_sink = torch.randn((h_q,), dtype=torch.float32, device="cuda") / 10
     topk_length = torch.full((s_q,), topk, dtype=torch.int32, device="cuda")
+    if indices_pattern == "mixed":
+        indices[:, :, ::3] = -1
+        indices[:, :, 1::5] = s_kv
+        topk_length.fill_(topk - 17)
+    elif indices_pattern == "all_invalid":
+        indices.fill_(-1)
+        topk_length.zero_()
     sm_scale = 1 / math.sqrt(d_qk)
 
     expected, _, _ = flash_mla_sparse_fwd(
