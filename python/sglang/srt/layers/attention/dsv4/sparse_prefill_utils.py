@@ -552,6 +552,9 @@ class SparsePrefillChunkCache:
         self,
         *,
         c128_page_indices: torch.Tensor,
+        live_seq_lens: torch.Tensor,
+        live_extend_seq_lens: torch.Tensor,
+        live_req_pool_indices: torch.Tensor,
     ) -> None:
         """Refresh only C128 outside the graph into capture-stable buffers.
 
@@ -580,6 +583,10 @@ class SparsePrefillChunkCache:
             self.swa_offsets,
             self.seq_lens,
             self.extend_seq_lens,
+            self.req_pool_indices,
+            live_seq_lens,
+            live_extend_seq_lens,
+            live_req_pool_indices,
             c128_page_indices,
             c128_page_indices.stride(0),
             C128_MAX=c128_max,

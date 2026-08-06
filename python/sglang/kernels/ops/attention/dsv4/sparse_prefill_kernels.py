@@ -8,6 +8,95 @@ import triton.language as tl
 
 
 @triton.jit
+def _copy_batch1_dsv4_core_metadata_kernel(
+    raw_out_loc_dst,
+    raw_out_loc_src,
+    seq_lens_casual_dst,
+    seq_lens_casual_src,
+    positions_casual_dst,
+    positions_casual_src,
+    c4_out_loc_dst,
+    c4_out_loc_src,
+    c128_out_loc_dst,
+    c128_out_loc_src,
+    c4_topk_lengths_raw_dst,
+    c4_topk_lengths_raw_src,
+    c4_topk_lengths_clamp1_dst,
+    c4_topk_lengths_clamp1_src,
+    c4_sparse_topk_lengths_dst,
+    c4_sparse_topk_lengths_src,
+    raw_out_loc_n,
+    seq_lens_casual_n,
+    positions_casual_n,
+    c4_out_loc_n,
+    c128_out_loc_n,
+    c4_topk_lengths_raw_n,
+    c4_topk_lengths_clamp1_n,
+    c4_sparse_topk_lengths_n,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy the eight strict M=4096 core metadata arrays in one launch."""
+
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < raw_out_loc_n
+    tl.store(
+        raw_out_loc_dst + offsets,
+        tl.load(raw_out_loc_src + offsets, mask=mask),
+        mask=mask,
+    )
+    tl.store(
+        seq_lens_casual_dst + offsets,
+        tl.load(
+            seq_lens_casual_src + offsets,
+            mask=offsets < seq_lens_casual_n,
+        ),
+        mask=offsets < seq_lens_casual_n,
+    )
+    tl.store(
+        positions_casual_dst + offsets,
+        tl.load(
+            positions_casual_src + offsets,
+            mask=offsets < positions_casual_n,
+        ),
+        mask=offsets < positions_casual_n,
+    )
+    tl.store(
+        c4_out_loc_dst + offsets,
+        tl.load(c4_out_loc_src + offsets, mask=offsets < c4_out_loc_n),
+        mask=offsets < c4_out_loc_n,
+    )
+    tl.store(
+        c128_out_loc_dst + offsets,
+        tl.load(c128_out_loc_src + offsets, mask=offsets < c128_out_loc_n),
+        mask=offsets < c128_out_loc_n,
+    )
+    tl.store(
+        c4_topk_lengths_raw_dst + offsets,
+        tl.load(
+            c4_topk_lengths_raw_src + offsets,
+            mask=offsets < c4_topk_lengths_raw_n,
+        ),
+        mask=offsets < c4_topk_lengths_raw_n,
+    )
+    tl.store(
+        c4_topk_lengths_clamp1_dst + offsets,
+        tl.load(
+            c4_topk_lengths_clamp1_src + offsets,
+            mask=offsets < c4_topk_lengths_clamp1_n,
+        ),
+        mask=offsets < c4_topk_lengths_clamp1_n,
+    )
+    tl.store(
+        c4_sparse_topk_lengths_dst + offsets,
+        tl.load(
+            c4_sparse_topk_lengths_src + offsets,
+            mask=offsets < c4_sparse_topk_lengths_n,
+        ),
+        mask=offsets < c4_sparse_topk_lengths_n,
+    )
+
+
+@triton.jit
 def _build_swa_token_ids_kernel(
     out_ptr,
     swa_first_pos_ptr,
@@ -96,8 +185,12 @@ def _rebuild_batch1_c128_replay_kernel(
     swa_first_pos_ptr,
     swa_gather_lens_ptr,
     swa_offsets_ptr,
-    seq_lens_ptr,
-    extend_seq_lens_ptr,
+    captured_seq_lens_ptr,
+    captured_extend_seq_lens_ptr,
+    captured_req_pool_indices_ptr,
+    live_seq_lens_ptr,
+    live_extend_seq_lens_ptr,
+    live_req_pool_indices_ptr,
     c128_page_indices_ptr,
     c128_page_indices_stride,
     C128_MAX: tl.constexpr,
@@ -109,12 +202,16 @@ def _rebuild_batch1_c128_replay_kernel(
 
     worker_id = tl.program_id(0)
     num_workers = tl.num_programs(0)
-    seq_len = tl.load(seq_lens_ptr)
-    query_len = tl.load(extend_seq_lens_ptr)
+    seq_len = tl.load(live_seq_lens_ptr).to(tl.int32)
+    query_len = tl.load(live_extend_seq_lens_ptr).to(tl.int32)
+    req_pool_idx = tl.load(live_req_pool_indices_ptr).to(tl.int32)
     gather_len = tl.minimum(seq_len, query_len + WINDOW_SIZE - 1)
     gather_start = seq_len - gather_len
 
     is_first_worker = worker_id == 0
+    tl.store(captured_seq_lens_ptr, seq_len, mask=is_first_worker)
+    tl.store(captured_extend_seq_lens_ptr, query_len, mask=is_first_worker)
+    tl.store(captured_req_pool_indices_ptr, req_pool_idx, mask=is_first_worker)
     tl.store(query_start_loc_ptr, 0, mask=is_first_worker)
     tl.store(query_start_loc_ptr + 1, query_len, mask=is_first_worker)
     tl.store(swa_first_pos_ptr, gather_start, mask=is_first_worker)

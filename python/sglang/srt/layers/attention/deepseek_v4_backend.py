@@ -27,6 +27,9 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
 from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
+from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
+    _copy_batch1_dsv4_core_metadata_kernel,
+)
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
@@ -235,7 +238,12 @@ class DSV4AttnMetadata:
             ],
         )
 
-    def refresh_for_breakable_cuda_graph_replay_(self, other: DSV4AttnMetadata) -> None:
+    def refresh_for_breakable_cuda_graph_replay_(
+        self,
+        other: DSV4AttnMetadata,
+        *,
+        use_fused_batch1_copy: bool = False,
+    ) -> None:
         assert self.c4_sparse_topk == other.c4_sparse_topk
         assert self.page_size == other.page_size
         assert self.cuda_int32_kwargs == other.cuda_int32_kwargs
@@ -260,15 +268,36 @@ class DSV4AttnMetadata:
             "c4_flashmla_metadata",
             "c128_flashmla_metadata",
         ]
-        # Keep graph-captured tensor objects alive for fields that captured
-        # kernels read by address; overwrite only their contents.
-        for field_name in tensor_copy_fields:
-            src_val = getattr(other, field_name)
-            dst_val = getattr(self, field_name)
-            if src_val is None and dst_val is None:
-                continue
-            assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-            dst_val.copy_(src_val)
+        if use_fused_batch1_copy:
+            tensors = []
+            numels = []
+            for field_name in tensor_copy_fields:
+                src_val = getattr(other, field_name)
+                dst_val = getattr(self, field_name)
+                if src_val is None or dst_val is None:
+                    raise RuntimeError(
+                        f"Huge Graph fused core metadata requires {field_name}"
+                    )
+                if src_val.numel() > 4096 or dst_val.shape != src_val.shape:
+                    raise RuntimeError(
+                        "Huge Graph fused core metadata requires arrays no larger "
+                        f"than M=4096; {field_name}={tuple(src_val.shape)}"
+                    )
+                tensors.extend((dst_val, src_val))
+                numels.append(src_val.numel())
+            _copy_batch1_dsv4_core_metadata_kernel[(16,)](
+                *tensors,
+                *numels,
+                BLOCK_SIZE=256,
+            )
+        else:
+            for field_name in tensor_copy_fields:
+                src_val = getattr(other, field_name)
+                dst_val = getattr(self, field_name)
+                if src_val is None and dst_val is None:
+                    continue
+                assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
+                dst_val.copy_(src_val)
 
         # These fields are safe to replace because captured kernels only need
         # the current per-replay objects, or the field is produced inside the
@@ -412,8 +441,13 @@ class DSV4Metadata:
         self.clustered_mqa_metadata = None
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
+        captured_sparse_cache = self.sparse_prefill_cache
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
-            static_metadata.core_attn_metadata
+            static_metadata.core_attn_metadata,
+            use_fused_batch1_copy=(
+                captured_sparse_cache is not None
+                and captured_sparse_cache.graph_local_rebuild
+            ),
         )
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
         maybe_copy_inplace(
@@ -428,7 +462,6 @@ class DSV4Metadata:
                 self.c128_compress_metadata,
                 src=static_metadata.c128_compress_metadata,
             )
-        captured_sparse_cache = self.sparse_prefill_cache
         live_sparse_cache = static_metadata.sparse_prefill_cache
         if captured_sparse_cache is None:
             self.sparse_prefill_cache = None
@@ -1600,16 +1633,14 @@ class DeepseekV4AttnBackend(
                 raise RuntimeError(
                     "Huge Graph replay requires seq/extend/request descriptors"
                 )
-            captured_sparse_cache.refresh_graph_inputs_(
-                seq_lens=live_batch.seq_lens,
-                extend_seq_lens=live_batch.extend_seq_lens,
-                req_pool_indices=live_batch.req_pool_indices,
-            )
             c128_page_indices = static_metadata.core_attn_metadata.c128_page_indices
             if c128_page_indices is None:
                 raise RuntimeError("Huge Graph replay requires C128 page indices")
             captured_sparse_cache.rebuild_c128_for_graph_replay_(
-                c128_page_indices=c128_page_indices
+                c128_page_indices=c128_page_indices,
+                live_seq_lens=live_batch.seq_lens,
+                live_extend_seq_lens=live_batch.extend_seq_lens,
+                live_req_pool_indices=live_batch.req_pool_indices,
             )
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
