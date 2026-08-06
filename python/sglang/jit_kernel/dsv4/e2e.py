@@ -26,6 +26,76 @@ _QUANT_GROUP_SIZE = 128
 
 
 @cache_once
+def _jit_mhc_post_vec8_module(use_pdl: bool) -> Module:
+    args = make_cpp_args(use_pdl)
+    return load_jit(
+        make_name("mhc_post_vec8_hc4_h4096_v3_occupancy"),
+        *args,
+        cuda_files=["deepseek_v4/mhc_post_vec8.cuh"],
+        cuda_wrappers=[("run", f"MhcPostVec8Kernel<{args}>::run")],
+        extra_cuda_cflags=["--use_fast_math"],
+    )
+
+
+def load_mhc_post_vec8_extension() -> None:
+    """Compile/load the strict HC=4/H=4096 post kernel before serving."""
+
+    _jit_mhc_post_vec8_module(False)
+
+
+@register_custom_op(
+    op_name="dsv4_mhc_post_vec8",
+    mutates_args=["output"],
+)
+def _mhc_post_vec8_custom_op(
+    hidden_in: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    module = _jit_mhc_post_vec8_module(False)
+    module.run(hidden_in, residual, post_mix, comb_mix, output)
+
+
+@debug_kernel_api
+def mhc_post_vec8(
+    hidden_in: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Apply DSV4 Flash mHC post into a caller-owned GPU output buffer."""
+
+    m = hidden_in.shape[0]
+    expected = (
+        (hidden_in, (m, 4096), torch.bfloat16),
+        (residual, (m, 4, 4096), torch.bfloat16),
+        (post_mix, (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (output, (m, 4, 4096), torch.bfloat16),
+    )
+    device = hidden_in.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"invalid DSV4 mHC post tensor: expected contiguous {shape} "
+                f"{dtype}, got {tuple(tensor.shape)} {tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError(
+                "all DSV4 mHC post tensors must share one CUDA device"
+            )
+    _mhc_post_vec8_custom_op(hidden_in, residual, post_mix, comb_mix, output)
+    return output
+
+
+@cache_once
 def _jit_mhc_pre_norm_mxfp8_quant_module(threads: int, use_pdl: bool) -> Module:
     args = make_cpp_args(threads, use_pdl)
     return load_jit(
@@ -395,6 +465,8 @@ def inverse_rope_fp8_wo_a_ue8m0(
 
 __all__ = [
     "inverse_rope_fp8_wo_a_ue8m0",
+    "load_mhc_post_vec8_extension",
     "load_mhc_pre_norm_mxfp8_quant_extension",
+    "mhc_post_vec8",
     "mhc_pre_norm_mxfp8_quant",
 ]

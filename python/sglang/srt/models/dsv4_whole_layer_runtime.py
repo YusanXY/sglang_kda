@@ -102,6 +102,8 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     q_lora_scale: torch.Tensor
     mhc_gemm_mul_storage: torch.Tensor
     mhc_gemm_sq_storage: torch.Tensor
+    mhc_residual_mid: torch.Tensor
+    mhc_residual_out: torch.Tensor
     mhc_post: torch.Tensor
     mhc_comb: torch.Tensor
     mhc_layer_input: torch.Tensor
@@ -209,9 +211,11 @@ class DSV4WholeLayerRuntime:
 
             load_clustered_mqa_extension()
         from sglang.jit_kernel.dsv4.e2e import (
+            load_mhc_post_vec8_extension,
             load_mhc_pre_norm_mxfp8_quant_extension,
         )
 
+        load_mhc_post_vec8_extension()
         load_mhc_pre_norm_mxfp8_quant_extension(160)
         from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
@@ -387,6 +391,8 @@ class DSV4WholeLayerRuntime:
         (
             mhc_gemm_mul_storage,
             mhc_gemm_sq_storage,
+            mhc_residual_mid,
+            mhc_residual_out,
             mhc_post,
             mhc_comb,
             mhc_layer_input,
@@ -419,6 +425,8 @@ class DSV4WholeLayerRuntime:
             q_lora_scale=q_lora_scale,
             mhc_gemm_mul_storage=mhc_gemm_mul_storage,
             mhc_gemm_sq_storage=mhc_gemm_sq_storage,
+            mhc_residual_mid=mhc_residual_mid,
+            mhc_residual_out=mhc_residual_out,
             mhc_post=mhc_post,
             mhc_comb=mhc_comb,
             mhc_layer_input=mhc_layer_input,
@@ -565,6 +573,8 @@ class DSV4WholeLayerRuntime:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """Return exact-M views over one model-scoped mHC producer workspace."""
 
@@ -583,6 +593,16 @@ class DSV4WholeLayerRuntime:
                 dtype=torch.float32,
                 device=device,
             )
+            # Every layer uses the same two fixed addresses: attention post
+            # writes ``mid`` and the final post writes ``out``.  The next
+            # layer reads ``out`` before overwriting ``mid``, so this is a
+            # graph-stable ping-pong without allocator traffic in the hot path.
+            residual_mid = torch.empty(
+                (_MAX_FORWARD_TOKENS, 4, 4096),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            residual_out = torch.empty_like(residual_mid)
             post = torch.empty(
                 (_MAX_FORWARD_TOKENS, 4), dtype=torch.float32, device=device
             )
@@ -627,6 +647,8 @@ class DSV4WholeLayerRuntime:
                 device,
                 gemm_mul_storage,
                 gemm_sq_storage,
+                residual_mid,
+                residual_out,
                 post,
                 comb,
                 layer_input,
@@ -641,6 +663,8 @@ class DSV4WholeLayerRuntime:
             _,
             gemm_mul_storage,
             gemm_sq_storage,
+            residual_mid,
+            residual_out,
             post,
             comb,
             layer_input,
@@ -655,6 +679,8 @@ class DSV4WholeLayerRuntime:
         return (
             gemm_mul_storage,
             gemm_sq_storage,
+            residual_mid[:num_tokens],
+            residual_out[:num_tokens],
             post[:num_tokens],
             comb[:num_tokens],
             layer_input[:num_tokens],
@@ -969,7 +995,13 @@ def _execute_common(
         shared_x_quant=shared_x_quant,
         routed_x_quant=routed_x_quant,
     )
-    hidden_states = layer.hc_post(hidden_states, residual, post, comb)
+    hidden_states = _huge_mhc_post(
+        hidden_states=hidden_states,
+        residual=residual,
+        post=post,
+        comb=comb,
+        output=descriptor.mhc_residual_out,
+    )
     return hidden_states, None, None, None
 
 
@@ -1031,9 +1063,15 @@ def _separate_mhc_post_ffn_pre(
     tuple[torch.Tensor, torch.Tensor],
     tuple[torch.Tensor, torch.Tensor],
 ]:
-    """Numerically stable Huge CUDA path for non-target tiny-M batches."""
+    """Numerically stable Huge CUDA path with graph-stable post storage."""
 
-    residual = layer.hc_post(hidden_states, residual, post, comb)
+    residual = _huge_mhc_post(
+        hidden_states=hidden_states,
+        residual=residual,
+        post=post,
+        comb=comb,
+        output=descriptor.mhc_residual_mid,
+    )
     hidden_states, post, comb, norm_fused = layer.hc_pre(
         residual,
         layer.hc_ffn_fn,
@@ -1071,6 +1109,21 @@ def _separate_mhc_post_ffn_pre(
             descriptor.mhc_routed_output_scale,
         ),
     )
+
+
+def _huge_mhc_post(
+    *,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Run the strict CUDA post primitive into graph-stable GPU storage."""
+
+    from sglang.jit_kernel.dsv4.e2e import mhc_post_vec8
+
+    return mhc_post_vec8(hidden_states, residual, post, comb, output)
 
 
 def _execute_c0(

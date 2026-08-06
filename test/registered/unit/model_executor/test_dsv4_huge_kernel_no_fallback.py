@@ -92,7 +92,7 @@ def test_model_runner_rejects_invalid_forward_before_native_runner_executes():
     native_forward.assert_not_called()
 
 
-def test_whole_layer_executor_uses_stable_gpu_attention_to_ffn_boundary():
+def test_whole_layer_executor_uses_strict_cuda_mhc_post_boundaries():
     source = textwrap.dedent(
         inspect.getsource(dsv4_whole_layer_runtime._execute_common)
     )
@@ -108,11 +108,29 @@ def test_whole_layer_executor_uses_stable_gpu_attention_to_ffn_boundary():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
 
-    # Attention input keeps its own hc_pre and the FFN result keeps its final
-    # hc_post. The middle boundary remains explicit GPU work until the fused
-    # implementation passes the model-level M=4096 cosine gate.
+    # Attention input keeps its own hc_pre. Both post boundaries use the
+    # strict Huge CUDA primitive and caller-owned ping-pong storage; neither
+    # may route through the generic layer hc_post or native decoder fallback.
     assert call_attrs.count("hc_pre") == 1
-    assert call_attrs.count("hc_post") == 1
+    assert call_attrs.count("hc_post") == 0
+    assert "_huge_mhc_post" in call_names
     assert "_fused_mhc_post_ffn_pre" not in call_names
     assert "_separate_mhc_post_ffn_pre" in call_names
     assert "_forward_native" not in call_attrs
+
+    middle_source = textwrap.dedent(
+        inspect.getsource(dsv4_whole_layer_runtime._separate_mhc_post_ffn_pre)
+    )
+    middle_tree = ast.parse(middle_source)
+    middle_names = {
+        node.func.id
+        for node in ast.walk(middle_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    middle_attrs = [
+        node.func.attr
+        for node in ast.walk(middle_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    assert "_huge_mhc_post" in middle_names
+    assert "hc_post" not in middle_attrs
