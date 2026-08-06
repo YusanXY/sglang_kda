@@ -11,6 +11,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
     topk_transform_512_v2,
+    topk_transform_512_v2_huge,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -814,22 +815,48 @@ class C4IndexerBackendMixin:
             combined_indices, combined_lens = (
                 cache.get_fused_c4_epilogue_outputs()
             )
-            topk_transform_512(
-                logits,
-                c4_seq_lens,
-                page_table,
-                c4_sparse_page_indices,
-                indexer_metadata.c4_page_size,
-                raw_indices,
-                positions=positions,
-                query_start_loc=cache.query_start_loc,
-                full_seq_lens=cache.seq_lens,
-                swa_gather_lens=cache.swa_gather_lens,
-                compressed_base=cache.c4_compressed_base,
-                swa_base=cache.c4_swa_base,
-                combined_indices=combined_indices,
-                combined_lens=combined_lens,
-            )
+            if indexer_metadata.topk_metadata.numel() != 0:
+                # The true req16/M65536 bucket preplans this device routing
+                # metadata once per ForwardBatch.  V2 keeps exact K=512 set
+                # semantics while routing the varying 4097..5120 C4 rows to
+                # its register-resident selector plus warp-bitset epilogue.
+                # The clustered req1 path
+                # returns above and retains its single C++ logits+topk entry;
+                # a non-Q16 clustered tail has no v2 plan and stays on v1.
+                topk_transform_512_v2_huge(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    indexer_metadata.topk_metadata,
+                    raw_indices,
+                    positions=positions,
+                    query_start_loc=cache.query_start_loc,
+                    full_seq_lens=cache.seq_lens,
+                    swa_gather_lens=cache.swa_gather_lens,
+                    compressed_base=cache.c4_compressed_base,
+                    swa_base=cache.c4_swa_base,
+                    combined_indices=combined_indices,
+                    combined_lens=combined_lens,
+                )
+            else:
+                topk_transform_512(
+                    logits,
+                    c4_seq_lens,
+                    page_table,
+                    c4_sparse_page_indices,
+                    indexer_metadata.c4_page_size,
+                    raw_indices,
+                    positions=positions,
+                    query_start_loc=cache.query_start_loc,
+                    full_seq_lens=cache.seq_lens,
+                    swa_gather_lens=cache.swa_gather_lens,
+                    compressed_base=cache.c4_compressed_base,
+                    swa_base=cache.c4_swa_base,
+                    combined_indices=combined_indices,
+                    combined_lens=combined_lens,
+                )
         elif kda_topk_transform is not None:
             kda_topk_transform(
                 scores=logits,

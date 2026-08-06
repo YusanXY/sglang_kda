@@ -65,6 +65,13 @@ struct IndexBitsetSortStorage {
   IndexBitsetScan::TempStorage scan;
 };
 
+struct WarpBitsetSortStorage {
+  static_assert(kBlockSize % 32 == 0 && kBlockSize <= 32 * 32);
+  uint32_t words[kHugeIndexSortWords];
+  uint32_t warp_offsets[kBlockSize / 32];
+  uint32_t first_chunk_total;
+};
+
 /// Metadata tensor rows (each 8 B / 2 int32). Row 0 is the global plan result;
 /// rows 1..N are the (batch_id, seq_len) of items routed to the cluster pool.
 struct alignas(8) GlobalMetadata {
@@ -258,6 +265,107 @@ SGL_DEVICE void problem_transform_bitset512(
   }
 }
 
+SGL_DEVICE uint32_t block_exclusive_sum_warps(
+    uint32_t value, WarpBitsetSortStorage* storage) {
+  constexpr uint32_t kFullWarpMask = 0xffffffffu;
+  const uint32_t lane = threadIdx.x & 31;
+  const uint32_t warp = threadIdx.x >> 5;
+  uint32_t inclusive = value;
+#pragma unroll
+  for (uint32_t offset = 1; offset < 32; offset <<= 1) {
+    const uint32_t other =
+        __shfl_up_sync(kFullWarpMask, inclusive, offset);
+    if (lane >= offset) inclusive += other;
+  }
+  if (lane == 31) storage->warp_offsets[warp] = inclusive;
+  __syncthreads();
+
+  if (warp == 0) {
+    const uint32_t original =
+        lane < kBlockSize / 32 ? storage->warp_offsets[lane] : 0;
+    uint32_t warp_inclusive = original;
+#pragma unroll
+    for (uint32_t offset = 1; offset < 32; offset <<= 1) {
+      const uint32_t other =
+          __shfl_up_sync(kFullWarpMask, warp_inclusive, offset);
+      if (lane >= offset) warp_inclusive += other;
+    }
+    if (lane < kBlockSize / 32) {
+      storage->warp_offsets[lane] = warp_inclusive - original;
+    }
+  }
+  __syncthreads();
+  return storage->warp_offsets[warp] + inclusive - value;
+}
+
+SGL_DEVICE void write_bitset_word(
+    TopKProblem& problem,
+    uint32_t word,
+    uint32_t bits,
+    uint32_t write_base) {
+  while (bits != 0) {
+    const uint32_t bit = static_cast<uint32_t>(__ffs(bits) - 1);
+    problem.transform_output(
+        write_base++, static_cast<int32_t>(word * 32 + bit));
+    bits &= bits - 1;
+  }
+}
+
+SGL_DEVICE void problem_transform_warp_bitset512(
+    TopKProblem& problem,
+    const int32_t* source_ptr,
+    WarpBitsetSortStorage* storage) {
+  const uint32_t tx = threadIdx.x;
+  const uint32_t num_words = (problem.seq_len + 31) >> 5;
+  for (uint32_t word = tx; word < num_words; word += kBlockSize) {
+    storage->words[word] = 0;
+  }
+  __syncthreads();
+
+  if (tx < kHugeIndexSortTopK) {
+    const int32_t raw = source_ptr[tx];
+    if (raw >= 0 && static_cast<uint32_t>(raw) < problem.seq_len) {
+      atomicOr(
+          &storage->words[static_cast<uint32_t>(raw) >> 5],
+          1u << (static_cast<uint32_t>(raw) & 31));
+    }
+  }
+  __syncthreads();
+
+  // The strict Huge cases need at most 640 words.  Scan the first 1024 words
+  // with warp shuffles and a 32-entry shared warp-prefix array, avoiding the
+  // much heavier generic CUB BlockScan.  Keep a uniform second pass so this
+  // remains correct if a future TopKConfig uses a smaller block.
+  const uint32_t bits0 = tx < num_words ? storage->words[tx] : 0;
+  const uint32_t count0 = static_cast<uint32_t>(__popc(bits0));
+  const uint32_t prefix0 = block_exclusive_sum_warps(count0, storage);
+  if (tx == kBlockSize - 1) {
+    storage->first_chunk_total = prefix0 + count0;
+  }
+  __syncthreads();
+
+  uint32_t bits1 = 0;
+  uint32_t prefix1 = 0;
+  if (num_words > kBlockSize) {
+    const uint32_t word1 = tx + kBlockSize;
+    bits1 = word1 < num_words ? storage->words[word1] : 0;
+    prefix1 = block_exclusive_sum_warps(
+        static_cast<uint32_t>(__popc(bits1)), storage);
+  }
+
+  if (tx < num_words) {
+    write_bitset_word(problem, tx, bits0, prefix0);
+  }
+  const uint32_t word1 = tx + kBlockSize;
+  if (word1 < num_words) {
+    write_bitset_word(
+        problem,
+        word1,
+        bits1,
+        storage->first_chunk_total + prefix1);
+  }
+}
+
 SGL_DEVICE void problem_transform(
     TopKProblem& problem, int32_t* output_ptr, void* sort_smem) {
   static_assert(kMaxTopK % kBlockSize == 0);
@@ -271,6 +379,16 @@ SGL_DEVICE void problem_transform(
   constexpr int32_t kInvalid = std::numeric_limits<int32_t>::max();
   const auto source_ptr = problem.out;
   problem.out = output_ptr;
+#ifdef SGLANG_DSV4_TOPK_WARP_BITSET_SORT
+  if (problem.topk == kHugeIndexSortTopK &&
+      problem.seq_len <= kHugeIndexSortMaxSeqLen) {
+    problem_transform_warp_bitset512(
+        problem,
+        source_ptr,
+        static_cast<WarpBitsetSortStorage*>(sort_smem));
+    return;
+  }
+#endif
   if (problem.topk == kHugeIndexSortTopK &&
       problem.seq_len <= kHugeIndexSortMaxSeqLen) {
     problem_transform_bitset512(
@@ -324,6 +442,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
       Register5::Smem,
       Streaming::Smem,
       IndexBitsetSortStorage,
+      WarpBitsetSortStorage,
       IndexSort1::TempStorage,
       IndexSort2::TempStorage>
       smem;
@@ -405,6 +524,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
       Streaming::Smem,
       Cluster::Smem,
       IndexBitsetSortStorage,
+      WarpBitsetSortStorage,
       IndexSort1::TempStorage,
       IndexSort2::TempStorage>
       smem;

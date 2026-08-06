@@ -42,6 +42,19 @@ def _jit_topk_v2_module():
     )
 
 
+@cache_once
+def _jit_topk_v2_huge_module():
+    # Emit the exact K=512 set in globally increasing order with a two-level
+    # warp-shuffle bitset scan.  This preserves deterministic attention
+    # accumulation while avoiding the generic 1024-thread CUB BlockScan.
+    return load_jit(
+        make_name("topk_v2_huge_warp_bitset_sort"),
+        cuda_files=["deepseek_v4/topk_v2.cuh"],
+        cuda_wrappers=[("topk_transform", "TopKKernel::transform")],
+        extra_cuda_cflags=["-DSGLANG_DSV4_TOPK_WARP_BITSET_SORT=1"],
+    )
+
+
 def topk_transform_512(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -134,6 +147,7 @@ def topk_transform_512_v2(
     swa_base: Optional[torch.Tensor] = None,
     combined_indices: Optional[torch.Tensor] = None,
     combined_lens: Optional[torch.Tensor] = None,
+    _module=None,
 ) -> None:
     """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -164,7 +178,7 @@ def topk_transform_512_v2(
         )
     if combined_indices is not None and out_raw_indices is None:
         raise ValueError("sparse-prefill topk epilogue requires raw indices")
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_module() if _module is None else _module
     module.topk_transform(
         scores,
         seq_lens,
@@ -174,4 +188,44 @@ def topk_transform_512_v2(
         metadata,
         out_raw_indices,
         *sparse_args,
+    )
+
+
+def topk_transform_512_v2_huge(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    metadata: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
+    *,
+    positions: Optional[torch.Tensor] = None,
+    query_start_loc: Optional[torch.Tensor] = None,
+    full_seq_lens: Optional[torch.Tensor] = None,
+    swa_gather_lens: Optional[torch.Tensor] = None,
+    compressed_base: Optional[torch.Tensor] = None,
+    swa_base: Optional[torch.Tensor] = None,
+    combined_indices: Optional[torch.Tensor] = None,
+    combined_lens: Optional[torch.Tensor] = None,
+) -> None:
+    """Huge-only exact v2 selector with a deterministic warp bitset epilogue."""
+
+    topk_transform_512_v2(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        metadata,
+        out_raw_indices,
+        positions=positions,
+        query_start_loc=query_start_loc,
+        full_seq_lens=full_seq_lens,
+        swa_gather_lens=swa_gather_lens,
+        compressed_base=compressed_base,
+        swa_base=swa_base,
+        combined_indices=combined_indices,
+        combined_lens=combined_lens,
+        _module=_jit_topk_v2_huge_module(),
     )

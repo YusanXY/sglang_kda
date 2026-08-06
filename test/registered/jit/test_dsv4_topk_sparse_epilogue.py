@@ -5,6 +5,7 @@ from sglang.jit_kernel.dsv4 import (
     plan_topk_v2,
     topk_transform_512,
     topk_transform_512_v2,
+    topk_transform_512_v2_huge,
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     combine_topk_swa_indices,
@@ -169,6 +170,8 @@ def test_topk_v2_huge_bitset_range_is_exact_sorted_and_deterministic():
         (batch, 512), -1, dtype=torch.int32, device=device
     )
     raw_indices = torch.full_like(page_indices, -1)
+    huge_page_indices = torch.full_like(page_indices, -1)
+    huge_raw_indices = torch.full_like(raw_indices, -1)
     metadata = plan_topk_v2(seq_lens)
 
     topk_transform_512_v2(
@@ -179,6 +182,15 @@ def test_topk_v2_huge_bitset_range_is_exact_sorted_and_deterministic():
         page_size,
         metadata,
         raw_indices,
+    )
+    topk_transform_512_v2_huge(
+        scores,
+        seq_lens,
+        page_table,
+        huge_page_indices,
+        page_size,
+        metadata,
+        huge_raw_indices,
     )
     torch.cuda.synchronize()
 
@@ -193,9 +205,15 @@ def test_topk_v2_huge_bitset_range_is_exact_sorted_and_deterministic():
     torch.testing.assert_close(raw_indices, reference, rtol=0, atol=0)
     # With an identity page table the transformed slots equal the raw slots.
     torch.testing.assert_close(page_indices, raw_indices, rtol=0, atol=0)
+    torch.testing.assert_close(huge_raw_indices, reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        huge_page_indices, huge_raw_indices, rtol=0, atol=0
+    )
 
     first_raw = raw_indices.clone()
     first_pages = page_indices.clone()
+    first_huge_raw = huge_raw_indices.clone()
+    first_huge_pages = huge_page_indices.clone()
     for _ in range(8):
         topk_transform_512_v2(
             scores,
@@ -206,9 +224,24 @@ def test_topk_v2_huge_bitset_range_is_exact_sorted_and_deterministic():
             metadata,
             raw_indices,
         )
+        topk_transform_512_v2_huge(
+            scores,
+            seq_lens,
+            page_table,
+            huge_page_indices,
+            page_size,
+            metadata,
+            huge_raw_indices,
+        )
         torch.cuda.synchronize()
         torch.testing.assert_close(raw_indices, first_raw, rtol=0, atol=0)
         torch.testing.assert_close(page_indices, first_pages, rtol=0, atol=0)
+        torch.testing.assert_close(
+            huge_raw_indices, first_huge_raw, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            huge_page_indices, first_huge_pages, rtol=0, atol=0
+        )
 
     # Tie-heavy inputs exercise the uniqueness precondition of the bitset
     # compactor. The selected set may differ from torch.topk's arbitrary tie
@@ -224,11 +257,26 @@ def test_topk_v2_huge_bitset_range_is_exact_sorted_and_deterministic():
         metadata,
         raw_indices,
     )
+    topk_transform_512_v2_huge(
+        scores,
+        seq_lens,
+        page_table,
+        huge_page_indices,
+        page_size,
+        metadata,
+        huge_raw_indices,
+    )
     torch.cuda.synchronize()
     assert torch.all(raw_indices[:, 1:] > raw_indices[:, :-1])
     assert torch.all(raw_indices >= 0)
     assert torch.all(raw_indices < seq_lens[:, None])
     torch.testing.assert_close(page_indices, raw_indices, rtol=0, atol=0)
+    assert torch.all(huge_raw_indices[:, 1:] > huge_raw_indices[:, :-1])
+    assert torch.all(huge_raw_indices >= 0)
+    assert torch.all(huge_raw_indices < seq_lens[:, None])
+    torch.testing.assert_close(
+        huge_page_indices, huge_raw_indices, rtol=0, atol=0
+    )
 
     for _ in range(8):
         topk_transform_512_v2(
