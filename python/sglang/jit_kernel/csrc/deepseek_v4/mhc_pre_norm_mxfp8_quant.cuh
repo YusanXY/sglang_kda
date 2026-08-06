@@ -87,20 +87,6 @@ __device__ __forceinline__ void mhc_issue_residual_tile(
 }
 
 template <uint32_t kDataThreads>
-__device__ __forceinline__ void mhc_issue_weight_tile(
-    const MhcPreNormMxfp8QuantParams& params,
-    bf16_t* stage,
-    const uint32_t tile,
-    const uint32_t data_tid) {
-#pragma unroll
-  for (uint32_t offset = data_tid * 8; offset < 1024;
-       offset += kDataThreads * 8) {
-    mhc_cp_async_16(
-        stage + offset, params.norm_weight + tile * 1024 + offset);
-  }
-}
-
-template <uint32_t kDataThreads>
 __device__ __forceinline__ float mhc_process_residual_tile(
     const bf16_t* stage,
     bf16_t* unnormalized,
@@ -151,7 +137,7 @@ __device__ __forceinline__ float mhc_process_residual_tile(
   return local_sq;
 }
 
-template <uint32_t kDataThreads>
+template <uint32_t kDataThreads, bool kEmitRoutedQuant>
 __device__ __forceinline__ void mhc_process_norm_quant_tile(
     const MhcPreNormMxfp8QuantParams& params,
     const bf16_t* unnormalized,
@@ -214,7 +200,7 @@ __device__ __forceinline__ void mhc_process_norm_quant_tile(
           values[pair * 2 + 1] * inv_scale);
     }
 
-    if (params.emit_routed_quant) {
+    if constexpr (kEmitRoutedQuant) {
       float routed_absmax = thread_absmax;
       routed_absmax = fmaxf(
           routed_absmax,
@@ -257,10 +243,12 @@ __device__ __forceinline__ void mhc_process_norm_quant_tile(
 
 // Fixed-shape SM100/SM103 path for the DSV4 Flash MHC boundary.  Warp 0 owns
 // the tiny routing head while the data warps independently execute the
-// residual/RMSNorm/FP8 pipeline.  The residual sweep mirrors the proven
-// three-stage TileLang schedule, but quantization is folded into the second
-// sweep so the normalized BF16 tensor is never reread by another kernel.
-template <uint32_t kDataWarps, bool kUsePDL>
+// residual/RMSNorm/FP8 pipeline.  The residual sweep uses two async stages;
+// the 8 KiB norm weight stays L1-resident and is read directly, avoiding four
+// extra cp.async groups, shared-memory writes, and named-barrier hand-offs.
+// Quantization is folded into the second sweep so the normalized BF16 tensor
+// is never reread by another kernel.
+template <uint32_t kDataWarps, bool kEmitRoutedQuant, bool kUsePDL>
 __global__ __launch_bounds__((kDataWarps + 1) * 32, 1)
 void mhc_pre_norm_mxfp8_quant_pipelined_kernel(
     const MhcPreNormMxfp8QuantParams __grid_constant__ params) {
@@ -270,9 +258,8 @@ void mhc_pre_norm_mxfp8_quant_pipelined_kernel(
 
   __shared__ float mixes[24];
   __shared__ float pre_mix[4];
-  __shared__ bf16_t residual_stages[3][4 * 1024];
+  __shared__ bf16_t residual_stages[2][4 * 1024];
   __shared__ bf16_t unnormalized[4096];
-  __shared__ bf16_t weight_stages[2][1024];
   __shared__ float data_warp_sums[kDataWarps];
   __shared__ float norm_factor;
 
@@ -366,34 +353,34 @@ void mhc_pre_norm_mxfp8_quant_pipelined_kernel(
     mhc_issue_residual_tile<kDataThreads>(
         params, residual_stages[1], token, 1, data_tid);
     mhc_cp_async_commit();
-    mhc_issue_residual_tile<kDataThreads>(
-        params, residual_stages[2], token, 2, data_tid);
-    mhc_cp_async_commit();
-
     float local_sq = 0.0f;
-    mhc_cp_async_wait<2>();
+    mhc_cp_async_wait<1>();
     mhc_data_warps_barrier<kDataThreads>();
     local_sq += mhc_process_residual_tile<kDataThreads>(
         residual_stages[0], unnormalized, pre_mix, 0, data_tid);
     mhc_data_warps_barrier<kDataThreads>();
     mhc_issue_residual_tile<kDataThreads>(
-        params, residual_stages[0], token, 3, data_tid);
+        params, residual_stages[0], token, 2, data_tid);
     mhc_cp_async_commit();
-
-    mhc_cp_async_wait<2>();
-    mhc_data_warps_barrier<kDataThreads>();
-    local_sq += mhc_process_residual_tile<kDataThreads>(
-        residual_stages[1], unnormalized, pre_mix, 1, data_tid);
 
     mhc_cp_async_wait<1>();
     mhc_data_warps_barrier<kDataThreads>();
     local_sq += mhc_process_residual_tile<kDataThreads>(
-        residual_stages[2], unnormalized, pre_mix, 2, data_tid);
+        residual_stages[1], unnormalized, pre_mix, 1, data_tid);
+    mhc_data_warps_barrier<kDataThreads>();
+    mhc_issue_residual_tile<kDataThreads>(
+        params, residual_stages[1], token, 3, data_tid);
+    mhc_cp_async_commit();
+
+    mhc_cp_async_wait<1>();
+    mhc_data_warps_barrier<kDataThreads>();
+    local_sq += mhc_process_residual_tile<kDataThreads>(
+        residual_stages[0], unnormalized, pre_mix, 2, data_tid);
 
     mhc_cp_async_wait<0>();
     mhc_data_warps_barrier<kDataThreads>();
     local_sq += mhc_process_residual_tile<kDataThreads>(
-        residual_stages[0], unnormalized, pre_mix, 3, data_tid);
+        residual_stages[1], unnormalized, pre_mix, 3, data_tid);
 
     const float warp_sq = warp::reduce_sum(local_sq);
     if (lane == 0) data_warp_sums[data_warp] = warp_sq;
@@ -409,63 +396,37 @@ void mhc_pre_norm_mxfp8_quant_pipelined_kernel(
     }
     mhc_data_warps_barrier<kDataThreads>();
 
-    mhc_issue_weight_tile<kDataThreads>(
-        params, weight_stages[0], 0, data_tid);
-    mhc_cp_async_commit();
-    mhc_issue_weight_tile<kDataThreads>(
-        params, weight_stages[1], 1, data_tid);
-    mhc_cp_async_commit();
-
-    mhc_cp_async_wait<1>();
-    mhc_data_warps_barrier<kDataThreads>();
-    mhc_process_norm_quant_tile<kDataThreads>(
+    mhc_process_norm_quant_tile<kDataThreads, kEmitRoutedQuant>(
         params,
         unnormalized,
-        weight_stages[0],
+        params.norm_weight,
         norm_factor,
         token,
         0,
         data_tid,
         lane);
-    mhc_data_warps_barrier<kDataThreads>();
-    mhc_issue_weight_tile<kDataThreads>(
-        params, weight_stages[0], 2, data_tid);
-    mhc_cp_async_commit();
-
-    mhc_cp_async_wait<1>();
-    mhc_data_warps_barrier<kDataThreads>();
-    mhc_process_norm_quant_tile<kDataThreads>(
+    mhc_process_norm_quant_tile<kDataThreads, kEmitRoutedQuant>(
         params,
         unnormalized,
-        weight_stages[1],
+        params.norm_weight + 1024,
         norm_factor,
         token,
         1,
         data_tid,
         lane);
-    mhc_data_warps_barrier<kDataThreads>();
-    mhc_issue_weight_tile<kDataThreads>(
-        params, weight_stages[1], 3, data_tid);
-    mhc_cp_async_commit();
-
-    mhc_cp_async_wait<1>();
-    mhc_data_warps_barrier<kDataThreads>();
-    mhc_process_norm_quant_tile<kDataThreads>(
+    mhc_process_norm_quant_tile<kDataThreads, kEmitRoutedQuant>(
         params,
         unnormalized,
-        weight_stages[0],
+        params.norm_weight + 2048,
         norm_factor,
         token,
         2,
         data_tid,
         lane);
-
-    mhc_cp_async_wait<0>();
-    mhc_data_warps_barrier<kDataThreads>();
-    mhc_process_norm_quant_tile<kDataThreads>(
+    mhc_process_norm_quant_tile<kDataThreads, kEmitRoutedQuant>(
         params,
         unnormalized,
-        weight_stages[1],
+        params.norm_weight + 3072,
         norm_factor,
         token,
         3,
@@ -806,13 +767,29 @@ struct MhcPreNormMxfp8QuantKernel {
         .emit_routed_quant = static_cast<uint32_t>(emit_routed_quant),
     };
     if constexpr (kThreads == 96) {
-      LaunchKernel(M.unwrap(), 96, device.unwrap())
-          .enable_pdl(kUsePDL)(
-              mhc_pre_norm_mxfp8_quant_pipelined_kernel<2, kUsePDL>, params);
+      if (emit_routed_quant) {
+        LaunchKernel(M.unwrap(), 96, device.unwrap())
+            .enable_pdl(kUsePDL)(
+                mhc_pre_norm_mxfp8_quant_pipelined_kernel<2, true, kUsePDL>,
+                params);
+      } else {
+        LaunchKernel(M.unwrap(), 96, device.unwrap())
+            .enable_pdl(kUsePDL)(
+                mhc_pre_norm_mxfp8_quant_pipelined_kernel<2, false, kUsePDL>,
+                params);
+      }
     } else if constexpr (kThreads == 160) {
-      LaunchKernel(M.unwrap(), 160, device.unwrap())
-          .enable_pdl(kUsePDL)(
-              mhc_pre_norm_mxfp8_quant_pipelined_kernel<4, kUsePDL>, params);
+      if (emit_routed_quant) {
+        LaunchKernel(M.unwrap(), 160, device.unwrap())
+            .enable_pdl(kUsePDL)(
+                mhc_pre_norm_mxfp8_quant_pipelined_kernel<4, true, kUsePDL>,
+                params);
+      } else {
+        LaunchKernel(M.unwrap(), 160, device.unwrap())
+            .enable_pdl(kUsePDL)(
+                mhc_pre_norm_mxfp8_quant_pipelined_kernel<4, false, kUsePDL>,
+                params);
+      }
     } else {
       LaunchKernel(M.unwrap(), kThreads, device.unwrap())
           .enable_pdl(kUsePDL)(
