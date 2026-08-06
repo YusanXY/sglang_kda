@@ -2116,17 +2116,30 @@ class DeepseekV4AttnBackend(
                 topk_length=combined_lens,
             )
         else:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+            if self.dsv4_huge_mode:
+                from sgl_kernel.flash_mla import flash_mla_sparse_fwd_output
 
-            o, _, _ = flash_mla_sparse_fwd(
-                q=q_flat,
-                kv=kv,
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.softmax_scale,
-                d_v=self.head_dim_v,
-                attn_sink=attn_sink,
-                topk_length=combined_lens,
-            )
+                o = flash_mla_sparse_fwd_output(
+                    q=q_flat,
+                    kv=kv,
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.softmax_scale,
+                    d_v=self.head_dim_v,
+                    attn_sink=attn_sink,
+                    topk_length=combined_lens,
+                )
+            else:
+                from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+                o, _, _ = flash_mla_sparse_fwd(
+                    q=q_flat,
+                    kv=kv,
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.softmax_scale,
+                    d_v=self.head_dim_v,
+                    attn_sink=attn_sink,
+                    topk_length=combined_lens,
+                )
         return o
 
     def expand_prefill_casually(

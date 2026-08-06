@@ -8,6 +8,7 @@ import torch
 import triton
 from sgl_kernel.flash_mla import (
     flash_mla_sparse_fwd,
+    flash_mla_sparse_fwd_output,
     flash_mla_with_kvcache,
     get_mla_metadata,
 )
@@ -346,6 +347,11 @@ def test_flashmla_prefill(
     ans_out, ans_max_logits, ans_lse = flash_mla_sparse_fwd(
         q.squeeze(0), kv.squeeze(0), indices.squeeze(0), sm_scale=sm_scale
     )
+    ans_out_only = flash_mla_sparse_fwd_output(
+        q.squeeze(0), kv.squeeze(0), indices.squeeze(0), sm_scale=sm_scale
+    )
+
+    torch.testing.assert_close(ans_out_only, ans_out, atol=0, rtol=0)
 
     ans_out, ans_max_logits, ans_lse = (
         ans_out.float(),

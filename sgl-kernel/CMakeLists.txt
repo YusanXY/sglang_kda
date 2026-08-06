@@ -45,6 +45,17 @@ endif()
 find_package(Torch REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
+# Developer fast path for iterating on the standalone FlashMLA extension.  It
+# deliberately remains opt-in so release wheels keep their existing contents.
+# Besides cutting compile time, this lets an offline build provide only the
+# pinned FlashMLA and CUTLASS FetchContent source directories.
+option(SGL_KERNEL_BUILD_FLASHMLA_ONLY "Build only the flashmla_ops extension" OFF)
+if(SGL_KERNEL_BUILD_FLASHMLA_ONLY)
+    include_directories(${CMAKE_CURRENT_LIST_DIR}/include)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+    return()
+endif()
+
 # Third Party repos
 # cutlass
 FetchContent_Declare(

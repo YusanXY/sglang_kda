@@ -71,6 +71,24 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       num_splits);
 }
 
+// DSV4 inference only consumes the attention output.  Calling the public
+// sparse_prefill_fwd compatibility wrapper also converts max_logits and LSE
+// with two pointwise kernels, even when both tensors are immediately dropped.
+// Enter the FlashMLA interface directly so Huge mode can omit that dead work
+// while keeping the existing three-output API unchanged for all other users.
+static at::Tensor sgl_sparse_prefill_fwd_output(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length) {
+  auto outputs = sparse_attn_prefill_interface(
+      q, kv, indices, static_cast<float>(sm_scale), static_cast<int>(d_v), attn_sink, topk_length);
+  return outputs.front();
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashMLA
@@ -116,6 +134,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink=None, "
       "Tensor? topk_length=None) -> Tensor[]");
   m.impl("sparse_prefill_fwd", torch::kCUDA, &sparse_prefill_fwd);
+
+  m.def(
+      "sparse_prefill_fwd_output(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? "
+      "attn_sink=None, Tensor? topk_length=None) -> Tensor");
+  m.impl("sparse_prefill_fwd_output", torch::kCUDA, &sgl_sparse_prefill_fwd_output);
 
   m.def(
       "fwd_kvcache_mla_fp8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "
