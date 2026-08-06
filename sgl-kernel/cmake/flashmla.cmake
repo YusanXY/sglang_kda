@@ -95,6 +95,40 @@ if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     )
 endif()
 
+if(FLASHMLA_ENABLE_SM100)
+    # DSV4 Huge consumes only the sparse-attention output.  The pinned
+    # FlashMLA kernel otherwise computes logf-based LSE/max statistics and
+    # stores them to global memory even when the caller immediately discards
+    # both tensors.  Apply a checked patch to expose an output-only SM100 h64
+    # specialization while leaving the public three-output path unchanged.
+    set(FLASHMLA_OUTPUT_ONLY_MARKER
+        "template<bool HAVE_ROPE, bool STORE_STATS, typename TmaParams>")
+    set(FLASHMLA_HEAD64_PHASE1
+        "${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh")
+    file(READ "${FLASHMLA_HEAD64_PHASE1}" FLASHMLA_HEAD64_PHASE1_CONTENT)
+    string(FIND "${FLASHMLA_HEAD64_PHASE1_CONTENT}"
+        "${FLASHMLA_OUTPUT_ONLY_MARKER}" FLASHMLA_OUTPUT_ONLY_PATCHED)
+    if(FLASHMLA_OUTPUT_ONLY_PATCHED EQUAL -1)
+        find_program(FLASHMLA_PATCH_EXECUTABLE patch REQUIRED)
+        execute_process(
+            COMMAND "${FLASHMLA_PATCH_EXECUTABLE}" -p1 -i
+                "${CMAKE_CURRENT_LIST_DIR}/patches/flashmla-sm100-head64-output-only.patch"
+            WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+            RESULT_VARIABLE FLASHMLA_OUTPUT_ONLY_PATCH_RESULT
+            OUTPUT_VARIABLE FLASHMLA_OUTPUT_ONLY_PATCH_STDOUT
+            ERROR_VARIABLE FLASHMLA_OUTPUT_ONLY_PATCH_STDERR)
+        if(NOT FLASHMLA_OUTPUT_ONLY_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to patch pinned FlashMLA output-only kernel:\n"
+                "${FLASHMLA_OUTPUT_ONLY_PATCH_STDOUT}\n"
+                "${FLASHMLA_OUTPUT_ONLY_PATCH_STDERR}")
+        endif()
+        message(STATUS "Patched FlashMLA SM100 h64 output-only sparse prefill")
+    else()
+        message(STATUS "FlashMLA SM100 h64 output-only sparse prefill already patched")
+    endif()
+endif()
+
 
 set(FlashMLA_SOURCES
     "csrc/flashmla_extension.cc"

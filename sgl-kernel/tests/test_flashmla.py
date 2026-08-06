@@ -46,6 +46,12 @@ def is_sm90_supported(device=None) -> bool:
     )
 
 
+def is_sm100_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 10) and (
+        torch.version.cuda >= "12.8"
+    )
+
+
 def quantize_k_cache(
     input_k_cache: torch.Tensor,  # (num_blocks, block_size, h_k, d)
     dv: int,
@@ -347,11 +353,6 @@ def test_flashmla_prefill(
     ans_out, ans_max_logits, ans_lse = flash_mla_sparse_fwd(
         q.squeeze(0), kv.squeeze(0), indices.squeeze(0), sm_scale=sm_scale
     )
-    ans_out_only = flash_mla_sparse_fwd_output(
-        q.squeeze(0), kv.squeeze(0), indices.squeeze(0), sm_scale=sm_scale
-    )
-
-    torch.testing.assert_close(ans_out_only, ans_out, atol=0, rtol=0)
 
     ans_out, ans_max_logits, ans_lse = (
         ans_out.float(),
@@ -373,6 +374,39 @@ def test_flashmla_prefill(
         rtol=2.01 / 65536,
     )
     torch.testing.assert_close(ans_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536)
+
+
+@pytest.mark.skipif(not is_sm100_supported(), reason="SM100 required")
+@torch.inference_mode()
+def test_flashmla_prefill_output_only():
+    s_q, s_kv, h_q, d_qk, topk = 64, 512, 64, 512, 128
+    q = torch.randn((s_q, h_q, d_qk), dtype=torch.bfloat16, device="cuda") / 10
+    kv = torch.randn((s_kv, 1, d_qk), dtype=torch.bfloat16, device="cuda") / 10
+    indices = torch.randint(
+        0, s_kv, (s_q, 1, topk), dtype=torch.int32, device="cuda"
+    )
+    attn_sink = torch.randn((h_q,), dtype=torch.float32, device="cuda") / 10
+    topk_length = torch.full((s_q,), topk, dtype=torch.int32, device="cuda")
+    sm_scale = 1 / math.sqrt(d_qk)
+
+    expected, _, _ = flash_mla_sparse_fwd(
+        q,
+        kv,
+        indices,
+        sm_scale=sm_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
+    actual = flash_mla_sparse_fwd_output(
+        q,
+        kv,
+        indices,
+        sm_scale=sm_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")
