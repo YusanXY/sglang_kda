@@ -414,7 +414,7 @@ def test_flashmla_prefill_output_only(indices_pattern):
         topk_length=topk_length,
     )
 
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual, expected[:, :16, :], atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")

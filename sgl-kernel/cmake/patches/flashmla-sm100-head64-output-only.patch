@@ -1,5 +1,5 @@
 diff --git a/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh b/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
-index 2831e6f..1176f6a 100644
+index 2831e6f..727f22d 100644
 --- a/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
 +++ b/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
 @@ -56,7 +56,7 @@ KV5                 scale(O) w.r.t P3
@@ -7,7 +7,7 @@ index 2831e6f..1176f6a 100644
  using FwdMode = SparseAttnFwdMode;
  
 -template<bool HAVE_ROPE, typename TmaParams>
-+template<bool HAVE_ROPE, bool STORE_STATS, typename TmaParams>
++template<bool HAVE_ROPE, bool STORE_STATS, int OUTPUT_HEADS, typename TmaParams>
  __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
  sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
  #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
@@ -65,38 +65,196 @@ index 2831e6f..1176f6a 100644
          }
  
          // Wait for the last GEMM
-@@ -580,8 +587,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
+@@ -275,18 +282,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
+         // Store O
+         float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : __ldg(params.attn_sink + (idx_in_warpgroup%64))*CUDART_L2E_F;
+         float output_scale = __fdividef(1.0f, li + exp2f(attn_sink - mi));
+-        Tensor sO = make_tensor(make_smem_ptr(plan.u.o.data()), SmemLayoutO{});
+         constexpr int B_EPI = 64;
+-        Tensor tma_gO = flat_divide(
+-            tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx),
+-            Shape<Int<B_H>, Int<B_EPI>>{}
+-        )(_, _, _0{}, _);
+-        Tensor sO_divided = flat_divide(
+-            sO,
+-            Shape<Int<B_H>, Int<B_EPI>>{}
+-        )(_, _, _0{}, _);
+-        auto thr_tma = tma_params.tma_O.get_slice(_0{});
+-
+         float2 o[B_EPI/2];
+         bool have_valid_indices = __any_sync(0xffffffff, li != 0);  // Prevent some threads' li == 0 and some threads' li != 0 which lead to deadlock during ku::tmem_ld
+         if (!have_valid_indices) {
+@@ -299,56 +295,97 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
+ 
+         float2 output_scale_float2 = make_float2(output_scale, output_scale);
+ 
+-        bf16* sO_addrs[8];
+-        CUTE_UNROLL
+-        for (int i = 0; i < B_EPI/8; ++i) {
+-            sO_addrs[i] = &sO(idx_in_warpgroup%64, i*8);
+-        }
+-
+-        CUTE_UNROLL
+-        for (int c = 0; c < 2; ++c) {
+-            // Each tile: 64 x 256
++        if constexpr (OUTPUT_HEADS == B_H) {
++            Tensor sO = make_tensor(make_smem_ptr(plan.u.o.data()), SmemLayoutO{});
++            Tensor tma_gO = flat_divide(
++                tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx),
++                Shape<Int<B_H>, Int<B_EPI>>{}
++            )(_, _, _0{}, _);
++            Tensor sO_divided = flat_divide(
++                sO,
++                Shape<Int<B_H>, Int<B_EPI>>{}
++            )(_, _, _0{}, _);
++            auto thr_tma = tma_params.tma_O.get_slice(_0{});
++            bf16* sO_addrs[8];
+             CUTE_UNROLL
+-            for (int k = 0; k < (D_V/4)/B_EPI; ++k) {
+-                // Load O from tO
+-                if (have_valid_indices) {
+-                    ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + c*128 + k*B_EPI, o);
+-                    cutlass::arch::fence_view_async_tmem_load();
+-                }
++            for (int i = 0; i < B_EPI/8; ++i) {
++                sO_addrs[i] = &sO(idx_in_warpgroup%64, i*8);
++            }
+ 
+-                // Convert and store
++            CUTE_UNROLL
++            for (int c = 0; c < 2; ++c) {
++                // Each tile: 64 x 256
+                 CUTE_UNROLL
+-                for (int i = 0; i < B_EPI/8; ++i) {
+-                    nv_bfloat162 o_bf16[4];
++                for (int k = 0; k < (D_V/4)/B_EPI; ++k) {
++                    // Load O from tO
++                    if (have_valid_indices) {
++                        ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + c*128 + k*B_EPI, o);
++                        cutlass::arch::fence_view_async_tmem_load();
++                    }
++
++                    // Convert and store
+                     CUTE_UNROLL
+-                    for (int j = 0; j < 4; ++j) {
+-                        o[i*4+j] = ku::float2_mul(o[i*4+j], output_scale_float2);
+-                        o_bf16[j] = __float22bfloat162_rn(o[i*4+j]);
++                    for (int i = 0; i < B_EPI/8; ++i) {
++                        nv_bfloat162 o_bf16[4];
++                        CUTE_UNROLL
++                        for (int j = 0; j < 4; ++j) {
++                            o[i*4+j] = ku::float2_mul(o[i*4+j], output_scale_float2);
++                            o_bf16[j] = __float22bfloat162_rn(o[i*4+j]);
++                        }
++                        *(uint128_t*)(sO_addrs[i] + (c*(D_V/2) + (idx_in_warpgroup/64)*(D_V/4) + k*B_EPI)*64) = *(uint128_t*)(o_bf16);
+                     }
+-                    *(uint128_t*)(sO_addrs[i] + (c*(D_V/2) + (idx_in_warpgroup/64)*(D_V/4) + k*B_EPI)*64) = *(uint128_t*)(o_bf16);
+-                }
+ 
+-                // Sync
+-                fence_view_async_shared();
+-                NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+-                
+-                if (warp_idx == 0 && elect_one_sync()) {
+-                    int epi_chunk_idx = c*(D_V/2/B_EPI) + k;
+-                    cute::copy(
+-                        tma_params.tma_O,
+-                        thr_tma.partition_S(sO_divided(_, _, epi_chunk_idx)),
+-                        thr_tma.partition_D(tma_gO(_, _, epi_chunk_idx))
+-                    );
++                    // Sync
++                    fence_view_async_shared();
++                    NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
++
++                    if (warp_idx == 0 && elect_one_sync()) {
++                        int epi_chunk_idx = c*(D_V/2/B_EPI) + k;
++                        cute::copy(
++                            tma_params.tma_O,
++                            thr_tma.partition_S(sO_divided(_, _, epi_chunk_idx)),
++                            thr_tma.partition_D(tma_gO(_, _, epi_chunk_idx))
++                        );
++                    }
++                    if (warp_idx == 1 && elect_one_sync()) {
++                        int epi_chunk_idx = c*(D_V/2/B_EPI) + (D_V/B_EPI/4) + k;
++                        cute::copy(
++                            tma_params.tma_O,
++                            thr_tma.partition_S(sO_divided(_, _, epi_chunk_idx)),
++                            thr_tma.partition_D(tma_gO(_, _, epi_chunk_idx))
++                        );
++                    }
+                 }
+-                if (warp_idx == 1 && elect_one_sync()) {
+-                    int epi_chunk_idx = c*(D_V/2/B_EPI) + (D_V/B_EPI/4) + k;
+-                    cute::copy(
+-                        tma_params.tma_O,
+-                        thr_tma.partition_S(sO_divided(_, _, epi_chunk_idx)),
+-                        thr_tma.partition_D(tma_gO(_, _, epi_chunk_idx))
+-                    );
++            }
++        } else {
++            static_assert(OUTPUT_HEADS == 16);
++            const int output_head = idx_in_warpgroup % B_H;
++            CUTE_UNROLL
++            for (int c = 0; c < 2; ++c) {
++                CUTE_UNROLL
++                for (int k = 0; k < (D_V/4)/B_EPI; ++k) {
++                    if (have_valid_indices) {
++                        ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + c*128 + k*B_EPI, o);
++                        cutlass::arch::fence_view_async_tmem_load();
++                    }
++                    if (output_head < OUTPUT_HEADS) {
++                        bf16* output_base = params.out +
++                            (static_cast<int64_t>(s_q_idx) * OUTPUT_HEADS + output_head) * D_V +
++                            c*(D_V/2) + (idx_in_warpgroup/64)*(D_V/4) + k*B_EPI;
++                        CUTE_UNROLL
++                        for (int i = 0; i < B_EPI/8; ++i) {
++                            nv_bfloat162 o_bf16[4];
++                            CUTE_UNROLL
++                            for (int j = 0; j < 4; ++j) {
++                                o[i*4+j] = ku::float2_mul(o[i*4+j], output_scale_float2);
++                                o_bf16[j] = __float22bfloat162_rn(o[i*4+j]);
++                            }
++                            *(uint128_t*)(output_base + i*8) = *(uint128_t*)(o_bf16);
++                        }
++                    }
+                 }
+             }
++            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+         }
+ 
+ 
+@@ -580,8 +617,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
  #endif
  }
  
 -template<int D_QK>
 -void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-+template<int D_QK, bool STORE_STATS>
++template<int D_QK, bool STORE_STATS, int OUTPUT_HEADS>
 +void run_fwd_phase1_kernel_impl(const SparseAttnFwdParams& params) {
      KU_ASSERT(params.h_kv == 1);
      KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
      KU_ASSERT(params.h_q == B_H);  // To save some calculation
-@@ -661,7 +668,7 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
+@@ -661,7 +698,7 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
          shape_O, tma_O,
          tensor_map_kv_nope
      };
 -    auto kernel = &sparse_attn_fwd_kernel<D_QK == 576, decltype(tma_params)>;
-+    auto kernel = &sparse_attn_fwd_kernel<D_QK == 576, STORE_STATS, decltype(tma_params)>;
++    auto kernel = &sparse_attn_fwd_kernel<D_QK == 576, STORE_STATS, OUTPUT_HEADS, decltype(tma_params)>;
  
      constexpr size_t smem_size = sizeof(SharedMemoryPlan);
      KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-@@ -670,4 +677,14 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
+@@ -670,4 +707,14 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
      KU_CHECK_KERNEL_LAUNCH();
  }
  
 +template<int D_QK>
 +void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-+    run_fwd_phase1_kernel_impl<D_QK, true>(params);
++    run_fwd_phase1_kernel_impl<D_QK, true, B_H>(params);
 +}
 +
 +template<int D_QK>
 +void run_fwd_phase1_output_kernel(const SparseAttnFwdParams& params) {
-+    run_fwd_phase1_kernel_impl<D_QK, false>(params);
++    run_fwd_phase1_kernel_impl<D_QK, false, 16>(params);
 +}
 +
  }

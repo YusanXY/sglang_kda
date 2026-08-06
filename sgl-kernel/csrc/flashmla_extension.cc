@@ -100,6 +100,7 @@ static at::Tensor sgl_sparse_prefill_fwd_output(
   const int h_kv = kv.size(1);
   const int d_qk = q.size(2);
   const int topk = indices.size(2);
+  constexpr int kLocalOutputHeads = 16;
   TORCH_CHECK(h_q == 64 && h_kv == 1, "sparse_prefill_fwd_output requires h_q=64 and h_kv=1");
   TORCH_CHECK(d_qk == 512 && d_v == 512, "sparse_prefill_fwd_output requires d_qk=d_v=512");
 
@@ -125,7 +126,7 @@ static at::Tensor sgl_sparse_prefill_fwd_output(
   KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
 
   at::cuda::CUDAGuard device_guard{static_cast<char>(q.get_device())};
-  auto out = torch::empty({s_q, h_q, d_v}, q.options());
+  auto out = torch::empty({s_q, kLocalOutputHeads, d_v}, q.options());
   KU_CHECK_CONTIGUOUS(out);
   SparseAttnFwdParams params = {
       s_q,

@@ -102,7 +102,7 @@ if(FLASHMLA_ENABLE_SM100)
     # both tensors.  Apply a checked patch to expose an output-only SM100 h64
     # specialization while leaving the public three-output path unchanged.
     set(FLASHMLA_OUTPUT_ONLY_MARKER
-        "template<bool HAVE_ROPE, bool STORE_STATS, typename TmaParams>")
+        "void run_fwd_phase1_output_kernel(const SparseAttnFwdParams& params)")
     set(FLASHMLA_HEAD64_PHASE1
         "${repo-flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh")
     file(READ "${FLASHMLA_HEAD64_PHASE1}" FLASHMLA_HEAD64_PHASE1_CONTENT)
