@@ -613,14 +613,11 @@ class DeepseekV4AttnBackend(
         self.dsv4_huge_mode = (
             model_runner.server_args.dsv4_worker_backend == "huge_kernel"
         )
-        # The clustered full-logits implementation wins at M=4096 but its
-        # FP32 workspace traffic scales as M*context and is prohibitive for
-        # the strict req16/M65536 bucket.  Select the high-load DeepGEMM path
-        # once at backend construction; no per-layer/runtime fallback exists.
-        self.dsv4_huge_use_clustered_mqa = (
-            self.dsv4_huge_mode
-            and model_runner.server_args.max_prefill_tokens == 4096
-        )
+        # Huge supports only the Q16-aligned M=4096 and M=65536 buckets.  Route
+        # both through the clustered metadata ABI so a high-load forward cannot
+        # silently enter the older Q1 logits kernel.  Performance experiments
+        # may replace the full workspace behind this ABI, but not its dispatch.
+        self.dsv4_huge_use_clustered_mqa = self.dsv4_huge_mode
 
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer

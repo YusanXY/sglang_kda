@@ -16,6 +16,7 @@ from sglang.srt.model_executor.dsv4_huge_kernel_whole_layer_runner import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.models import dsv4_whole_layer_runtime
 
 
@@ -134,3 +135,18 @@ def test_whole_layer_executor_uses_strict_cuda_mhc_post_boundaries():
     ]
     assert "_huge_mhc_post" in middle_names
     assert "hc_post" not in middle_attrs
+
+
+def test_high_load_huge_runtime_does_not_route_c4_back_to_q1_logits():
+    runtime_init = textwrap.dedent(
+        inspect.getsource(dsv4_whole_layer_runtime.DSV4WholeLayerRuntime.__init__)
+    )
+    backend_init = textwrap.dedent(inspect.getsource(DeepseekV4AttnBackend.__init__))
+
+    # Both strict Graph buckets are Q16-aligned.  The M=65536 bucket must keep
+    # the same clustered ABI instead of silently selecting the older Q1
+    # DeepGEMM path based on max_prefill_tokens.
+    assert "self._use_clustered_mqa = True" in runtime_init
+    assert "self.dsv4_huge_use_clustered_mqa = self.dsv4_huge_mode" in backend_init
+    assert "max_prefill_tokens == 4096" not in runtime_init
+    assert "max_prefill_tokens == 4096" not in backend_init

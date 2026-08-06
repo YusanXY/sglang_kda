@@ -149,7 +149,10 @@ class DSV4WholeLayerRuntime:
         self._validate_static_config(config, server_args)
         self._config = config
         self._server_args = server_args
-        self._use_clustered_mqa = server_args.max_prefill_tokens == 4096
+        # Both strict buckets are Q16-aligned and fit the clustered kernel's
+        # fixed M<=65536 capacity.  Keep this selected once per model so the
+        # high-load path cannot silently fall back to the Q1 DeepGEMM producer.
+        self._use_clustered_mqa = True
         self._generation = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
         self._active: Optional[DSV4ForwardDescriptor] = None
