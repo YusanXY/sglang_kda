@@ -905,6 +905,19 @@ class DSV4WholeLayerRuntime:
                 f"layer {layer_id}: Huge fused q_lora producer requires wq_b "
                 f"block-FP8 [128, 128], got {q_b_quant!r} / {q_b_block_size!r}"
             )
+        if ratio == 4:
+            indexer_q_b_quant = getattr(attn.indexer.wq_b, "quant_method", None)
+            indexer_q_b_block_size = getattr(
+                indexer_q_b_quant, "weight_block_size", None
+            )
+            if not getattr(indexer_q_b_quant, "block_quant", False) or list(
+                indexer_q_b_block_size or ()
+            ) != [128, 128]:
+                raise RuntimeError(
+                    f"layer {layer_id}: Huge q_lora quant workspace reuse "
+                    "requires indexer.wq_b block-FP8 [128, 128], got "
+                    f"{indexer_q_b_quant!r} / {indexer_q_b_block_size!r}"
+                )
         if layer._post_attention_layernorm_weight_bf16 is None:
             raise RuntimeError(
                 f"layer {layer_id}: huge mHC fusion requires the cached BF16 "

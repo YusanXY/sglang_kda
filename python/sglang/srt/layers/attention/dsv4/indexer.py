@@ -322,6 +322,7 @@ class C4IndexerBackendMixin:
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,
+        q_lora_quant: Optional[Tuple[torch.Tensor, torch.Tensor]],
         c4_indexer: C4Indexer,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -359,7 +360,12 @@ class C4IndexerBackendMixin:
             if q_lora_ready is not None:
                 stream_q.wait_event(q_lora_ready)
             stream_q.wait_event(weights_ready)
-            q, weights = c4_indexer.compute_q(q_lora, positions, weights)
+            q, weights = c4_indexer.compute_q(
+                q_lora,
+                positions,
+                weights,
+                q_quant=q_lora_quant,
+            )
 
         current_stream.wait_stream(stream_q)
         return q, weights
@@ -368,6 +374,7 @@ class C4IndexerBackendMixin:
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,
+        q_lora_quant: Optional[Tuple[torch.Tensor, torch.Tensor]],
         c4_indexer: C4Indexer,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -377,7 +384,12 @@ class C4IndexerBackendMixin:
             assert isinstance(self, CompressorBackendMixin)
 
         weights = c4_indexer.compute_weights(x, skip_scale=True)
-        q, weights = c4_indexer.compute_q(q_lora, positions, weights)
+        q, weights = c4_indexer.compute_q(
+            q_lora,
+            positions,
+            weights,
+            q_quant=q_lora_quant,
+        )
         if not skip_compressor:
             self.forward_indexer_compressor(
                 x=x,
@@ -547,6 +559,7 @@ class C4IndexerBackendMixin:
         q_lora: torch.Tensor,
         c4_indexer: C4Indexer,
         forward_batch: ForwardBatch,
+        q_lora_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
@@ -572,6 +585,11 @@ class C4IndexerBackendMixin:
             x = x[:num_queries]
         if q_lora.shape[0] != num_queries:
             q_lora = q_lora[:num_queries]
+        if q_lora_quant is not None and q_lora_quant[0].shape[0] != num_queries:
+            q_lora_quant = (
+                q_lora_quant[0][:num_queries],
+                q_lora_quant[1][:num_queries],
+            )
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
@@ -579,6 +597,7 @@ class C4IndexerBackendMixin:
             q_indexer, weights = self._forward_prepare_multi_stream(
                 x=x,
                 q_lora=q_lora,
+                q_lora_quant=q_lora_quant,
                 c4_indexer=c4_indexer,
                 positions=positions,
                 forward_batch=forward_batch,
@@ -590,6 +609,7 @@ class C4IndexerBackendMixin:
             q_indexer, weights = self._forward_prepare_normal(
                 x=x,
                 q_lora=q_lora,
+                q_lora_quant=q_lora_quant,
                 c4_indexer=c4_indexer,
                 positions=positions,
                 forward_batch=forward_batch,
@@ -983,8 +1003,9 @@ class C4Indexer(nn.Module):
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         weight: torch.Tensor,
+        q_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
-        q, _ = self.wq_b(q_lora)
+        q, _ = self.wq_b(q_quant if q_quant is not None else q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
@@ -1017,6 +1038,7 @@ class C4Indexer(nn.Module):
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend: AttentionBackend,
+        q_lora_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
@@ -1024,6 +1046,7 @@ class C4Indexer(nn.Module):
         return attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
+            q_lora_quant=q_lora_quant,
             forward_batch=forward_batch,
             c4_indexer=self,
             alt_streams=self.alt_streams,

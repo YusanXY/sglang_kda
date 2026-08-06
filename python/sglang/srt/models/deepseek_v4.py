@@ -909,6 +909,7 @@ class MQALayer(MqaAttentionBase):
         ] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
+        q_lora_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
             q_lora = qkv_a[..., : self.q_lora_rank]
@@ -1041,11 +1042,12 @@ class MQALayer(MqaAttentionBase):
                     group_size=128,
                 )
                 q_lora = q_lora_bf16
+                q_lora_quant = (q_lora_fp8, q_lora_scale)
                 q = self._compute_q_b(
                     q_lora,
                     positions,
                     q_out,
-                    q_quant=(q_lora_fp8, q_lora_scale),
+                    q_quant=q_lora_quant,
                 )
             else:
                 q_lora = self.q_norm(q_lora)
@@ -1094,6 +1096,7 @@ class MQALayer(MqaAttentionBase):
             self.indexer(
                 x=x,
                 q_lora=q_lora,
+                q_lora_quant=q_lora_quant,
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
             )

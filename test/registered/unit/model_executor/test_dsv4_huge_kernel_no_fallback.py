@@ -8,7 +8,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import torch
 
+from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.model_executor.dsv4_huge_kernel_model_runner import (
     Dsv4HugeKernelModelRunner,
 )
@@ -168,3 +170,52 @@ def test_fp8_q_indexer_owns_req16_block_specialization():
     assert "blockIdx.x * kFusedQIndexerNumWarps + warp_id" in source
     assert "div_ceil(total_works, kFusedQIndexerNumWarps)" in source
     assert "LaunchKernel(num_blocks, kFusedQIndexerBlockSize" in source
+
+
+def test_c4_indexer_compute_q_consumes_caller_owned_quant_workspace():
+    q_projection = torch.empty(4, 128)
+    quant_workspace = (object(), object())
+    indexer = SimpleNamespace(
+        wq_b=mock.Mock(return_value=(q_projection, None)),
+        n_local_heads=2,
+        head_dim=128,
+        use_fp4_indexer=False,
+        weight_scale=0.125,
+        freqs_cis=object(),
+    )
+    fused_result = (object(), object())
+
+    with mock.patch(
+        "sglang.srt.layers.attention.dsv4.indexer.get_kda_operator",
+        return_value=None,
+    ), mock.patch(
+        "sglang.srt.layers.attention.dsv4.indexer."
+        "fused_q_indexer_rope_hadamard_quant",
+        return_value=fused_result,
+    ):
+        result = C4Indexer.compute_q(
+            indexer,
+            q_lora=torch.empty(2, 1024),
+            positions=torch.zeros(2, dtype=torch.int32),
+            weight=torch.empty(2, 2),
+            q_quant=quant_workspace,
+        )
+
+    indexer.wq_b.assert_called_once_with(quant_workspace)
+    assert result is fused_result
+
+
+def test_huge_q_lora_quant_workspace_reaches_c4_indexer():
+    root = Path(__file__).parents[4]
+    model_source = (root / "python/sglang/srt/models/deepseek_v4.py").read_text()
+    indexer_source = (
+        root / "python/sglang/srt/layers/attention/dsv4/indexer.py"
+    ).read_text()
+    runtime_source = (
+        root / "python/sglang/srt/models/dsv4_whole_layer_runtime.py"
+    ).read_text()
+
+    assert "q_lora_quant = (q_lora_fp8, q_lora_scale)" in model_source
+    assert "q_lora_quant=q_lora_quant" in model_source
+    assert "self.wq_b(q_quant if q_quant is not None else q_lora)" in indexer_source
+    assert "requires indexer.wq_b block-FP8 [128, 128]" in runtime_source
