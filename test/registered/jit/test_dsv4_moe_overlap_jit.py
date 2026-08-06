@@ -7,6 +7,9 @@ from sglang.jit_kernel.dsv4_moe_overlap.jit import (
     _FP4_MULTI_TILE_END,
     _FP4_MULTI_TILE_START,
     _INCLUDE_ANCHOR,
+    _MOE_RUNNER_CONSTRUCTION,
+    _MOE_RUNNER_MEMBER,
+    _MOE_TACTIC_AND_WORKSPACE,
     _NAMESPACE_ANCHOR,
     _POST_ROUTING_PREPARE,
     _RUN_PROLOGUE,
@@ -15,6 +18,13 @@ from sglang.jit_kernel.dsv4_moe_overlap.jit import (
 
 
 def _source() -> str:
+    # The production launcher currently has 48 temporary allocations.  Two
+    # live in the tactic/workspace anchor below; synthesize the remaining 46
+    # so this hermetic fixture exercises the same strict source-layout guard.
+    allocations = "\n".join(
+        f"auto allocation_{index} = alloc_tensor(shape, dtype, device);"
+        for index in range(46)
+    )
     multi_tile = """  std::unordered_map<int32_t, int> launchers_map;
   for (int32_t curr_tile_N : mSupportedTileN) {
     std::make_unique<FP4BlockScaleLauncher>();
@@ -25,7 +35,9 @@ def _source() -> str:
 """
     return (
         f"{_INCLUDE_ANCHOR}{_NAMESPACE_ANCHOR}"
-        f"prefix\n{_RUN_PROLOGUE}routing body\n{_POST_ROUTING_PREPARE}"
+        f"prefix\n{_MOE_RUNNER_MEMBER}\n{_MOE_RUNNER_CONSTRUCTION}"
+        f"{_MOE_TACTIC_AND_WORKSPACE}\n{allocations}\n"
+        f"{_RUN_PROLOGUE}routing body\n{_POST_ROUTING_PREPARE}"
         f"middle\n{_FP4_MULTI_TILE_START}{multi_tile}{_FP4_MULTI_TILE_END}"
         f"suffix\n{_EXPORT_ANCHOR}"
     )

@@ -456,6 +456,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        per_request_chunk_tokens: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -464,6 +465,7 @@ class PrefillAdder:
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
+        self.per_request_chunk_tokens = per_request_chunk_tokens
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
@@ -546,6 +548,20 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+
+    def _request_chunk_budget(self) -> Optional[int]:
+        """Return the remaining budget for one request in this prefill pass.
+
+        Normally SGLang uses one value for both the aggregate batch budget and
+        an individual request chunk.  Huge DSV4 deliberately separates them:
+        aggregate M can be 65536 while one request advances by at most 4096.
+        """
+
+        if self.rem_chunk_tokens is None:
+            return None
+        if self.per_request_chunk_tokens is None:
+            return self.rem_chunk_tokens
+        return min(self.rem_chunk_tokens, self.per_request_chunk_tokens)
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -632,8 +648,9 @@ class PrefillAdder:
         chunk N+1 allocation. We floor at sliding_window_size to reserve
         room for the decode phase.
         """
-        if self.rem_chunk_tokens is not None:
-            alloc = min(extend_input_len, self.rem_chunk_tokens)
+        request_chunk_budget = self._request_chunk_budget()
+        if request_chunk_budget is not None:
+            alloc = min(extend_input_len, request_chunk_budget)
         else:
             alloc = extend_input_len
         budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
@@ -807,6 +824,8 @@ class PrefillAdder:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+            if self.per_request_chunk_tokens is not None:
+                _rem_tokens = min(_rem_tokens, self.per_request_chunk_tokens)
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
@@ -936,7 +955,7 @@ class PrefillAdder:
             self._add_dllm_req(req, 0)
         elif (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
-            or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+            or cand_extend_input_len <= self._request_chunk_budget()
         ):
             # Non-chunked prefill — the whole sequence is committed this iter.
             req.set_extend_range(
@@ -955,7 +974,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = self._request_chunk_budget()
 
             assert len(req.prefix_indices) == 0
             req.set_extend_range(
@@ -1086,7 +1105,10 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            elif (
+                self.rem_chunk_tokens is None
+                or input_tokens <= self._request_chunk_budget()
+            ):
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
@@ -1105,8 +1127,16 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
             else:
+                # The scheduler owns only one in-progress chunked request.  A
+                # second long request must wait, while complete <=4K requests
+                # may still be packed together into the remaining aggregate
+                # Huge budget.
+                if has_chunked_req or self.new_chunked_req is not None:
+                    return AddReqResult.OTHER
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
+                trunc_len = (
+                    self._request_chunk_budget() // self.page_size * self.page_size
+                )
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER

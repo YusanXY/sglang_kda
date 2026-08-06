@@ -21,7 +21,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_m
 
 CompressRatio = Literal[0, 4, 128]
 
-_MAX_FORWARD_TOKENS = 4096
+_MAX_FORWARD_TOKENS = 65536
 _MAX_FORWARD_REQUESTS = 128
 _MAX_MHC_SPLITS = 64
 
@@ -147,6 +147,7 @@ class DSV4WholeLayerRuntime:
         self._validate_static_config(config, server_args)
         self._config = config
         self._server_args = server_args
+        self._use_clustered_mqa = server_args.max_prefill_tokens == 4096
         self._generation = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
         self._active: Optional[DSV4ForwardDescriptor] = None
@@ -199,13 +200,14 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError("cannot rebind DSV4 layer handles during a forward")
         # Compile/load the C4 CUDA module at binding time. The first live
         # request must never encounter a per-layer JIT or a hidden fallback.
-        from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
-            MAX_C4_CONTEXT,
-            MAX_TOTAL_Q,
-            load_clustered_mqa_extension,
-        )
+        if self._use_clustered_mqa:
+            from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
+                MAX_C4_CONTEXT,
+                MAX_TOTAL_Q,
+                load_clustered_mqa_extension,
+            )
 
-        load_clustered_mqa_extension()
+            load_clustered_mqa_extension()
         from sglang.jit_kernel.dsv4.e2e import (
             load_mhc_pre_norm_mxfp8_quant_extension,
         )
@@ -225,7 +227,7 @@ class DSV4WholeLayerRuntime:
                 f"{fp8_backend}"
             )
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
-        if (
+        if self._use_clustered_mqa and (
             self._clustered_logits_workspace is None
             or self._clustered_logits_workspace.device != workspace_device
         ):
@@ -301,13 +303,17 @@ class DSV4WholeLayerRuntime:
             )
         if not 1 <= num_tokens <= _MAX_FORWARD_TOKENS:
             raise RuntimeError(
-                "DSV4 huge runtime requires aggregate M in 1..4096, "
+                "DSV4 huge runtime requires aggregate M in 1..65536, "
                 f"got {num_tokens}"
             )
-        if is_graph_capture and (batch_size != 1 or num_tokens != 4096):
+        if is_graph_capture and (batch_size, num_tokens) not in (
+            (1, 4096),
+            (16, 65536),
+        ):
             raise RuntimeError(
                 "DSV4 huge breakable capture requires the exact static shape "
-                f"req=1, M=4096; got req={batch_size}, M={num_tokens}"
+                "req=1/M=4096 or req=16/M=65536; "
+                f"got req={batch_size}, M={num_tokens}"
             )
         extend_lens = forward_batch.extend_seq_lens_cpu
         if extend_lens is None or len(extend_lens) != batch_size:
@@ -357,11 +363,14 @@ class DSV4WholeLayerRuntime:
         # all 21 C4 layers consume these exact objects without replanning. In
         # Breakable Graph mode the captured object keeps stable addresses and
         # DSV4Metadata refreshes its live schedule in place before every replay.
-        metadata.clustered_mqa_metadata = prepare_clustered_mqa_metadata(
-            indexer_metadata=indexer_metadata,
-            extend_lens_cpu=extend_lens,
-            logits_workspace=self._clustered_logits_workspace,
-        )
+        if self._use_clustered_mqa:
+            metadata.clustered_mqa_metadata = prepare_clustered_mqa_metadata(
+                indexer_metadata=indexer_metadata,
+                extend_lens_cpu=extend_lens,
+                logits_workspace=self._clustered_logits_workspace,
+            )
+        else:
+            metadata.clustered_mqa_metadata = None
         (
             attention_q_padded,
             output_q,
@@ -760,7 +769,6 @@ class DSV4WholeLayerRuntime:
             "tp_size": 4,
             "ep_size": 4,
             "pp_size": 1,
-            "chunked_prefill_size": 4096,
             "moe_runner_backend": "flashinfer_mxfp4",
             "disable_overlap_schedule": True,
             "enable_dsa_prefill_context_parallel": False,
@@ -774,6 +782,19 @@ class DSV4WholeLayerRuntime:
                     f"DSV4 huge runtime requires --{name.replace('_', '-')}="
                     f"{expected!r}, got {actual!r}"
                 )
+        if view.max_prefill_tokens not in (4096, 65536):
+            raise RuntimeError(
+                "DSV4 huge runtime requires --max-prefill-tokens to select "
+                "4096 or 65536, got "
+                f"{view.max_prefill_tokens!r}"
+            )
+        if view.chunked_prefill_size != view.max_prefill_tokens:
+            raise RuntimeError(
+                "DSV4 huge runtime requires aggregate chunked-prefill-size "
+                "to equal max-prefill-tokens; the scheduler separately caps "
+                "each request at 4096, got "
+                f"{view.chunked_prefill_size!r} vs {view.max_prefill_tokens!r}"
+            )
         prefill_backend, decode_backend = attention_backends_of(view)
         if (prefill_backend, decode_backend) != ("dsv4", "dsv4"):
             raise RuntimeError(
@@ -786,13 +807,18 @@ class DSV4WholeLayerRuntime:
                 "DSV4 huge runtime requires prefill CUDA graph disabled or "
                 f"breakable, got {prefill_graph.backend!r}"
             )
-        if prefill_graph.backend == Backend.BREAKABLE and tuple(
-            prefill_graph.bs or ()
-        ) != (4096,):
-            raise RuntimeError(
-                "DSV4 huge breakable prefill CUDA graph requires the single "
-                f"exact bucket [4096], got {prefill_graph.bs!r}"
+        if prefill_graph.backend == Backend.BREAKABLE:
+            expected_buckets = (
+                (4096,)
+                if view.max_prefill_tokens == 4096
+                else (4096, 65536)
             )
+            if tuple(prefill_graph.bs or ()) != expected_buckets:
+                raise RuntimeError(
+                    "DSV4 huge breakable prefill CUDA graph requires exact "
+                    f"buckets {list(expected_buckets)}, got "
+                    f"{prefill_graph.bs!r}"
+                )
         if view.cuda_graph_config.decode.backend != Backend.DISABLED:
             raise RuntimeError("DSV4 huge runtime requires decode CUDA graph disabled")
         if not torch.cuda.is_available() or torch.version.hip is not None:

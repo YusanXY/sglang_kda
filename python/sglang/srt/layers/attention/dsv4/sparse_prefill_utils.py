@@ -53,7 +53,7 @@ from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
     _build_c4_geometry_kernel,
     _build_swa_token_ids_kernel,
     _combine_topk_swa_indices_kernel,
-    _rebuild_batch1_c128_replay_kernel,
+    _rebuild_c128_replay_kernel,
 )
 
 
@@ -563,8 +563,11 @@ class SparsePrefillChunkCache:
         replay only needs this small correct C128 preparation path.
         """
 
-        if self.num_reqs != 1 or self.num_qo_tokens != 4096:
-            raise RuntimeError("fused C128 Graph replay requires req=1 and M=4096")
+        if (self.num_reqs, self.num_qo_tokens) not in ((1, 4096), (16, 65536)):
+            raise RuntimeError(
+                "fused C128 Graph replay requires req=1/M=4096 or "
+                "req=16/M=65536"
+            )
         if (
             self.c128_flat_token_ids is None
             or self.c128_combined_indices is None
@@ -572,7 +575,7 @@ class SparsePrefillChunkCache:
         ):
             raise RuntimeError("C128 buffers must be allocated during graph warmup")
         c128_max = self.c128_flat_token_ids.shape[0] // self.num_reqs
-        _rebuild_batch1_c128_replay_kernel[(128,)](
+        _rebuild_c128_replay_kernel[(self.num_reqs, 128)](
             self.c128_flat_token_ids,
             self.c128_combined_indices,
             self.c128_combined_indices.stride(0),
@@ -595,6 +598,7 @@ class SparsePrefillChunkCache:
                 self.c128_combined_indices.shape[1]
             ),
             WINDOW_SIZE=self.swa_window_size,
+            NUM_REQS=self.num_reqs,
         )
 
     def refresh_for_breakable_cuda_graph_replay_(

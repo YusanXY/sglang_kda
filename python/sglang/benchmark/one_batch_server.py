@@ -456,6 +456,7 @@ def _warmup_cache(
     backend: str = "sglang",
     model_name: Optional[str] = None,
     warmup_cached_prefill_shape: bool = False,
+    share_cached_prefix_across_batch: bool = False,
 ):
     """Warm up the cache by sending prefix tokens to populate the radix/prefix cache.
 
@@ -479,6 +480,18 @@ def _warmup_cache(
     )
     # Create prefix input_ids for cache warming
     cache_warmup_input_ids = [ids[:cached_token_len] for ids in input_ids]
+    if share_cached_prefix_across_batch:
+        shared_prefix = cache_warmup_input_ids[0]
+        if any(prefix != shared_prefix for prefix in cache_warmup_input_ids[1:]):
+            raise ValueError(
+                "shared-prefix cache warmup received non-identical prefixes"
+            )
+        # One request populates the shared radix entry for the entire batch.
+        # Sending all copies makes the scheduler manufacture redundant
+        # intermediate shapes (for example req15/M61440), which is both extra
+        # work and incompatible with strict exact-bucket CUDA Graph execution.
+        cache_warmup_input_ids = [shared_prefix]
+        print("Shared prefix detected; warming one canonical cache entry")
 
     if backend == "vllm":
         cache_warmup_payload = {
@@ -816,6 +829,7 @@ def run_one_case(
             backend=backend,
             model_name=model_name,
             warmup_cached_prefill_shape=warmup_cached_prefill_shape,
+            share_cached_prefix_across_batch=share_cached_prefix_across_batch,
         )
 
     # Turn on profiler
@@ -896,6 +910,18 @@ def run_one_case(
                         if return_logprob:
                             first_token_logprobs = data["meta_info"].get(
                                 "output_token_logprobs"
+                            )
+                            print(
+                                "SGLANG_BENCH_FIRST_TOKEN_RESULT "
+                                + json.dumps(
+                                    {
+                                        "index": data.get("index"),
+                                        "request_id": data["meta_info"].get("id"),
+                                        "output_token_logprobs": first_token_logprobs,
+                                    },
+                                    sort_keys=True,
+                                ),
+                                flush=True,
                             )
                             print(
                                 "SGLANG_BENCH_FIRST_TOKEN_LOGPROBS "

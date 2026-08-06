@@ -528,9 +528,12 @@ inline PrefillPlan plan_compress_prefill(
   const auto f2s_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr());
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
-  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
+  // ragged_id stores an index, not a count.  uint16_t therefore covers the
+  // complete M=65536 range [0, 65535].
+  constexpr auto kMaxTokenCount =
+      static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) + 1u;
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
-  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokenCount);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
 
@@ -760,9 +763,10 @@ inline PrefillPlan plan_compress_prefill_legacy(
 
   const auto window_size = compress_ratio * (is_overlap ? 2 : 1);
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
-  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
+  constexpr auto kMaxTokenCount =
+      static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) + 1u;
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
-  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokenCount);
 
   uint32_t counter = 0;
   uint32_t counter_c = 0;

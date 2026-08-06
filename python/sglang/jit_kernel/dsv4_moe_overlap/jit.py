@@ -91,7 +91,17 @@ _DSV4_MOE_RUNNER_CONSTRUCTION = """    auto make_runner = [&]() -> std::shared_p
       int const weight_dtype = static_cast<int>(this->mDtypeWeights);
       int const activation = static_cast<int>(this->activation_type);
       int const layout = static_cast<int>(this->weight_layout);
-      if (!persistent.runner) {
+      bool const runner_matches =
+          persistent.runner &&
+          persistent.runner_tile == tile_tokens_dim &&
+          persistent.runner_act_dtype == act_dtype &&
+          persistent.runner_weight_dtype == weight_dtype &&
+          persistent.runner_activation == activation &&
+          persistent.runner_layout == layout &&
+          persistent.runner_deepseek_fp8 == args->mUseDeepSeekFp8 &&
+          persistent.runner_scale_gemm1 == usePerTokenScalingGemm1 &&
+          persistent.runner_scale_gemm2 == usePerTokenScalingGemm2;
+      if (!runner_matches) {
         persistent.runner = make_runner();
         persistent.runner_tile = tile_tokens_dim;
         persistent.runner_act_dtype = act_dtype;
@@ -101,15 +111,14 @@ _DSV4_MOE_RUNNER_CONSTRUCTION = """    auto make_runner = [&]() -> std::shared_p
         persistent.runner_deepseek_fp8 = args->mUseDeepSeekFp8;
         persistent.runner_scale_gemm1 = usePerTokenScalingGemm1;
         persistent.runner_scale_gemm2 = usePerTokenScalingGemm2;
-      } else {
-        TVM_FFI_ICHECK_EQ(persistent.runner_tile, tile_tokens_dim);
-        TVM_FFI_ICHECK_EQ(persistent.runner_act_dtype, act_dtype);
-        TVM_FFI_ICHECK_EQ(persistent.runner_weight_dtype, weight_dtype);
-        TVM_FFI_ICHECK_EQ(persistent.runner_activation, activation);
-        TVM_FFI_ICHECK_EQ(persistent.runner_layout, layout);
-        TVM_FFI_ICHECK_EQ(persistent.runner_deepseek_fp8, args->mUseDeepSeekFp8);
-        TVM_FFI_ICHECK_EQ(persistent.runner_scale_gemm1, usePerTokenScalingGemm1);
-        TVM_FFI_ICHECK_EQ(persistent.runner_scale_gemm2, usePerTokenScalingGemm2);
+        // A tactic and its byte workspaces are valid only for the selected
+        // runner geometry.  Device tensor variants remain cached separately.
+        persistent.num_tokens = -1;
+        persistent.tactic_ready = false;
+        persistent.tactic = -1;
+        persistent.workspace_sizes_ready = false;
+        persistent.workspace_fc1_bytes = 0;
+        persistent.workspace_fc2_bytes = 0;
       }
       moe_runner = persistent.runner;
     } else {
@@ -139,6 +148,18 @@ _MOE_TACTIC_AND_WORKSPACE = """    if (moe_tactic == -1) {
 
 _DSV4_MOE_TACTIC_AND_WORKSPACE = """    auto& persistent = dsv4_persistent_moe_state;
     bool const use_persistent = dsv4_shared_finalize_state.active;
+    // Tactic validity and workspace byte counts depend on aggregate M.  Prefix
+    // construction and the true req=16 batch deliberately alternate between
+    // M=4096 and M=65536, so retain the runner but refresh the shape-dependent
+    // planning state whenever M changes.
+    if (use_persistent && persistent.num_tokens != args->num_tokens) {
+      persistent.num_tokens = args->num_tokens;
+      persistent.tactic_ready = false;
+      persistent.tactic = -1;
+      persistent.workspace_sizes_ready = false;
+      persistent.workspace_fc1_bytes = 0;
+      persistent.workspace_fc2_bytes = 0;
+    }
     if (use_persistent && persistent.tactic_ready) {
       if (moe_tactic != -1) {
         TVM_FFI_ICHECK_EQ(moe_tactic, persistent.tactic);
@@ -209,7 +230,11 @@ thread_local Dsv4SharedFinalizeState dsv4_shared_finalize_state;
 
 struct Dsv4PersistentMoeState {
   size_t tensor_cursor = 0;
-  std::vector<Tensor> tensors;
+  // A logical allocator slot can request different routing-dependent shapes
+  // across decoder layers.  Cache each shape variant on device instead of
+  // reallocating every call or incorrectly forcing the first layer's shape on
+  // all following layers.
+  std::vector<std::vector<Tensor>> tensor_variants;
   std::shared_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> runner;
   int64_t runner_tile = -1;
   int runner_act_dtype = -1;
@@ -219,6 +244,7 @@ struct Dsv4PersistentMoeState {
   bool runner_deepseek_fp8 = false;
   bool runner_scale_gemm1 = false;
   bool runner_scale_gemm2 = false;
+  int64_t num_tokens = -1;
   bool tactic_ready = false;
   int64_t tactic = -1;
   bool workspace_sizes_ready = false;
@@ -238,19 +264,24 @@ Tensor dsv4_alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice devic
   }
   auto& persistent = dsv4_persistent_moe_state;
   size_t const slot = persistent.tensor_cursor++;
-  if (slot == persistent.tensors.size()) {
-    persistent.tensors.push_back(alloc_tensor(shape, dtype, device));
-  } else {
-    Tensor const& tensor = persistent.tensors[slot];
-    TVM_FFI_ICHECK_EQ(tensor.ndim(), shape.size());
-    for (int i = 0; i < tensor.ndim(); ++i) {
-      TVM_FFI_ICHECK_EQ(tensor.size(i), shape[i]);
-    }
-    TVM_FFI_ICHECK(tensor.dtype() == dtype);
-    TVM_FFI_ICHECK_EQ(tensor.device().device_type, device.device_type);
-    TVM_FFI_ICHECK_EQ(tensor.device().device_id, device.device_id);
+  if (slot == persistent.tensor_variants.size()) {
+    persistent.tensor_variants.emplace_back();
   }
-  return persistent.tensors[slot];
+  auto& variants = persistent.tensor_variants[slot];
+  for (Tensor const& tensor : variants) {
+    bool matches = tensor.ndim() == shape.size();
+    for (int i = 0; matches && i < tensor.ndim(); ++i) {
+      matches = tensor.size(i) == shape[i];
+    }
+    matches = matches && tensor.dtype() == dtype;
+    matches = matches && tensor.device().device_type == device.device_type;
+    matches = matches && tensor.device().device_id == device.device_id;
+    if (matches) {
+      return tensor;
+    }
+  }
+  variants.push_back(alloc_tensor(shape, dtype, device));
+  return variants.back();
 }
 
 void dsv4_set_shared_finalize(TensorView shared_output, double routed_scale) {

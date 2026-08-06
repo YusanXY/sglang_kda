@@ -71,6 +71,12 @@ def test_whole_layer_dispatch_has_no_exception_fallback_or_host_sync():
 def test_model_runner_rejects_invalid_forward_before_native_runner_executes():
     runner = object.__new__(Dsv4HugeKernelModelRunner)
     runner._huge_kernel_layers_bound = True
+    runner.server_args = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(backend="disabled", bs=None),
+            decode=SimpleNamespace(backend="disabled"),
+        )
+    )
     invalid = SimpleNamespace(
         forward_mode=ForwardMode.DECODE,
         global_forward_mode=ForwardMode.DECODE,

@@ -278,14 +278,16 @@ class DSV4AttnMetadata:
                     raise RuntimeError(
                         f"Huge Graph fused core metadata requires {field_name}"
                     )
-                if src_val.numel() > 4096 or dst_val.shape != src_val.shape:
+                if src_val.numel() > 65536 or dst_val.shape != src_val.shape:
                     raise RuntimeError(
                         "Huge Graph fused core metadata requires arrays no larger "
-                        f"than M=4096; {field_name}={tuple(src_val.shape)}"
+                        f"than M=65536; {field_name}={tuple(src_val.shape)}"
                     )
                 tensors.extend((dst_val, src_val))
                 numels.append(src_val.numel())
-            _copy_batch1_dsv4_core_metadata_kernel[(16,)](
+            _copy_batch1_dsv4_core_metadata_kernel[
+                ((max(numels) + 255) // 256,)
+            ](
                 *tensors,
                 *numels,
                 BLOCK_SIZE=256,
@@ -611,6 +613,14 @@ class DeepseekV4AttnBackend(
         self.dsv4_huge_mode = (
             model_runner.server_args.dsv4_worker_backend == "huge_kernel"
         )
+        # The clustered full-logits implementation wins at M=4096 but its
+        # FP32 workspace traffic scales as M*context and is prohibitive for
+        # the strict req16/M65536 bucket.  Select the high-load DeepGEMM path
+        # once at backend construction; no per-layer/runtime fallback exists.
+        self.dsv4_huge_use_clustered_mqa = (
+            self.dsv4_huge_mode
+            and model_runner.server_args.max_prefill_tokens == 4096
+        )
 
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
@@ -736,7 +746,7 @@ class DeepseekV4AttnBackend(
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
-            prefer_clustered_mqa=self.dsv4_huge_mode,
+            prefer_clustered_mqa=self.dsv4_huge_use_clustered_mqa,
         )
 
     def init_forward_metadata_decode(
@@ -840,7 +850,7 @@ class DeepseekV4AttnBackend(
                     compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
                 )
                 if use_graph_plan:
-                    return create_paged_compressor_data(
+                    plan = create_paged_compressor_data(
                         compress_ratio=compress_ratio,
                         is_prefill=True,
                         token_to_kv_pool=self.token_to_kv_pool,
@@ -854,6 +864,33 @@ class DeepseekV4AttnBackend(
                         num_q_tokens=out_cache_loc.shape[0],
                         online_state_slot_offset=online_c128_state_slot_offset,
                     )
+                    if self.dsv4_huge_mode:
+                        # Strict Huge Graph batches contribute request-local
+                        # 4096-token chunks on a 128-aligned prefix.  The
+                        # generic graph planner pads both plan arrays to M so
+                        # arbitrary underfilled replays remain legal, but our
+                        # two exact buckets have invariant compact counts:
+                        #   C4:   M/4 compress, M/32 overlap writes
+                        #   C128: M/128 compress, zero tail writes
+                        # Capture compact views so every layer avoids tens of
+                        # thousands of invalid early-return thread blocks.
+                        num_q_tokens = int(out_cache_loc.shape[0])
+                        if num_q_tokens % 4096:
+                            raise RuntimeError(
+                                "Huge Graph compact compression plans require "
+                                f"M divisible by 4096, got {num_q_tokens}"
+                            )
+                        if compress_ratio == 4:
+                            num_compress = num_q_tokens // 4
+                            num_write = num_q_tokens // 32
+                        else:
+                            num_compress = num_q_tokens // 128
+                            num_write = 0
+                        plan = plan._replace(
+                            plan_c=plan.plan_c[:num_compress],
+                            plan_w=plan.plan_w[:num_write],
+                        )
+                    return plan
                 return create_paged_compressor_data(
                     compress_ratio=compress_ratio,
                     is_prefill=True,
@@ -885,14 +922,20 @@ class DeepseekV4AttnBackend(
             # both lazy per-layer Python setup and the standalone Triton
             # topk+SWA combine launch from every C4 layer.
             if use_prefill_cuda_graph:
-                if len(extend_seq_lens_cpu) != 1 or num_tokens != 4096:
+                graph_shape = (len(extend_seq_lens_cpu), num_tokens)
+                if graph_shape not in ((1, 4096), (16, 65536)) or any(
+                    int(length) != 4096 for length in extend_seq_lens_cpu
+                ):
                     raise RuntimeError(
-                        "Huge Graph sparse cache requires req=1 and M=4096"
+                        "Huge Graph sparse cache requires req=1/M=4096 or "
+                        "req=16/M=65536 with 4096 new tokens per request"
                     )
                 # Capture dummy chunks can have seq_len=M while a replay can
                 # have a long prefix. Keep one bucket-stable allocation for
                 # the maximum SWA union and zero its unused capture-time tail.
-                total_swa_hint = num_tokens + SWA_WINDOW - 1
+                total_swa_hint = num_tokens + len(extend_seq_lens_cpu) * (
+                    SWA_WINDOW - 1
+                )
                 zero_initialize_swa_tail = True
             else:
                 total_swa_hint = sum(
@@ -1603,6 +1646,15 @@ class DeepseekV4AttnBackend(
         # Build graph-compatible metadata against the padded static batch. The
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
+        assert isinstance(capture_metadata, DSV4Metadata)
+        if not self.dsv4_huge_mode:
+            # Preserve the native breakable-graph contract from before Huge's
+            # graph-local metadata path: Python sparse geometry is rebuilt from
+            # the live batch at the first break instead of being copied into a
+            # captured Huge cache.  Requiring a live Huge replay cache here
+            # regressed the otherwise untouched Native baseline.
+            capture_metadata.sparse_prefill_cache = None
+            capture_metadata.clustered_mqa_metadata = None
         self._skip_huge_sparse_cache_build = True
         try:
             static_metadata = self._build_forward_metadata(
@@ -1614,7 +1666,6 @@ class DeepseekV4AttnBackend(
             )
         finally:
             self._skip_huge_sparse_cache_build = False
-        assert isinstance(capture_metadata, DSV4Metadata)
         captured_sparse_cache = capture_metadata.sparse_prefill_cache
         if (
             captured_sparse_cache is not None

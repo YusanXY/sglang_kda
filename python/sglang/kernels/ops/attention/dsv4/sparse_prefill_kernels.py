@@ -176,7 +176,7 @@ def _build_c4_geometry_kernel(
 
 
 @triton.jit
-def _rebuild_batch1_c128_replay_kernel(
+def _rebuild_c128_replay_kernel(
     flat_token_ids_ptr,
     combined_indices_ptr,
     combined_indices_stride,
@@ -197,56 +197,108 @@ def _rebuild_batch1_c128_replay_kernel(
     COMBINED_WIDTH: tl.constexpr,
     PADDED_COMBINED: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
+    NUM_REQS: tl.constexpr,
 ):
-    """Strict req=1 replay descriptor and C128 geometry in one launch."""
+    """Rebuild all request descriptors and C128 geometry in one launch."""
 
-    worker_id = tl.program_id(0)
-    num_workers = tl.num_programs(0)
-    seq_len = tl.load(live_seq_lens_ptr).to(tl.int32)
-    query_len = tl.load(live_extend_seq_lens_ptr).to(tl.int32)
-    req_pool_idx = tl.load(live_req_pool_indices_ptr).to(tl.int32)
+    req_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+    seq_len = tl.load(live_seq_lens_ptr + req_idx).to(tl.int32)
+    query_len = tl.load(live_extend_seq_lens_ptr + req_idx).to(tl.int32)
+    req_pool_idx = tl.load(live_req_pool_indices_ptr + req_idx).to(tl.int32)
     gather_len = tl.minimum(seq_len, query_len + WINDOW_SIZE - 1)
     gather_start = seq_len - gather_len
 
-    is_first_worker = worker_id == 0
-    tl.store(captured_seq_lens_ptr, seq_len, mask=is_first_worker)
-    tl.store(captured_extend_seq_lens_ptr, query_len, mask=is_first_worker)
-    tl.store(captured_req_pool_indices_ptr, req_pool_idx, mask=is_first_worker)
-    tl.store(query_start_loc_ptr, 0, mask=is_first_worker)
-    tl.store(query_start_loc_ptr + 1, query_len, mask=is_first_worker)
-    tl.store(swa_first_pos_ptr, gather_start, mask=is_first_worker)
-    tl.store(swa_gather_lens_ptr, gather_len, mask=is_first_worker)
-    tl.store(swa_offsets_ptr, 0, mask=is_first_worker)
-    tl.store(swa_offsets_ptr + 1, gather_len, mask=is_first_worker)
+    # NUM_REQS is at most 16 for the strict high-load graph.  Computing the
+    # two tiny exclusive scans redundantly in each request block keeps all
+    # replay descriptor generation in this single GPU launch and avoids a
+    # host prefix-sum/copy sequence.
+    # Seed scalar accumulators from a scalar load.  A shape-(1,) tl.zeros is
+    # a Triton block and cannot be stored through the scalar descriptor
+    # pointers below.
+    zero = tl.load(live_extend_seq_lens_ptr).to(tl.int32) * 0
+    query_start = zero
+    swa_base_offset = zero
+    for prior_req in range(NUM_REQS):
+        prior_query_len = tl.load(live_extend_seq_lens_ptr + prior_req).to(
+            tl.int32
+        )
+        prior_seq_len = tl.load(live_seq_lens_ptr + prior_req).to(tl.int32)
+        prior_gather_len = tl.minimum(
+            prior_seq_len, prior_query_len + WINDOW_SIZE - 1
+        )
+        is_prior = prior_req < req_idx
+        query_start += tl.where(is_prior, prior_query_len, 0)
+        swa_base_offset += tl.where(is_prior, prior_gather_len, 0)
 
-    last_query = (query_len - 1).to(tl.int64)
+    is_first_worker = worker_id == 0
+    tl.store(captured_seq_lens_ptr + req_idx, seq_len, mask=is_first_worker)
+    tl.store(
+        captured_extend_seq_lens_ptr + req_idx,
+        query_len,
+        mask=is_first_worker,
+    )
+    tl.store(
+        captured_req_pool_indices_ptr + req_idx,
+        req_pool_idx,
+        mask=is_first_worker,
+    )
+    tl.store(query_start_loc_ptr + req_idx, query_start, mask=is_first_worker)
+    tl.store(
+        query_start_loc_ptr + req_idx + 1,
+        query_start + query_len,
+        mask=is_first_worker,
+    )
+    tl.store(swa_first_pos_ptr + req_idx, gather_start, mask=is_first_worker)
+    tl.store(swa_gather_lens_ptr + req_idx, gather_len, mask=is_first_worker)
+    tl.store(swa_offsets_ptr + req_idx, swa_base_offset, mask=is_first_worker)
+    tl.store(
+        swa_offsets_ptr + req_idx + 1,
+        swa_base_offset + gather_len,
+        mask=is_first_worker,
+    )
+
+    last_query = (query_start + query_len - 1).to(tl.int64)
+    compressed_base = req_idx * C128_MAX
+    total_compressed = NUM_REQS * C128_MAX
     for c128_idx in range(worker_id, C128_MAX, num_workers):
         page_id = tl.load(
             c128_page_indices_ptr
             + last_query * c128_page_indices_stride
             + c128_idx
         )
-        tl.store(flat_token_ids_ptr + c128_idx, tl.maximum(page_id, 0))
+        tl.store(
+            flat_token_ids_ptr + compressed_base + c128_idx,
+            tl.maximum(page_id, 0),
+        )
 
     start_pos = seq_len - query_len
     for token_idx in range(worker_id, query_len, num_workers):
         pos = start_pos + token_idx
         topk_len = tl.minimum((pos + 1) // 128, C128_MAX)
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
-        combined_row = token_idx.to(tl.int64) * combined_indices_stride
+        global_token_idx = query_start + token_idx
+        combined_row = global_token_idx.to(tl.int64) * combined_indices_stride
 
         all_offsets = tl.arange(0, PADDED_COMBINED)
         is_topk = all_offsets < topk_len
         is_swa = (all_offsets >= topk_len) & (
             all_offsets < topk_len + swa_len
         )
-        swa_offset = all_offsets - topk_len
+        swa_lane = all_offsets - topk_len
         swa_value = (
-            C128_MAX + swa_offset + pos - swa_len + 1 - gather_start
+            total_compressed
+            + swa_base_offset
+            + swa_lane
+            + pos
+            - swa_len
+            + 1
+            - gather_start
         )
         combined_value = tl.where(
             is_topk,
-            all_offsets,
+            compressed_base + all_offsets,
             tl.where(is_swa, swa_value, -1),
         )
         tl.store(
@@ -254,7 +306,7 @@ def _rebuild_batch1_c128_replay_kernel(
             combined_value,
             mask=all_offsets < COMBINED_WIDTH,
         )
-        tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
+        tl.store(combined_lens_ptr + global_token_idx, topk_len + swa_len)
 
 
 @triton.jit(do_not_specialize=["top_k"])

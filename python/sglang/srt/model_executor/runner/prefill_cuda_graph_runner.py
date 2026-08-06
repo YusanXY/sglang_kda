@@ -265,7 +265,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Set before resolve_prefill_backend — TcPiecewise's _run_compile_pass
         # calls back into capture_prepare which reads this. Full overrides below
         # once the backend type is known.
-        self._capture_req_slots = 1
+        self._dsv4_req16_capture = (
+            getattr(model_runner.server_args, "attention_backend", None) == "dsv4"
+            and 65536 in self.capture_num_tokens
+        )
+        # Breakable CG historically models a token bucket as one request.  The
+        # strict high-load Huge bucket is instead 16 request-local 4096-token
+        # chunks in one M=65536 forward, so capture must preserve those request
+        # boundaries for causal/indexer/SWA geometry.
+        self._capture_req_slots = 16 if self._dsv4_req16_capture else 1
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
@@ -676,10 +684,20 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         Returns ``(forward_batch, attn_backend)`` to mirror decode's
         capture_prepare signature.
         """
-        bs = self._capture_req_slots
-        # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
-        lens_cpu = [num_tokens] + [0] * (bs - 1)
-        start_loc_cpu = [0] + [num_tokens] * (bs - 1)
+        if self._dsv4_req16_capture and num_tokens == 65536:
+            bs = 16
+            if self._capture_req_slots != 16:
+                raise RuntimeError(
+                    "DSV4 Huge req16 Graph capture requires req=16, M=65536"
+                )
+            lens_cpu = [4096] * bs
+            start_loc_cpu = [i * 4096 for i in range(bs)]
+        else:
+            bs = 1
+            # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length
+            # sentinels for the generic request-padded graph contract.
+            lens_cpu = [num_tokens] + [0] * (bs - 1)
+            start_loc_cpu = [0] + [num_tokens] * (bs - 1)
 
         with torch.device(self.device):
             shape_inputs = {

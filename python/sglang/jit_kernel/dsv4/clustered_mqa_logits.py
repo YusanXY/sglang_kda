@@ -23,7 +23,9 @@ HEADS = 64
 HEAD_DIM = 128
 PAGE_SIZE = 64
 QUERIES_PER_CLUSTER = 16
-MAX_TOTAL_Q = 4096
+# One true req=16 high-load forward contributes 16*4096 query rows.  This is
+# a capacity bound only; req=1 continues to take an exact 4096-row view.
+MAX_TOTAL_Q = 65536
 MAX_C4_CONTEXT = 18432
 
 _HERE = Path(__file__).resolve().parent

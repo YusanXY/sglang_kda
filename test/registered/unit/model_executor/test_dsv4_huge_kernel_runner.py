@@ -43,6 +43,7 @@ def _server_args(**overrides):
         nnodes=1,
         max_running_requests=1,
         max_total_tokens=73728,
+        max_prefill_tokens=4096,
         chunked_prefill_size=4096,
         page_size=256,
         moe_runner_backend="flashinfer_mxfp4",
@@ -51,7 +52,7 @@ def _server_args(**overrides):
         speculative_algorithm=None,
         disable_overlap_schedule=True,
         cuda_graph_config=SimpleNamespace(
-            prefill=SimpleNamespace(backend="disabled"),
+            prefill=SimpleNamespace(backend="disabled", bs=None),
             decode=SimpleNamespace(backend="disabled"),
         ),
         enable_mixed_chunk=False,
@@ -140,10 +141,55 @@ def test_startup_contract_rejects_unsupported_or_mismatched_gpu_without_fallback
         )
 
 
-def test_startup_contract_rejects_any_enabled_cuda_graph_phase():
+def test_startup_contract_accepts_exact_breakable_prefill_graph_bucket():
     args = _server_args()
     args.cuda_graph_config.prefill.backend = "breakable"
-    with pytest.raises(ValueError, match="CUDA graphs"):
+    args.cuda_graph_config.prefill.bs = [4096]
+    validate_dsv4_huge_kernel_startup(
+        server_args=args,
+        model_config=_flash_model_config(),
+        gpu_id=0,
+        device_name="NVIDIA B200",
+        device_capability=(10, 0),
+    )
+
+
+def test_startup_contract_accepts_dual_high_load_graph_buckets():
+    args = _server_args(
+        max_running_requests=16,
+        max_prefill_tokens=65536,
+        chunked_prefill_size=65536,
+        max_total_tokens=331776,
+    )
+    args.cuda_graph_config.prefill.backend = "breakable"
+    args.cuda_graph_config.prefill.bs = [4096, 65536]
+    validate_dsv4_huge_kernel_startup(
+        server_args=args,
+        model_config=_flash_model_config(),
+        gpu_id=0,
+        device_name="NVIDIA B300 SXM6 AC",
+        device_capability=(10, 3),
+    )
+
+
+def test_startup_contract_rejects_non_exact_graph_bucket_without_fallback():
+    args = _server_args()
+    args.cuda_graph_config.prefill.backend = "breakable"
+    args.cuda_graph_config.prefill.bs = [4096, 65536]
+    with pytest.raises(ValueError, match="exact buckets"):
+        validate_dsv4_huge_kernel_startup(
+            server_args=args,
+            model_config=_flash_model_config(),
+            gpu_id=0,
+            device_name="NVIDIA B200",
+            device_capability=(10, 0),
+        )
+
+
+def test_startup_contract_rejects_decode_graph():
+    args = _server_args()
+    args.cuda_graph_config.decode.backend = "piecewise"
+    with pytest.raises(ValueError, match="decode CUDA graph"):
         validate_dsv4_huge_kernel_startup(
             server_args=args,
             model_config=_flash_model_config(),
@@ -180,6 +226,18 @@ def test_dynamic_contract_accepts_high_load_aggregate_m4096(
             batch_size=batch_size,
             extend_num_tokens=4096,
             extend_seq_lens_cpu=extend_lens,
+        )
+    )
+
+
+def test_dynamic_contract_accepts_true_req16_m65536():
+    validate_dsv4_huge_kernel_forward(
+        SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            global_forward_mode=ForwardMode.EXTEND,
+            batch_size=16,
+            extend_num_tokens=65536,
+            extend_seq_lens_cpu=[4096] * 16,
         )
     )
 
@@ -237,12 +295,22 @@ def test_bench_contract_requires_single_prefill_ttft_point():
     )
     validate_dsv4_huge_kernel_bench_args(
         SimpleNamespace(
-            batch_size=(128,),
-            input_len=(4096,),
+            batch_size=(16,),
+            input_len=(20480,),
             output_len=(1,),
+            cache_hit_rate=0.8,
             correctness_test=False,
         )
     )
+    with pytest.raises(ValueError, match="aggregate uncached tokens"):
+        validate_dsv4_huge_kernel_bench_args(
+            SimpleNamespace(
+                batch_size=(128,),
+                input_len=(4096,),
+                output_len=(1,),
+                correctness_test=False,
+            )
+        )
     with pytest.raises(ValueError, match="batch-size"):
         validate_dsv4_huge_kernel_bench_args(
             SimpleNamespace(
