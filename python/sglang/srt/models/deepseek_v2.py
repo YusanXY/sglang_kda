@@ -293,6 +293,16 @@ class DeepseekV2MLP(nn.Module):
         )
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
+        self._fused_swiglu_mxfp8_checked = False
+        self._fused_swiglu_mxfp8 = False
+        self._fused_swiglu_mxfp8_flashinfer_128x4 = False
+        self._fused_swiglu_quant_group_size = 0
+        self._dsv4_huge_runtime = None
+
+    def bind_dsv4_huge_runtime(self, runtime) -> None:
+        """Bind the model-scoped GPU workspace used by strict DSV4 Huge."""
+
+        self._dsv4_huge_runtime = runtime
 
     def forward(
         self,
@@ -300,7 +310,8 @@ class DeepseekV2MLP(nn.Module):
         forward_batch=None,
         gemm_output_zero_allocator: BumpAllocator = None,
     ):
-        if (self.tp_size == 1) and x.shape[0] == 0:
+        x_rows = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
+        if (self.tp_size == 1) and x_rows == 0:
             return x
 
         if (
@@ -330,15 +341,123 @@ class DeepseekV2MLP(nn.Module):
 
         if (
             gemm_output_zero_allocator is not None
-            and x.shape[0] <= 256
+            and not isinstance(x, tuple)
+            and x_rows <= 256
             and self.gate_up_proj.weight.dtype == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
-                x.shape[0] * self.gate_up_proj.output_size_per_partition
-            ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
+                x_rows * self.gate_up_proj.output_size_per_partition
+            ).view(x_rows, self.gate_up_proj.output_size_per_partition)
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
+        # Fuse the BF16-rounded SiLU/clamp epilogue directly with the exact
+        # activation format consumed by the down projection. DSV4 Flash can
+        # expose either MXFP8 group-32 or block-FP8 group-128 weights here;
+        # both DeepGEMM paths accept a prequantized tuple without a Host-side
+        # format conversion.
+        if not self._fused_swiglu_mxfp8_checked:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+            from sglang.srt.layers.quantization.fp8_utils import (
+                get_fp8_gemm_runner_backend,
+            )
+
+            down_quant = getattr(self.down_proj, "quant_method", None)
+            fp8_backend = get_fp8_gemm_runner_backend()
+            effective_deep_gemm = fp8_backend.is_deep_gemm() or (
+                fp8_backend.is_auto() and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            )
+            down_is_mxfp8 = isinstance(down_quant, Fp8LinearMethod) and (
+                down_quant.use_mxfp8
+            )
+            down_is_block_fp8 = isinstance(down_quant, Fp8LinearMethod) and (
+                down_quant.block_quant
+                and list(down_quant.weight_block_size) == [128, 128]
+            )
+            self._fused_swiglu_mxfp8_flashinfer_128x4 = (
+                down_is_mxfp8
+                and (
+                    fp8_backend.is_flashinfer_cutlass()
+                    or fp8_backend.is_flashinfer_trtllm()
+                )
+            )
+            self._fused_swiglu_quant_group_size = 32 if down_is_mxfp8 else 128
+            self._fused_swiglu_mxfp8 = (
+                get_server_args().dsv4_worker_backend == "huge_kernel"
+                and self.swiglu_limit is not None
+                and not self.down_proj.reduce_results
+                and (down_is_mxfp8 or down_is_block_fp8)
+                and (
+                    (
+                        effective_deep_gemm
+                        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                    )
+                    or self._fused_swiglu_mxfp8_flashinfer_128x4
+                )
+            )
+            self._fused_swiglu_mxfp8_checked = True
+
+        if self._fused_swiglu_mxfp8:
+            M, N = gate_up.shape
+            hidden_dim = N // 2
+            quant_group_size = self._fused_swiglu_quant_group_size
+            huge_runtime = self._dsv4_huge_runtime
+            if huge_runtime is not None:
+                if self._fused_swiglu_mxfp8_flashinfer_128x4:
+                    raise RuntimeError(
+                        "DSV4 Huge shared workspace requires the DeepGEMM "
+                        "group-128 activation ABI, not FlashInfer 128x4"
+                    )
+                if hidden_dim != 512 or quant_group_size != 128:
+                    raise RuntimeError(
+                        "DSV4 Huge shared workspace requires hidden_dim=512 "
+                        f"and group_size=128, got {hidden_dim} and "
+                        f"{quant_group_size}"
+                    )
+                descriptor = huge_runtime.active_descriptor
+                down_input_fp8 = descriptor.shared_down_fp8
+                down_input_scale = descriptor.shared_down_scale
+                if down_input_fp8.shape != (M, hidden_dim):
+                    raise RuntimeError(
+                        "DSV4 Huge shared workspace shape mismatch: "
+                        f"{tuple(down_input_fp8.shape)} != {(M, hidden_dim)}"
+                    )
+            else:
+                down_input_fp8 = gate_up.new_empty(
+                    (M, hidden_dim), dtype=torch.float8_e4m3fn
+                )
+            if huge_runtime is None and self._fused_swiglu_mxfp8_flashinfer_128x4:
+                padded_m = (M + 127) // 128 * 128
+                padded_scale_cols = (
+                    hidden_dim // quant_group_size + 3
+                ) // 4 * 4
+                down_input_scale = torch.empty(
+                    padded_m * padded_scale_cols,
+                    dtype=torch.uint8,
+                    device=gate_up.device,
+                )
+            elif huge_runtime is None:
+                down_input_scale = create_per_token_group_quant_fp8_output_scale(
+                    x_shape=(M, hidden_dim),
+                    device=gate_up.device,
+                    group_size=quant_group_size,
+                    column_major_scales=True,
+                    scale_tma_aligned=True,
+                    scale_ue8m0=True,
+                )
+            silu_and_mul_contig_post_quant(
+                input=gate_up,
+                output=down_input_fp8,
+                output_scale=down_input_scale,
+                quant_group_size=quant_group_size,
+                scale_ue8m0=True,
+                transposed=not self._fused_swiglu_mxfp8_flashinfer_128x4,
+                flashinfer_128x4=self._fused_swiglu_mxfp8_flashinfer_128x4,
+                swiglu_limit=float(self.swiglu_limit),
+            )
+            down_output, _ = self.down_proj((down_input_fp8, down_input_scale))
+            return down_output
+
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -867,15 +986,36 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        shared_x_quant=None,
+        routed_x_quant=None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
+            if shared_x_quant is not None or routed_x_quant is not None:
+                raise RuntimeError(
+                    "DSV4 Huge shared prequantization is incompatible with mega MoE"
+                )
             return forward_mega_moe(
                 self,
                 hidden_states,
                 forward_batch,
                 input_ids_global=input_ids_global,
+            )
+
+        if shared_x_quant is not None or routed_x_quant is not None:
+            if self._enable_a2a_moe:
+                raise RuntimeError(
+                    "DSV4 Huge shared prequantization is incompatible with A2A MoE"
+                )
+            return self.forward_normal(
+                hidden_states,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                shared_x_quant=shared_x_quant,
+                routed_x_quant=routed_x_quant,
             )
 
         if not self._enable_a2a_moe:
@@ -1027,6 +1167,8 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        shared_x_quant=None,
+        routed_x_quant=None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1050,7 +1192,9 @@ class DeepseekV2MoE(nn.Module):
                 and not skip_shared_experts
             ):
                 shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator
+                    hidden_states,
+                    gemm_output_zero_allocator,
+                    x_quant=shared_x_quant,
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
@@ -1082,7 +1226,9 @@ class DeepseekV2MoE(nn.Module):
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self._forward_shared_experts(
-                        hidden_states, gemm_output_zero_allocator
+                        hidden_states,
+                        gemm_output_zero_allocator,
+                        x_quant=shared_x_quant,
                     )
 
                 pre_combine_hook_handle.remove()
@@ -1101,9 +1247,36 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
+        fuse_moe_shared_finalize = (
+            get_server_args().dsv4_worker_backend == "huge_kernel"
+            and hidden_states.shape[0] > 0
+            and hasattr(self, "shared_experts")
+            and self.num_fused_shared_experts == 0
+            and not self._fuse_shared_experts_inside_sbo
+            and not skip_shared_experts
+            and not self._shared_expert_tp1
+            and routed_x_quant is not None
+        )
+        if fuse_moe_shared_finalize:
+            if defer_shared or shared_output is None:
+                raise RuntimeError(
+                    "DSV4 Huge in-launcher MoE finalize requires shared experts "
+                    "to be issued before routed experts"
+                )
+            if len(routed_x_quant) != 2:
+                raise RuntimeError("invalid DSV4 Huge routed prequant descriptor")
+            moe_prequant = (
+                routed_x_quant[0],
+                routed_x_quant[1],
+                shared_output,
+                self.routed_scaling_factor,
+            )
+        else:
+            moe_prequant = routed_x_quant
         final_hidden_states = self.experts(
             hidden_states,
             topk_output,
+            prequant=moe_prequant,
         )
         if (
             not _is_cuda
@@ -1122,15 +1295,18 @@ class DeepseekV2MoE(nn.Module):
             and not skip_shared_experts
         ):
             shared_output = self._forward_shared_experts(
-                hidden_states, gemm_output_zero_allocator
+                hidden_states,
+                gemm_output_zero_allocator,
+                x_quant=shared_x_quant,
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if not fuse_moe_shared_finalize:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -1426,11 +1602,16 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def _forward_shared_experts(
-        self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
+        self,
+        hidden_states,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        *,
+        x_quant=None,
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             return self.shared_experts(
-                hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
+                x_quant if x_quant is not None else hidden_states,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
             )
         else:
             return None

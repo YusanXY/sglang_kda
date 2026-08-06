@@ -90,8 +90,9 @@ def moe_fused_gate_jit(
 def _router_triton_kernel(
     scores_ptr,  # [M, N] fp32, GEMM output (raw logits)
     bias_ptr,  # [N]    fp32
-    out_weights_ptr,  # [M, K] fp32
+    out_weights_ptr,  # [M, K] fp32 or bf16
     out_indices_ptr,  # [M, K] int32
+    packed_out_ptr,  # [M, K] int32, optional fused FlashInfer carrier
     M,
     routed_scaling_factor,
     moe_softcapping,
@@ -110,12 +111,15 @@ def _router_triton_kernel(
     RENORMALIZE: tl.constexpr,
     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
     USE_PDL: tl.constexpr,
+    HAS_PACKED_OUT: tl.constexpr,
     stride_sm,
     stride_sn,
     stride_wm,
     stride_wk,
     stride_im,
     stride_ik,
+    stride_pm,
+    stride_pk,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
@@ -249,6 +253,19 @@ def _router_triton_kernel(
     store_mask = mask_m[:, None] & mask_k_total[None, :]
     tl.store(out_w_ptr, selected_vals, mask=store_mask)
     tl.store(out_i_ptr, selected_idx, mask=store_mask)
+    if HAS_PACKED_OUT:
+        # Match PackTopkIds exactly: expert id in the high 16 bits and the
+        # rounded BF16 routing weight bits in the low 16 bits.
+        weight_bf16 = selected_vals.to(tl.bfloat16)
+        weight_i16 = weight_bf16.to(tl.int16, bitcast=True)
+        weight_i32 = weight_i16.to(tl.int32) & 0xFFFF
+        packed = (selected_idx.to(tl.int32) << 16) | weight_i32
+        packed_ptr = (
+            packed_out_ptr
+            + offs_m[:, None] * stride_pm
+            + offs_k[None, :] * stride_pk
+        )
+        tl.store(packed_ptr, packed, mask=store_mask)
 
 
 @debug_kernel_api
@@ -264,6 +281,7 @@ def moe_fused_gate(
     moe_softcapping: float = 0.0,
     num_expert_group: int = 1,
     topk_group: int = 1,
+    packed_out: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -301,6 +319,12 @@ def moe_fused_gate(
 
     weights = torch.empty((M, K), dtype=torch.float32, device=scores.device)
     indices = torch.empty((M, K), dtype=torch.int32, device=scores.device)
+    if packed_out is not None:
+        assert packed_out.shape == (M, K)
+        assert packed_out.dtype == torch.int32
+        assert packed_out.device == scores.device
+        assert packed_out.is_contiguous()
+    packed_arg = indices if packed_out is None else packed_out
 
     BLOCK_N = triton.next_power_of_2(N)  # 256 -> 256, 384 -> 512
     BLOCK_K = triton.next_power_of_2(K)  # 6 -> 8, 8 -> 8
@@ -318,6 +342,7 @@ def moe_fused_gate(
         bias,
         weights,
         indices,
+        packed_arg,
         M,
         float(routed_scaling_factor),
         float(moe_softcapping),
@@ -336,12 +361,15 @@ def moe_fused_gate(
         RENORMALIZE=bool(renormalize),
         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
         USE_PDL=use_pdl,
+        HAS_PACKED_OUT=packed_out is not None,
         stride_sm=scores.stride(0),
         stride_sn=scores.stride(1),
         stride_wm=weights.stride(0),
         stride_wk=weights.stride(1),
         stride_im=indices.stride(0),
         stride_ik=indices.stride(1),
+        stride_pm=packed_arg.stride(0),
+        stride_pk=packed_arg.stride(1),
         num_warps=num_warps,
         **extra,
     )

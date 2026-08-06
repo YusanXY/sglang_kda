@@ -467,8 +467,11 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
         w8a8_mxfp8_matmul_deepgemm,
     )
 
-    assert input_scale is None
-    output_dtype = input.dtype
+    # Huge DSV4 fused epilogues may already have produced the exact MXFP8
+    # activation and packed UE8M0 scale layout consumed by DeepGEMM.  Keep the
+    # tuple on device and skip the otherwise mandatory standalone quant launch.
+    prequantized = input_scale is not None
+    output_dtype = torch.bfloat16 if prequantized else input.dtype
 
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
     dtype_supported = output_dtype == torch.bfloat16
@@ -481,13 +484,21 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d,
-        32,
-        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    if prequantized:
+        if input_2d.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "prequantized DeepGEMM MXFP8 input must use float8_e4m3fn, "
+                f"got {input_2d.dtype}"
+            )
+        q_input, x_scale = input_2d, input_scale
+    else:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            32,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
 
     # weight_scale format is set per-backend by _process_mxfp8_linear_weight_scale
     # (int32 packed TMA-aligned on Blackwell, float32 on Hopper); NOT uint8 — Triton form is routed to the fallback above.
@@ -789,15 +800,22 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert input_scale is None
-
-    output_dtype = input.dtype
+    # DSV4 Huge may fuse the preceding RMSNorm with this activation quantizer
+    # and pass the exact TMA-aligned UE8M0 scale tensor as a tuple.  Preserve
+    # BF16 as the GEMM output type even though the prequantized input is FP8.
+    prequantized = input_scale is not None
+    output_dtype = torch.bfloat16 if prequantized else input.dtype
     dtype_supported = output_dtype == torch.bfloat16
 
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
     if not (shape_supported and dtype_supported):
+        if prequantized:
+            raise RuntimeError(
+                "prequantized block-FP8 input requires the DeepGEMM shape and "
+                "BF16 output contract; runtime fallback is forbidden"
+            )
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32
@@ -813,7 +831,19 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    if not _is_musa:
+    if prequantized:
+        if input_2d.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                "prequantized DeepGEMM block-FP8 input must use "
+                f"float8_e4m3fn, got {input_2d.dtype}"
+            )
+        if input_scale.dtype != torch.int32:
+            raise TypeError(
+                "prequantized Blackwell block-FP8 scale must use packed "
+                f"UE8M0 int32 storage, got {input_scale.dtype}"
+            )
+        q_input, x_scale = input_2d, input_scale
+    elif not _is_musa:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d,
             block_size[1],

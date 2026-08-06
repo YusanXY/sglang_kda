@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -45,12 +46,40 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 )
 
 _DSV4_MOE_OVERLAP_INSTALLED = False
+_FLASHINFER_CUBIN_OVERLAY_INSTALLED = False
+
+
+def _install_writable_flashinfer_cubin_overlay() -> None:
+    """Stage writable JIT include links when flashinfer-cubin is read-only."""
+    global _FLASHINFER_CUBIN_OVERLAY_INSTALLED
+
+    if _FLASHINFER_CUBIN_OVERLAY_INSTALLED:
+        return
+
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.cubin_loader import ensure_symlink
+
+    packaged_dir = jit_env.FLASHINFER_CUBIN_DIR
+    if os.access(packaged_dir, os.W_OK):
+        _FLASHINFER_CUBIN_OVERLAY_INSTALLED = True
+        return
+
+    overlay_dir = jit_env.FLASHINFER_WORKSPACE_DIR / "cubin_overlay"
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    for artifact in packaged_dir.iterdir():
+        ensure_symlink(overlay_dir / artifact.name, artifact)
+
+    # FlashInfer's generator reads this value dynamically for include staging.
+    # Its artifact loader keeps reading the immutable packaged directory.
+    jit_env.FLASHINFER_CUBIN_DIR = overlay_dir
+    _FLASHINFER_CUBIN_OVERLAY_INSTALLED = True
 
 
 def _install_dsv4_huge_moe_overlap() -> None:
     """Select the Huge-only TRTLLM MoE module before FlashInfer builds it."""
     global _DSV4_MOE_OVERLAP_INSTALLED
 
+    _install_writable_flashinfer_cubin_overlay()
     if get_server_args().dsv4_worker_backend != "huge_kernel":
         return
     if _DSV4_MOE_OVERLAP_INSTALLED:
@@ -287,6 +316,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self,
         layer: Module,
         dispatch_output: DispatchOutput,
+        prequant=None,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -318,7 +348,16 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         else:
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
-        packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
+        if get_server_args().dsv4_worker_backend == "huge_kernel":
+            packed_topk = getattr(topk_output, "packed_topk_ids", None)
+            if packed_topk is None:
+                layer_id = getattr(layer, "layer_id", None)
+                raise RuntimeError(
+                    "DSV4 Huge requires fused packed routing for every MoE layer; "
+                    f"layer_id={layer_id}, got {type(topk_output).__name__}"
+                )
+        else:
+            packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
 
         precision = self.flashinfer_mxfp4_moe_precision
         if precision == "bf16":
@@ -334,12 +373,47 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     value=0.0,
                 )
         elif precision == "default":
-            x_quant, x_scale = mxfp8_quantize(
-                hidden_states,
-                False,
-                alignment=hidden_size,
-                backend=_MXFP8_QUANTIZE_BACKEND,
-            )
+            if prequant is None:
+                x_quant, x_scale = mxfp8_quantize(
+                    hidden_states,
+                    False,
+                    alignment=hidden_size,
+                    backend=_MXFP8_QUANTIZE_BACKEND,
+                )
+            else:
+                if get_server_args().dsv4_worker_backend != "huge_kernel":
+                    raise RuntimeError(
+                        "routed-MoE prequantization is restricted to DSV4 Huge"
+                    )
+                if len(prequant) == 2:
+                    x_quant, x_scale = prequant
+                    shared_output = None
+                    routed_scaling_factor = None
+                elif len(prequant) == 4:
+                    (
+                        x_quant,
+                        x_scale,
+                        shared_output,
+                        routed_scaling_factor,
+                    ) = prequant
+                else:
+                    raise RuntimeError(
+                        "DSV4 Huge routed-MoE prequant must have 2 or 4 tensors/values"
+                    )
+                expected_scale_shape = (hidden_states.shape[0], hidden_size // 32)
+                if (
+                    x_quant.shape != hidden_states.shape
+                    or x_quant.dtype != torch.float8_e4m3fn
+                    or not x_quant.is_contiguous()
+                    or x_quant.device != hidden_states.device
+                    or x_scale.shape != expected_scale_shape
+                    or x_scale.dtype != torch.uint8
+                    or not x_scale.is_contiguous()
+                    or x_scale.device != hidden_states.device
+                ):
+                    raise RuntimeError(
+                        "invalid DSV4 Huge routed-MoE MXFP8 prequant workspace"
+                    )
             x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
                 *hidden_states.shape[:-1], -1
             )
@@ -359,6 +433,23 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
             )
 
+        if prequant is not None and shared_output is not None:
+            if (
+                shared_output.shape != (num_tokens, out_hidden_size)
+                or shared_output.dtype != torch.bfloat16
+                or not shared_output.is_contiguous()
+                or shared_output.device != x_quant.device
+                or routed_scaling_factor is None
+            ):
+                raise RuntimeError(
+                    "invalid DSV4 Huge shared-output finalize descriptor"
+                )
+            from sglang.jit_kernel.dsv4_moe_overlap.jit import (
+                set_dsv4_shared_finalize,
+            )
+
+            set_dsv4_shared_finalize(shared_output, routed_scaling_factor)
+
         output = trtllm_fp4_block_scale_routed_moe(
             topk_ids=packed_topk,
             routing_bias=None,
@@ -377,7 +468,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
             output2_scale_scalar=layer.output2_scale_scalar,
             num_experts=layer.num_experts,
-            top_k=packed_topk.shape[1],
+            top_k=topk_ids.shape[1],
             n_group=1,
             topk_group=1,
             intermediate_size=intermediate_size,

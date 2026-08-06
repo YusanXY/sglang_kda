@@ -77,16 +77,27 @@ def test_inverse_rope_fp8_wo_a_matches_two_kernel_boundary(
     expected_q, expected_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(
         reference
     )
+    import deep_gemm
+
+    expected_s = torch.stack(
+        [
+            deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                expected_s[:, group]
+            ).transpose(0, 1)
+            for group in range(2)
+        ]
+    ).permute(2, 0, 1)[:num_tokens]
 
     output_q = torch.empty(
         source.shape,
         device=device,
         dtype=torch.float8_e4m3fn,
     )
+    aligned_tokens = (num_tokens + 3) // 4 * 4
     output_s_storage = torch.empty(
-        (2, num_tokens, 32),
+        (2, 8, aligned_tokens),
         device=device,
-        dtype=torch.float32,
+        dtype=torch.int32,
     )
     actual_q, actual_s = inverse_rope_fp8_wo_a_ue8m0(
         source,
@@ -122,7 +133,7 @@ def test_inverse_rope_fp8_wo_a_rejects_wrong_shape() -> None:
     freqs = _freqs(2, x.device)
     positions = torch.zeros(1, device=x.device, dtype=torch.int32)
     output_q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    output_s_storage = torch.empty(1, 1, 32, device=x.device, dtype=torch.float32)
+    output_s_storage = torch.empty(1, 8, 4, device=x.device, dtype=torch.int32)
     with pytest.raises(RuntimeError, match=r"requires \[T, 2, 4096\]"):
         inverse_rope_fp8_wo_a_ue8m0(
             x,

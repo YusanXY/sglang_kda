@@ -32,7 +32,10 @@ def _jit_hash_topk_module():
         make_name("hash_topk"),
         *args,
         cuda_files=["deepseek_v4/hash_topk.cuh"],
-        cuda_wrappers=[("hash_topk", f"HashTopKKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("hash_topk", f"HashTopKKernel<{args}>::run"),
+            ("hash_topk_packed", f"HashTopKPackedKernel<{args}>::run"),
+        ],
     )
 
 
@@ -74,12 +77,14 @@ def _jit_silu_mul_quant_varlen_module(
 def _jit_silu_mul_quant_contig_module(
     quant_group_size: int,
     scale_ue8m0: bool,
+    flashinfer_128x4: bool,
     swizzle: bool,
     apply_swiglu_limit: bool,
 ):
     args = make_cpp_args(
         quant_group_size,
         scale_ue8m0,
+        flashinfer_128x4,
         swizzle,
         is_arch_support_pdl(),
         apply_swiglu_limit,
@@ -116,6 +121,7 @@ def hash_topk(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: float = 1.0,
     scoring_func: str = "sqrtsoftplus",
+    packed_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert scoring_func == "sqrtsoftplus"
     if is_hip_runtime():
@@ -140,14 +146,25 @@ def hash_topk(
             (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
         )
         module = _jit_hash_topk_module()
-        module.hash_topk(
-            router_logits,
-            input_ids,
-            tid2eid,
-            topk_weights,
-            topk_ids,
-            routed_scaling_factor,
-        )
+        if packed_out is None:
+            module.hash_topk(
+                router_logits,
+                input_ids,
+                tid2eid,
+                topk_weights,
+                topk_ids,
+                routed_scaling_factor,
+            )
+        else:
+            module.hash_topk_packed(
+                router_logits,
+                input_ids,
+                tid2eid,
+                topk_weights,
+                topk_ids,
+                packed_out,
+                routed_scaling_factor,
+            )
         return topk_weights, topk_ids
 
 
@@ -221,17 +238,23 @@ def silu_and_mul_contig_post_quant(
     quant_group_size: int,
     scale_ue8m0: bool = False,
     transposed: bool = False,
+    flashinfer_128x4: bool = False,
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
     module = _jit_silu_mul_quant_contig_module(
-        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
+        quant_group_size,
+        scale_ue8m0,
+        flashinfer_128x4,
+        swizzle,
+        apply_swiglu_limit,
     )
     module.run(
         input,
         output,
         output_scale,
         transposed,
+        flashinfer_128x4,
         float(swiglu_limit) if apply_swiglu_limit else 0.0,
     )

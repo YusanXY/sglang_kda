@@ -1214,11 +1214,21 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        *,
+        prequant=None,
+    ):
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        if prequant is not None:
+            return self.forward_impl(
+                hidden_states, topk_output, prequant=prequant
+            )
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
@@ -1246,7 +1256,13 @@ class FusedMoE(torch.nn.Module):
         else:
             return self.forward_impl(hidden_states, topk_output)
 
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        *,
+        prequant=None,
+    ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1256,6 +1272,7 @@ class FusedMoE(torch.nn.Module):
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
+            prequant=prequant,
         )
 
         with use_symmetric_memory(
@@ -1290,8 +1307,16 @@ class FusedMoE(torch.nn.Module):
 
         return self.dispatcher.combine(combine_input=combine_input)
 
-    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+    def run_moe_core(
+        self, dispatch_output: DispatchOutput, *, prequant=None
+    ) -> CombineInput:
         # TODO: consider using symmetric memory
+        if prequant is not None:
+            return self.quant_method.apply(
+                layer=self,
+                dispatch_output=dispatch_output,
+                prequant=prequant,
+            )
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,

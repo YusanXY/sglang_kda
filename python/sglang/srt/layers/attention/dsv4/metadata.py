@@ -192,6 +192,18 @@ class PagedIndexerMetadata:
             copy_fields = ["page_table", "c4_seq_lens"]
             assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
         else:
+            # Huge normally prefers its clustered Q16 schedule and therefore
+            # leaves DeepGEMM metadata lazy. Breakable CUDA Graph deliberately
+            # captures the graph-safe DeepGEMM C4 specialization instead. Its
+            # capture object has a stable metadata tensor after warmup, while
+            # each replay's freshly planned source still starts as None.
+            # Materialize the live schedule before the in-place copy so replay
+            # updates the captured address instead of allocating/rebinding it.
+            if (
+                self.deep_gemm_metadata is not None
+                and other.deep_gemm_metadata is None
+            ):
+                other.ensure_deep_gemm_metadata()
             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
             assign_fields = ["nonpaged_plan"]
         copy_fields += ["topk_metadata"]

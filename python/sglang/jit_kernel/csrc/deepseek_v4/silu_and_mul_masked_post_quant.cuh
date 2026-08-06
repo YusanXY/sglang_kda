@@ -366,43 +366,56 @@ struct SiluAndMulClampKernel {
 struct SiluMulQuantContigParams {
   const bf16_t* __restrict__ input;
   fp8_e4m3_t* __restrict__ output;
-  float* __restrict__ output_scale;
+  void* __restrict__ output_scale;
   float swiglu_limit;  // only read when kApplySwigluLimit=true
   int64_t hidden_dim;
   uint32_t num_tokens;
   uint32_t scale_row_stride_int32;  // only used when kTransposed=true
+  uint32_t padded_scale_cols;       // only used by FlashInfer 128x4 layout
 };
 
-template <bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <
+    uint32_t kGroupSize,
+    bool kScaleUE8M0,
+    bool kTransposed,
+    bool kFlashinfer128x4,
+    bool kSwizzle,
+    bool kUsePDL,
+    bool kApplySwigluLimit>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_contig_kernel(const SiluMulQuantContigParams __grid_constant__ params) {
   using namespace device;
 
-  constexpr uint32_t kGroupSize = 128u;
-  constexpr uint32_t kWorkThreads = 16u;
+  static_assert(kGroupSize == 32u || kGroupSize == 64u || kGroupSize == 128u);
+  constexpr uint32_t kWorkThreads = kGroupSize / 8u;
   using InputVec = AlignedVector<bf16x2_t, 4>;
   using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
-  static_assert(8 * kWorkThreads == 128, "Invalid tiling");
+  static_assert(8 * kWorkThreads == kGroupSize, "Invalid tiling");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
+  static_assert(!(kFlashinfer128x4 && !kScaleUE8M0), "FlashInfer layout only supports ue8m0");
+  static_assert(!(kTransposed && kFlashinfer128x4), "scale layouts are mutually exclusive");
 
   const auto token_id = blockIdx.x;
   const auto work_id = threadIdx.x / kWorkThreads;
+  const auto group_lane = threadIdx.x % kWorkThreads;
+
+  if constexpr (kFlashinfer128x4) {
+    if (token_id >= params.num_tokens) {
+      // FlashInfer GEMM reads full 128-row scale tiles. Materialize zero
+      // exponents for padded rows in the same launch, without a Host memset.
+      if (group_lane == 0) {
+        const uint32_t col = work_id;
+        const uint32_t offset = (col % 4u) + (col / 4u) * 512u + (token_id % 32u) * 16u +
+                                ((token_id % 128u) / 32u) * 4u +
+                                (token_id / 128u) * (128u * params.padded_scale_cols);
+        static_cast<uint8_t*>(params.output_scale)[offset] = 0;
+      }
+      return;
+    }
+  }
 
   const auto input = params.input + token_id * params.hidden_dim * 2;
   const auto output = params.output + token_id * params.hidden_dim;
-  [[maybe_unused]]
-  const auto output_scale = [&] {
-    const auto num_groups = params.hidden_dim / kGroupSize;
-    if constexpr (kTransposed) {
-      // Physical layout is (G//4_pad, M_pad) int32; each int32 packs 4
-      // consecutive UE8M0 exponents for the same token. Byte address:
-      //   (work_id / 4) * M_pad * 4  +  token * 4  +  (work_id % 4).
-      const auto base = reinterpret_cast<uint8_t*>(params.output_scale);
-      return base + (work_id / 4u) * (params.scale_row_stride_int32 * 4u) + token_id * 4u + (work_id % 4u);
-    } else {
-      return params.output_scale + token_id * num_groups + work_id;
-    }
-  }();
 
   PDLWaitPrimary<kUsePDL>();
 
@@ -420,7 +433,12 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
-    const auto [x, y] = silu_and_mul<kApplySwigluLimit>(gate_vec[i], up_vec[i], params.swiglu_limit);
+    // Preserve the original two-kernel numerical boundary exactly: the
+    // standalone SiLU kernel writes BF16 and the quant kernel reads BF16.
+    // Keeping this rounding inside registers avoids the HBM round-trip while
+    // retaining model-level token/logit behavior.
+    const auto [x, y] =
+        silu_and_mul<kApplySwigluLimit, false>(gate_vec[i], up_vec[i], params.swiglu_limit);
     results[2 * i + 0] = x;
     results[2 * i + 1] = y;
     local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
@@ -452,26 +470,48 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   PDLTriggerSecondary<kUsePDL>();
 
   out_vec.store(output, threadIdx.x);
-  if constexpr (kTransposed) {
-    *output_scale = ue8m0_exp;
-  } else {
-    *output_scale = scale;
+  if (group_lane == 0) {
+    const auto num_groups = params.hidden_dim / kGroupSize;
+    if constexpr (kFlashinfer128x4) {
+      // FlashInfer SfLayout.layout_128x4. This is the GPU-local equivalent of
+      // compute_sf_index_swizzled_128x4_gpu(row=token, col=group).
+      const uint32_t col = work_id;
+      const uint32_t offset = (col % 4u) + (col / 4u) * 512u + (token_id % 32u) * 16u +
+                              ((token_id % 128u) / 32u) * 4u +
+                              (token_id / 128u) * (128u * params.padded_scale_cols);
+      static_cast<uint8_t*>(params.output_scale)[offset] = static_cast<uint8_t>(ue8m0_exp);
+    } else if constexpr (kTransposed) {
+      const uint32_t offset = (work_id / 4u) * (params.scale_row_stride_int32 * 4u) +
+                              token_id * 4u + (work_id % 4u);
+      static_cast<uint8_t*>(params.output_scale)[offset] = static_cast<uint8_t>(ue8m0_exp);
+    } else {
+      static_cast<float*>(params.output_scale)[token_id * num_groups + work_id] = scale;
+    }
   }
 }
 
-template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <
+    int64_t kGroupSize,
+    bool kScaleUE8M0,
+    bool kFlashinfer128x4,
+    bool kSwizzle,
+    bool kUsePDL,
+    bool kApplySwigluLimit>
 struct SiluAndMulContigPostQuantKernel {
-  static_assert(kGroupSize == 128);
+  static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128);
   static constexpr auto kernel_normal =
-      silu_mul_quant_contig_kernel<kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_contig_kernel<kGroupSize, kScaleUE8M0, false, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
   static constexpr auto kernel_transposed =
-      silu_mul_quant_contig_kernel<true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
+      silu_mul_quant_contig_kernel<kGroupSize, true, true, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
+  static constexpr auto kernel_flashinfer =
+      silu_mul_quant_contig_kernel<kGroupSize, true, false, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
 
   static void
   run(const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView output,
       const tvm::ffi::TensorView output_scale,
       const bool transposed,
+      const bool flashinfer_128x4,
       const double swiglu_limit) {
     using namespace host;
 
@@ -495,9 +535,22 @@ struct SiluAndMulContigPostQuantKernel {
     RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
     RuntimeCheck(hidden_dim % kGroupSize == 0);
     const auto num_groups = static_cast<uint32_t>(hidden_dim / kGroupSize);
+    RuntimeCheck(!(transposed && flashinfer_128x4), "scale layouts are mutually exclusive");
 
     uint32_t scale_row_stride_int32 = 0;
-    if (!transposed) {
+    uint32_t padded_scale_cols = 0;
+    uint32_t launch_tokens = static_cast<uint32_t>(M.unwrap());
+    if (flashinfer_128x4) {
+      RuntimeCheck(kScaleUE8M0, "FlashInfer layout requires scale_ue8m0=true");
+      auto S = SymbolicSize{"FlashInfer scale storage"};
+      TensorMatcher({S}).with_dtype<uint8_t>().with_device(device).verify(output_scale);
+      const uint32_t padded_m = (launch_tokens + 127u) / 128u * 128u;
+      padded_scale_cols = (num_groups + 3u) / 4u * 4u;
+      RuntimeCheck(
+          S.unwrap() == static_cast<int64_t>(padded_m) * padded_scale_cols,
+          "invalid FlashInfer 128x4 scale storage size");
+      launch_tokens = padded_m;
+    } else if (!transposed) {
       G.set_value(num_groups);
       TensorMatcher({M, G})  // (M, G) fp32 natural row-major
           .with_dtype<fp32_t>()
@@ -522,18 +575,24 @@ struct SiluAndMulContigPostQuantKernel {
     const auto params = SiluMulQuantContigParams{
         .input = static_cast<const bf16_t*>(input.data_ptr()),
         .output = static_cast<fp8_e4m3_t*>(output.data_ptr()),
-        .output_scale = static_cast<float*>(output_scale.data_ptr()),
+        .output_scale = output_scale.data_ptr(),
         .swiglu_limit = static_cast<float>(swiglu_limit),
         .hidden_dim = hidden_dim,
         .num_tokens = num_tokens,
         .scale_row_stride_int32 = scale_row_stride_int32,
+        .padded_scale_cols = padded_scale_cols,
     };
 
     const auto num_threads = hidden_dim / 8;
     RuntimeCheck(num_threads % device::kWarpThreads == 0);
-    const auto kernel = transposed ? kernel_transposed : kernel_normal;
-    LaunchKernel(num_tokens, num_threads, device.unwrap())  //
-        .enable_pdl(kUsePDL)(kernel, params);
+    if (flashinfer_128x4) {
+      LaunchKernel(launch_tokens, num_threads, device.unwrap())  //
+          .enable_pdl(kUsePDL)(kernel_flashinfer, params);
+    } else {
+      const auto kernel = transposed ? kernel_transposed : kernel_normal;
+      LaunchKernel(num_tokens, num_threads, device.unwrap())  //
+          .enable_pdl(kUsePDL)(kernel, params);
+    }
   }
 };
 

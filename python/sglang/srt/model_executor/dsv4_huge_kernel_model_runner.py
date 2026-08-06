@@ -38,6 +38,7 @@ DSV4_HUGE_MAX_TOTAL_TOKENS = DSV4_HUGE_MAX_REQUESTS * (
 DSV4_HUGE_TP_SIZE = 4
 DSV4_HUGE_EP_SIZE = 4
 DSV4_FLASH_COMPRESS_RATIOS = (0, 0) + (4, 128) * 20 + (4,)
+DSV4_HUGE_GRAPH_PREFILL_TOKENS = 4096
 
 
 def _is_deepseek_v4_flash(model_config) -> bool:
@@ -147,12 +148,25 @@ def validate_dsv4_huge_kernel_startup(
     if not server_args.disable_overlap_schedule:
         errors.append("--disable-overlap-schedule is required")
     cuda_graph_config = server_args.cuda_graph_config
-    if (
-        cuda_graph_config is None
-        or cuda_graph_config.prefill.backend != Backend.DISABLED
-        or cuda_graph_config.decode.backend != Backend.DISABLED
-    ):
-        errors.append("prefill and decode CUDA graphs must both be disabled")
+    if cuda_graph_config is None:
+        errors.append("cuda_graph_config must be resolved")
+    else:
+        prefill_graph = cuda_graph_config.prefill
+        if prefill_graph.backend not in (Backend.DISABLED, Backend.BREAKABLE):
+            errors.append(
+                "prefill CUDA graph backend must be disabled or breakable, "
+                f"got {prefill_graph.backend!r}"
+            )
+        elif prefill_graph.backend == Backend.BREAKABLE and tuple(
+            prefill_graph.bs or ()
+        ) != (DSV4_HUGE_GRAPH_PREFILL_TOKENS,):
+            errors.append(
+                "huge breakable prefill CUDA graph requires the single exact "
+                f"bucket [{DSV4_HUGE_GRAPH_PREFILL_TOKENS}], got "
+                f"{prefill_graph.bs!r}"
+            )
+        if cuda_graph_config.decode.backend != Backend.DISABLED:
+            errors.append("decode CUDA graph must be disabled")
     if server_args.enable_mixed_chunk:
         errors.append("mixed prefill/decode batches are unsupported")
     if server_args.enable_lora:
@@ -166,7 +180,9 @@ def validate_dsv4_huge_kernel_startup(
         )
 
 
-def validate_dsv4_huge_kernel_forward(forward_batch: ForwardBatch) -> None:
+def validate_dsv4_huge_kernel_forward(
+    forward_batch: ForwardBatch, *, cuda_graph_config=None
+) -> None:
     """Validate the dynamic phase-1 batch shape without device synchronizes."""
 
     if forward_batch.forward_mode is not ForwardMode.EXTEND:
@@ -217,6 +233,16 @@ def validate_dsv4_huge_kernel_forward(forward_batch: ForwardBatch) -> None:
         raise ValueError(
             "sum(extend_seq_lens_cpu) must equal the total EXTEND M without a "
             f"device readback; got lengths={extend_lens!r}, M={num_tokens}"
+        )
+    if (
+        cuda_graph_config is not None
+        and cuda_graph_config.prefill.backend == Backend.BREAKABLE
+        and (batch_size != 1 or num_tokens != DSV4_HUGE_GRAPH_PREFILL_TOKENS)
+    ):
+        raise ValueError(
+            "dsv4 huge breakable prefill CUDA graph currently requires the "
+            "exact captured shape req=1, M=4096; no eager fallback is allowed; "
+            f"got req={batch_size}, M={num_tokens}"
         )
 
 
@@ -307,5 +333,7 @@ class Dsv4HugeKernelModelRunner(ModelRunner):
                 "dsv4 huge_kernel forward called before all whole-layer runners "
                 "were bound"
             )
-        validate_dsv4_huge_kernel_forward(forward_batch)
+        validate_dsv4_huge_kernel_forward(
+            forward_batch, cuda_graph_config=self.server_args.cuda_graph_config
+        )
         return super().forward(forward_batch, *args, **kwargs)

@@ -221,6 +221,7 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    fuse_packed_routing: bool = False
     # Draft-side MoE blocks set this False so they never write the target's
     # process-global routed-experts capture buffer.
     allow_routed_experts_capture: bool = True
@@ -233,14 +234,7 @@ class TopKOutputChecker:
 
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        # ===== TO BE REFACTORED ====
-        # The experimental fused topk+pack carrier only exists under the master switch.
-        if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-            return isinstance(
-                topk_output, (StandardTopKOutput, StandardTopKOutputPacked)
-            )
-        # ===== END TO BE REFACTORED ====
-        return isinstance(topk_output, StandardTopKOutput)
+        return isinstance(topk_output, (StandardTopKOutput, StandardTopKOutputPacked))
 
     @staticmethod
     def format_is_triton_kernels(
@@ -428,6 +422,9 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            fuse_packed_routing=(
+                get_server_args().dsv4_worker_backend == "huge_kernel"
+            ),
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
 
@@ -1116,6 +1113,7 @@ def biased_topk_jit_kernel_impl(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    packed_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -1154,6 +1152,7 @@ def biased_topk_jit_kernel_impl(
             renormalize=renormalize,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            packed_out=packed_out,
         )
         topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(
             torch.int32
@@ -1910,6 +1909,25 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
+    use_dsv4_huge_packed = topk_config.fuse_packed_routing
+    if use_dsv4_huge_packed:
+        if (
+            topk_config.torch_native
+            or expert_location_dispatch_info is not None
+            or num_fused_shared_experts != 0
+            or num_token_non_padded is not None
+            or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        ):
+            raise RuntimeError(
+                "DSV4 Huge fused packed routing received an unsupported TopK path"
+            )
+        packed_topk = torch.empty(
+            (hidden_states.shape[0], top_k),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
     num_routed_topk = top_k - num_fused_shared_experts
@@ -1965,6 +1983,11 @@ def select_experts(
         if scoring_func == "sqrtsoftplus" or (
             scoring_func == "sigmoid" and use_jit_fused_gate
         ):
+            if use_dsv4_huge_packed:
+                if not use_jit_fused_gate:
+                    raise RuntimeError(
+                        "DSV4 Huge requires the fused Triton router for packed routing"
+                    )
             _biased_topk = (
                 biased_topk_jit_kernel_impl if use_jit_fused_gate else biased_topk_impl
             )
@@ -1981,6 +2004,7 @@ def select_experts(
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                **({"packed_out": packed_topk} if packed_topk is not None else {}),
             )
         elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()

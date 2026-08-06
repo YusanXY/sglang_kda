@@ -18,6 +18,7 @@ from .elementwise import (
     fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
     fused_rope_inplace,
+    rmsnorm_mxfp8_quant,
 )
 from .e2e import inverse_rope_fp8_wo_a_ue8m0
 from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
@@ -44,6 +45,7 @@ __all__ = [
     "fused_store_cache",
     "fused_rope_inplace",
     "fused_q_norm_rope",
+    "rmsnorm_mxfp8_quant",
     "fused_q_indexer_rope_first_quant",
     "fused_q_indexer_rope_hadamard_fp4_quant",
     "fused_q_indexer_rope_hadamard_quant",

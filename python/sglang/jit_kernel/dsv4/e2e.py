@@ -26,6 +26,226 @@ _QUANT_GROUP_SIZE = 128
 
 
 @cache_once
+def _jit_mhc_pre_norm_mxfp8_quant_module(threads: int, use_pdl: bool) -> Module:
+    args = make_cpp_args(threads, use_pdl)
+    return load_jit(
+        make_name("mhc_pre_norm_mxfp8_quant"),
+        *args,
+        cuda_files=["deepseek_v4/mhc_pre_norm_mxfp8_quant.cuh"],
+        cuda_wrappers=[
+            (
+                "run",
+                f"MhcPreNormMxfp8QuantKernel<{args}>::run",
+            )
+        ],
+    )
+
+
+def load_mhc_pre_norm_mxfp8_quant_extension(threads: int = 160) -> None:
+    """Compile/load the strict DSV4 mHC producer before the first request."""
+
+    if threads not in (64, 96, 128, 160, 256, 512, 1024):
+        raise RuntimeError(
+            "mHC fused quant threads must be 64/96/128/160/256/512/1024"
+        )
+    _jit_mhc_pre_norm_mxfp8_quant_module(threads, is_arch_support_pdl())
+
+
+@register_custom_op(
+    op_name="dsv4_mhc_pre_norm_mxfp8_quant",
+    mutates_args=[
+        "post_mix",
+        "comb_mix",
+        "layer_input",
+        "output_fp8",
+        "output_scale",
+        "routed_output_fp8",
+        "routed_output_scale",
+    ],
+)
+def _mhc_pre_norm_mxfp8_quant_custom_op(
+    gemm_mul: torch.Tensor,
+    gemm_sq: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    output_fp8: torch.Tensor,
+    output_scale: torch.Tensor,
+    routed_output_fp8: torch.Tensor,
+    routed_output_scale: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    emit_routed_quant: bool,
+    threads: int,
+) -> None:
+    module = _jit_mhc_pre_norm_mxfp8_quant_module(
+        threads, is_arch_support_pdl()
+    )
+    module.run(
+        gemm_mul,
+        gemm_sq,
+        hc_scale,
+        hc_base,
+        residual,
+        norm_weight,
+        post_mix,
+        comb_mix,
+        layer_input,
+        output_fp8,
+        output_scale,
+        routed_output_fp8,
+        routed_output_scale,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult,
+        sinkhorn_repeat,
+        norm_eps,
+        emit_routed_quant,
+    )
+
+
+@debug_kernel_api
+def mhc_pre_norm_mxfp8_quant(
+    gemm_mul: torch.Tensor,
+    gemm_sq: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    layer_input: torch.Tensor,
+    output_fp8: torch.Tensor,
+    output_scale_storage: torch.Tensor,
+    routed_output_fp8: torch.Tensor,
+    routed_output_scale: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    emit_routed_quant: bool,
+    threads: int = 160,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Fuse mHC finalization, following RMSNorm, and block-FP8 quantization.
+
+    This is the strict DSV4-Flash M=4096-oriented producer used immediately
+    before attention/shared-expert block-FP8 linears.  ``output_scale_storage``
+    is DeepGEMM's physical ``[8, align(M,4)]`` packed-UE8M0 layout.
+    """
+
+    m = residual.shape[0]
+    if residual.shape != (m, 4, 4096) or residual.dtype != torch.bfloat16:
+        raise RuntimeError("mHC fused quant requires BF16 residual [M,4,4096]")
+    if gemm_mul.ndim != 3 or gemm_mul.shape[1:] != (m, 24):
+        raise RuntimeError("gemm_mul must be [splits,M,24]")
+    if gemm_sq.shape != gemm_mul.shape[:2]:
+        raise RuntimeError("gemm_sq must be [splits,M]")
+    if gemm_mul.dtype != torch.float32 or gemm_sq.dtype != torch.float32:
+        raise RuntimeError("mHC GEMM partials must be FP32")
+    if hc_scale.shape != (3,) or hc_base.shape != (24,):
+        raise RuntimeError("invalid DSV4 mHC scale/base shape")
+    if norm_weight.shape != (4096,) or norm_weight.dtype != torch.bfloat16:
+        raise RuntimeError("mHC fused quant requires BF16 norm weight [4096]")
+    if threads not in (64, 96, 128, 160, 256, 512, 1024):
+        raise RuntimeError(
+            "mHC fused quant threads must be 64/96/128/160/256/512/1024"
+        )
+    expected = (
+        (post_mix, (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (layer_input, (m, 4096), torch.bfloat16),
+        (output_fp8, (m, 4096), torch.float8_e4m3fn),
+        (routed_output_fp8, (m, 4096), torch.float8_e4m3fn),
+        (routed_output_scale, (m, 128), torch.uint8),
+    )
+    for tensor, shape, dtype in expected:
+        if tensor.shape != shape or tensor.dtype != dtype or not tensor.is_contiguous():
+            raise RuntimeError(
+                f"invalid mHC fused output: expected contiguous {shape} {dtype}, "
+                f"got {tuple(tensor.shape)} {tensor.dtype}"
+            )
+    aligned_m = (m + 3) // 4 * 4
+    if (
+        output_scale_storage.shape != (8, aligned_m)
+        or output_scale_storage.dtype != torch.int32
+        or not output_scale_storage.is_contiguous()
+    ):
+        raise RuntimeError(
+            f"mHC packed scale storage must be contiguous int32 {(8, aligned_m)}"
+        )
+    device = residual.device
+    tensors = (
+        gemm_mul,
+        gemm_sq,
+        hc_scale,
+        hc_base,
+        norm_weight,
+        post_mix,
+        comb_mix,
+        layer_input,
+        output_fp8,
+        output_scale_storage,
+        routed_output_fp8,
+        routed_output_scale,
+    )
+    if device.type != "cuda" or any(t.device != device for t in tensors):
+        raise RuntimeError("all mHC fused quant tensors must share one CUDA device")
+    _mhc_pre_norm_mxfp8_quant_custom_op(
+        gemm_mul,
+        gemm_sq,
+        hc_scale,
+        hc_base,
+        residual,
+        norm_weight,
+        post_mix,
+        comb_mix,
+        layer_input,
+        output_fp8,
+        output_scale_storage,
+        routed_output_fp8,
+        routed_output_scale,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult,
+        sinkhorn_repeat,
+        norm_eps,
+        emit_routed_quant,
+        threads,
+    )
+    logical_scale = output_scale_storage.transpose(0, 1)[:m]
+    return (
+        post_mix,
+        comb_mix,
+        layer_input,
+        output_fp8,
+        logical_scale,
+        routed_output_fp8,
+        routed_output_scale,
+    )
+
+
+@cache_once
 def _jit_inverse_rope_fp8_wo_a_module(
     input_dtype: torch.dtype,
     head_dim: int,
@@ -88,13 +308,14 @@ def inverse_rope_fp8_wo_a_ue8m0(
         freqs_cis: The model complex64 RoPE table.
         positions: One int32/int64 position per token.
         output_q: Preallocated contiguous FP8 ``[T, 2, 4096]`` workspace.
-        output_s_storage: Preallocated contiguous FP32 group-major
-            ``[2, T, 32]`` workspace.
+        output_s_storage: Preallocated contiguous int32 packed-scale storage
+            ``[2, 8, align(T, 4)]``.
 
     Returns:
         FP8 codes in contiguous ``[T, G, D]`` layout and a logical
-        ``[T, G, D/128]`` FP32 UE8M0 scale view backed by group-major
-        ``[G, T, D/128]`` storage, exactly as DeepGEMM's WO_A einsum expects.
+        ``[T, G, D/512]`` int32 view.  Each int32 packs four UE8M0 exponent
+        bytes and is backed by DeepGEMM's physical
+        ``[G, D/512, align(T, 4)]`` TMA layout.
 
     This API is strict.  It never runs the separate RoPE and quant kernels.
     """
@@ -144,20 +365,21 @@ def inverse_rope_fp8_wo_a_ue8m0(
             "output_q must be preallocated contiguous CUDA FP8 "
             f"{tuple(input.shape)} on {input.device}"
         )
+    aligned_tokens = (num_tokens + 3) // 4 * 4
     expected_scale_shape = (
         num_groups,
-        num_tokens,
-        hidden // _QUANT_GROUP_SIZE,
+        hidden // (_QUANT_GROUP_SIZE * 4),
+        aligned_tokens,
     )
     if (
         output_s_storage.shape != expected_scale_shape
-        or output_s_storage.dtype != torch.float32
+        or output_s_storage.dtype != torch.int32
         or output_s_storage.device != input.device
         or not output_s_storage.is_contiguous()
     ):
         raise RuntimeError(
-            "output_s_storage must be preallocated contiguous CUDA FP32 "
-            f"group-major {expected_scale_shape} on {input.device}"
+            "output_s_storage must be preallocated contiguous CUDA int32 "
+            f"packed-scale {expected_scale_shape} on {input.device}"
         )
     if input.numel() != 0:
         freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
@@ -168,7 +390,11 @@ def inverse_rope_fp8_wo_a_ue8m0(
             output_q,
             output_s_storage,
         )
-    return output_q, output_s_storage.transpose(0, 1)
+    return output_q, output_s_storage.permute(2, 0, 1)[:num_tokens]
 
 
-__all__ = ["inverse_rope_fp8_wo_a_ue8m0"]
+__all__ = [
+    "inverse_rope_fp8_wo_a_ue8m0",
+    "load_mhc_pre_norm_mxfp8_quant_extension",
+    "mhc_pre_norm_mxfp8_quant",
+]

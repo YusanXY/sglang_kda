@@ -106,6 +106,29 @@ def _jit_main_q_indexer_rope_hadamard_fp4_quant_module(dtype: torch.dtype):
     )
 
 
+@cache_once
+def _jit_rmsnorm_mxfp8_quant_module(
+    dtype: torch.dtype,
+    hidden_size: int,
+    group_size: int,
+):
+    """DSV4 q_lora RMSNorm producing BF16 and DeepGEMM MXFP8 together."""
+    args = make_cpp_args(
+        dtype,
+        hidden_size,
+        group_size,
+        is_arch_support_pdl(),
+    )
+    return load_jit(
+        make_name("rmsnorm_mxfp8_quant"),
+        *args,
+        cuda_files=["deepseek_v4/rmsnorm_mxfp8_quant.cuh"],
+        cuda_wrappers=[
+            ("forward", f"RmsnormMxfp8QuantKernel<{args}>::run"),
+        ],
+    )
+
+
 def fused_rope_inplace(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -149,6 +172,31 @@ def fused_q_norm_rope(
     rope_dim = freqs_real.shape[-1]
     module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
     module.forward(q_input, q_output, freqs_real, positions, eps)
+
+
+def rmsnorm_mxfp8_quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output_bf16: torch.Tensor,
+    output_fp8: torch.Tensor,
+    output_scale: torch.Tensor,
+    eps: float,
+    group_size: int = 128,
+) -> None:
+    """Fuse q_lora RMSNorm with DeepGEMM block-FP8 quantization.
+
+    ``output_scale`` is DeepGEMM's token-contiguous, TMA-aligned packed UE8M0
+    layout. All outputs are caller-owned so Huge can reuse one model-scoped
+    GPU workspace across all decoder layers.
+    """
+    if _is_hip or _is_xpu:
+        raise RuntimeError("DSV4 Huge RMSNorm+MXFP8 fusion requires NVIDIA CUDA")
+    module = _jit_rmsnorm_mxfp8_quant_module(
+        input.dtype,
+        input.shape[-1],
+        group_size,
+    )
+    module.forward(input, weight, output_bf16, output_fp8, output_scale, eps)
 
 
 def fused_q_indexer_rope_hadamard_quant(

@@ -428,8 +428,51 @@ class DSV4Metadata:
                 self.c128_compress_metadata,
                 src=static_metadata.c128_compress_metadata,
             )
-        self.sparse_prefill_cache = None
-        self.clustered_mqa_metadata = None
+        captured_sparse_cache = self.sparse_prefill_cache
+        live_sparse_cache = static_metadata.sparse_prefill_cache
+        if captured_sparse_cache is None:
+            self.sparse_prefill_cache = None
+        elif captured_sparse_cache.graph_local_rebuild:
+            # The single Huge graph starts by rebuilding this cache in-place
+            # from stable ForwardBatch/KV-pool tensors. Keep captured addresses;
+            # no temporary replay cache or D2D geometry copies are needed.
+            pass
+        else:
+            if live_sparse_cache is None:
+                raise RuntimeError(
+                    "captured Huge sparse-prefill cache has no live replay cache"
+                )
+            if captured_sparse_cache.c128_flat_token_ids is not None:
+                c128_page_indices = (
+                    static_metadata.core_attn_metadata.c128_page_indices
+                )
+                if c128_page_indices is None:
+                    raise RuntimeError(
+                        "Huge Graph replay requires C128 page indices"
+                    )
+                live_sparse_cache.ensure_c128(c128_page_indices)
+            captured_sparse_cache.refresh_for_breakable_cuda_graph_replay_(
+                live_sparse_cache
+            )
+        captured_clustered = self.clustered_mqa_metadata
+        if captured_clustered is None:
+            self.clustered_mqa_metadata = None
+        elif not (
+            captured_sparse_cache is not None
+            and captured_sparse_cache.graph_local_rebuild
+        ):
+            if static_metadata.indexer_metadata is None:
+                raise RuntimeError(
+                    "captured clustered MQA has no live indexer metadata"
+                )
+            from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
+                refresh_clustered_mqa_metadata_for_graph_replay_,
+            )
+
+            refresh_clustered_mqa_metadata_for_graph_replay_(
+                captured_clustered,
+                indexer_metadata=static_metadata.indexer_metadata,
+            )
 
 
 @dataclass
@@ -800,16 +843,30 @@ class DeepseekV4AttnBackend(
             c4_compress_metadata=c4_compress_metadata,
             c128_compress_metadata=c128_compress_metadata,
         )
-        if self.dsv4_huge_mode:
+        if self.dsv4_huge_mode and not getattr(
+            self, "_skip_huge_sparse_cache_build", False
+        ):
             # Build all request geometry once, before layer 0.  In particular,
             # the C4 top-k CUDA kernel needs the preallocated combined-index
             # outputs and request-local bases in its epilogue.  This removes
             # both lazy per-layer Python setup and the standalone Triton
             # topk+SWA combine launch from every C4 layer.
-            total_swa_hint = sum(
-                min(int(seq_lens_cpu[i]), int(ext) + SWA_WINDOW - 1)
-                for i, ext in enumerate(extend_seq_lens_cpu)
-            )
+            if use_prefill_cuda_graph:
+                if len(extend_seq_lens_cpu) != 1 or num_tokens != 4096:
+                    raise RuntimeError(
+                        "Huge Graph sparse cache requires req=1 and M=4096"
+                    )
+                # Capture dummy chunks can have seq_len=M while a replay can
+                # have a long prefix. Keep one bucket-stable allocation for
+                # the maximum SWA union and zero its unused capture-time tail.
+                total_swa_hint = num_tokens + SWA_WINDOW - 1
+                zero_initialize_swa_tail = True
+            else:
+                total_swa_hint = sum(
+                    min(int(seq_lens_cpu[i]), int(ext) + SWA_WINDOW - 1)
+                    for i, ext in enumerate(extend_seq_lens_cpu)
+                )
+                zero_initialize_swa_tail = False
             sparse_cache = SparsePrefillChunkCache.build(
                 seq_lens=seq_lens.to(torch.int32),
                 extend_seq_lens=extend_seq_lens.to(torch.int32),
@@ -821,6 +878,7 @@ class DeepseekV4AttnBackend(
                 num_qo_tokens=num_tokens,
                 max_seq_len=max_seq_len,
                 total_swa_hint=total_swa_hint,
+                zero_initialize_swa_tail=zero_initialize_swa_tail,
             )
             sparse_cache.ensure_c4(core_attn_metadata.page_table, self.page_size // 4)
             sparse_cache.ensure_c4_combined_outputs(self.c4_topk)
@@ -1512,12 +1570,47 @@ class DeepseekV4AttnBackend(
         # Build graph-compatible metadata against the padded static batch. The
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
-        static_metadata = self._build_forward_metadata(
-            static_forward_batch if static_forward_batch is not None else forward_batch,
-            max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
-            use_prefill_cuda_graph=True,
-        )
+        self._skip_huge_sparse_cache_build = True
+        try:
+            static_metadata = self._build_forward_metadata(
+                static_forward_batch
+                if static_forward_batch is not None
+                else forward_batch,
+                max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
+                use_prefill_cuda_graph=True,
+            )
+        finally:
+            self._skip_huge_sparse_cache_build = False
         assert isinstance(capture_metadata, DSV4Metadata)
+        captured_sparse_cache = capture_metadata.sparse_prefill_cache
+        if (
+            captured_sparse_cache is not None
+            and captured_sparse_cache.graph_local_rebuild
+        ):
+            live_batch = (
+                static_forward_batch
+                if static_forward_batch is not None
+                else forward_batch
+            )
+            if (
+                live_batch.seq_lens is None
+                or live_batch.extend_seq_lens is None
+                or live_batch.req_pool_indices is None
+            ):
+                raise RuntimeError(
+                    "Huge Graph replay requires seq/extend/request descriptors"
+                )
+            captured_sparse_cache.refresh_graph_inputs_(
+                seq_lens=live_batch.seq_lens,
+                extend_seq_lens=live_batch.extend_seq_lens,
+                req_pool_indices=live_batch.req_pool_indices,
+            )
+            c128_page_indices = static_metadata.core_attn_metadata.c128_page_indices
+            if c128_page_indices is None:
+                raise RuntimeError("Huge Graph replay requires C128 page indices")
+            captured_sparse_cache.rebuild_c128_for_graph_replay_(
+                c128_page_indices=c128_page_indices
+            )
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
 

@@ -176,7 +176,12 @@ def prepare_clustered_mqa_metadata(
         PAGE_SIZE,
         deep_gemm.get_num_sms() // 2,
     )
-    padded_context = (indexer_metadata.max_c4_seq_len + 255) // 256 * 256
+    # Breakable capture pads the page table beyond the model's legal context
+    # capacity. The extra columns are address-stability sentinels, not keys the
+    # model may attend to. Keep the clustered logits stride and CUDA v2 bound
+    # at the strict DSV4-Flash C4 limit.
+    max_context = min(int(indexer_metadata.max_c4_seq_len), MAX_C4_CONTEXT)
+    padded_context = (max_context + 255) // 256 * 256
     if logits_workspace is None:
         # Standalone/operator callers retain the old allocation contract.
         logits_workspace = torch.empty(
@@ -208,10 +213,50 @@ def prepare_clustered_mqa_metadata(
         page_table=grouped_page_table,
         schedule=schedule,
         logits_workspace=logits_workspace,
-        max_context=int(indexer_metadata.max_c4_seq_len),
+        max_context=max_context,
         total_q=total_q,
         extension=load_clustered_mqa_extension(),
     )
+
+
+def refresh_clustered_mqa_metadata_for_graph_replay_(
+    captured: ClusteredMqaMetadata,
+    *,
+    indexer_metadata: Any,
+) -> None:
+    """Refresh a captured Q16 schedule without rebinding graph pointers."""
+
+    live = prepare_clustered_mqa_metadata(
+        indexer_metadata=indexer_metadata,
+        extend_lens_cpu=(captured.total_q,),
+        logits_workspace=captured.logits_workspace,
+    )
+    if live is None:
+        raise RuntimeError("captured clustered MQA replay unexpectedly has a Q16 tail")
+    scalar_fields = ("max_context", "total_q")
+    for name in scalar_fields:
+        current = getattr(captured, name)
+        incoming = getattr(live, name)
+        if current != incoming:
+            raise RuntimeError(
+                "clustered MQA Graph replay shape changed: "
+                f"{name}={current!r} vs {incoming!r}"
+            )
+    if captured.extension is not live.extension:
+        raise RuntimeError("clustered MQA extension changed during Graph replay")
+    for name in ("seq_lens", "page_table", "schedule"):
+        dst = getattr(captured, name)
+        src = getattr(live, name)
+        if dst.shape != src.shape or dst.dtype != src.dtype:
+            raise RuntimeError(
+                "clustered MQA Graph replay tensor changed: "
+                f"{name}: captured={tuple(dst.shape)}/{dst.dtype}, "
+                f"live={tuple(src.shape)}/{src.dtype}"
+            )
+        # seq_lens/page_table are views into the already-refreshed captured
+        # indexer metadata, so this is redundant for values but intentionally
+        # enforces the stable-view contract alongside the independent schedule.
+        dst.copy_(src)
 
 
 def clustered_fp8_paged_mqa_logits(
@@ -294,4 +339,5 @@ __all__ = [
     "clustered_fp8_paged_mqa_topk",
     "load_clustered_mqa_extension",
     "prepare_clustered_mqa_metadata",
+    "refresh_clustered_mqa_metadata_for_graph_replay_",
 ]

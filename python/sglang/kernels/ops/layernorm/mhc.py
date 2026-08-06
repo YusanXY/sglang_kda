@@ -794,6 +794,9 @@ def mhc_pre(
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    output_buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    gemm_workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    quant_output: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
@@ -817,31 +820,83 @@ def mhc_pre(
     num_tokens = residual_flat.shape[0]
     fn_flat = fn
 
-    post_mix = torch.empty(
-        num_tokens, hc_mult, dtype=torch.float32, device=residual.device
-    )
-    comb_mix = torch.empty(
-        num_tokens, hc_mult2, dtype=torch.float32, device=residual.device
-    )
-    # layer_input is the post-norm activation fed into the MoE. Allocate it in
-    # the symmetric memory pool so the downstream all-reduce uses the low-latency
-    # NCCL symmetric path: the Triton inplace MoE runner writes the expert
-    # output back into this buffer, so a symmetric input yields a symmetric
-    # all-reduce input.
-    with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
-        layer_input = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
+    if output_buffers is None:
+        post_mix = torch.empty(
+            num_tokens, hc_mult, dtype=torch.float32, device=residual.device
         )
+        comb_mix = torch.empty(
+            num_tokens, hc_mult2, dtype=torch.float32, device=residual.device
+        )
+        # layer_input is the post-norm activation fed into the MoE. Allocate it
+        # in the symmetric pool so a downstream in-place MoE retains the
+        # low-latency NCCL symmetric path.
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            layer_input = torch.empty(
+                num_tokens,
+                hidden_size,
+                dtype=torch.bfloat16,
+                device=residual.device,
+            )
+    else:
+        post_mix, comb_mix, layer_input = output_buffers
+        expected_outputs = (
+            (post_mix, (num_tokens, hc_mult), torch.float32),
+            (comb_mix, (num_tokens, hc_mult2), torch.float32),
+            (layer_input, (num_tokens, hidden_size), torch.bfloat16),
+        )
+        for output, expected_shape, expected_dtype in expected_outputs:
+            if (
+                output.shape != expected_shape
+                or output.dtype != expected_dtype
+                or output.device != residual.device
+                or not output.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "invalid preallocated mHC output: expected contiguous "
+                    f"{expected_shape} {expected_dtype} on {residual.device}, "
+                    f"got {tuple(output.shape)} {output.dtype} on {output.device}"
+                )
 
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
-        gemm_out_mul = torch.empty(
-            n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
-        )
-        gemm_out_sqrsum = torch.empty(
-            n_splits, num_tokens, dtype=torch.float32, device=residual.device
-        )
+        if gemm_workspace is None:
+            gemm_out_mul = torch.empty(
+                n_splits,
+                num_tokens,
+                hc_mult3,
+                dtype=torch.float32,
+                device=residual.device,
+            )
+            gemm_out_sqrsum = torch.empty(
+                n_splits,
+                num_tokens,
+                dtype=torch.float32,
+                device=residual.device,
+            )
+        else:
+            gemm_mul_storage, gemm_sq_storage = gemm_workspace
+            mul_numel = n_splits * num_tokens * hc_mult3
+            sq_numel = n_splits * num_tokens
+            if (
+                gemm_mul_storage.dtype != torch.float32
+                or gemm_sq_storage.dtype != torch.float32
+                or gemm_mul_storage.device != residual.device
+                or gemm_sq_storage.device != residual.device
+                or not gemm_mul_storage.is_contiguous()
+                or not gemm_sq_storage.is_contiguous()
+                or gemm_mul_storage.numel() < mul_numel
+                or gemm_sq_storage.numel() < sq_numel
+            ):
+                raise RuntimeError("invalid DSV4 Huge mHC GEMM workspace")
+            gemm_out_mul = gemm_mul_storage[:mul_numel].view(
+                n_splits, num_tokens, hc_mult3
+            )
+            gemm_out_sqrsum = gemm_sq_storage[:sq_numel].view(
+                n_splits, num_tokens
+            )
 
         from sglang.srt.layers.deep_gemm_wrapper.entrypoint import tf32_hc_prenorm_gemm
 
@@ -931,28 +986,79 @@ def mhc_pre(
         )
         if not norm_weight_bf.is_contiguous():
             norm_weight_bf = norm_weight_bf.contiguous()
-        mhc_pre_big_fuse_with_norm_tilelang(
-            gemm_out_mul,
-            gemm_out_sqrsum,
-            hc_scale,
-            hc_base,
-            residual_flat,
-            post_mix,
-            comb_mix,
-            layer_input,
-            norm_weight_bf,
-            hidden_size,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            norm_eps,
-            big_fuse_n_splits,
-            hc_mult,
-            gemm_last_dim,
-        )
+        if quant_output is not None:
+            if (
+                hc_mult != 4
+                or hidden_size != 4096
+                or gemm_last_dim != 24
+                or big_fuse_n_splits != gemm_out_mul.shape[0]
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge fused mHC quant requires hc=4, hidden=4096, "
+                    "and DeepGEMM 24-wide partials"
+                )
+            if len(quant_output) != 5:
+                raise RuntimeError(
+                    "DSV4 Huge mHC quant workspace must provide block128 FP8, "
+                    "packed scale, routed block32 FP8, linear scale, and emit flag"
+                )
+            (
+                output_fp8,
+                output_scale_storage,
+                routed_output_fp8,
+                routed_output_scale,
+                emit_routed_quant,
+            ) = quant_output
+            from sglang.jit_kernel.dsv4.e2e import mhc_pre_norm_mxfp8_quant
+
+            mhc_pre_norm_mxfp8_quant(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                residual_flat,
+                norm_weight_bf,
+                post_mix,
+                comb_mix.view(num_tokens, hc_mult, hc_mult),
+                layer_input,
+                output_fp8,
+                output_scale_storage,
+                routed_output_fp8,
+                routed_output_scale,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+                norm_eps=norm_eps,
+                emit_routed_quant=emit_routed_quant,
+                threads=160,
+            )
+        else:
+            mhc_pre_big_fuse_with_norm_tilelang(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                residual_flat,
+                post_mix,
+                comb_mix,
+                layer_input,
+                norm_weight_bf,
+                hidden_size,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_eps,
+                big_fuse_n_splits,
+                hc_mult,
+                gemm_last_dim,
+            )
     else:
+        if quant_output is not None:
+            raise RuntimeError("mHC quant_output requires a following RMSNorm")
         mhc_pre_big_fuse_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,

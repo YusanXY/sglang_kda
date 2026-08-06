@@ -23,6 +23,7 @@ CompressRatio = Literal[0, 4, 128]
 
 _MAX_FORWARD_TOKENS = 4096
 _MAX_FORWARD_REQUESTS = 128
+_MAX_MHC_SPLITS = 64
 
 # This is model identity, not a generic V4 default.  Fail rather than silently
 # running a different architecture through a shape-specialized executor.
@@ -96,6 +97,21 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     extend_seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
     attention_q_padded: torch.Tensor
+    q_lora_bf16: torch.Tensor
+    q_lora_fp8: torch.Tensor
+    q_lora_scale: torch.Tensor
+    mhc_gemm_mul_storage: torch.Tensor
+    mhc_gemm_sq_storage: torch.Tensor
+    mhc_post: torch.Tensor
+    mhc_comb: torch.Tensor
+    mhc_layer_input: torch.Tensor
+    mhc_output_fp8: torch.Tensor
+    mhc_output_scale_storage: torch.Tensor
+    mhc_output_scale: torch.Tensor
+    mhc_routed_output_fp8: torch.Tensor
+    mhc_routed_output_scale: torch.Tensor
+    shared_down_fp8: torch.Tensor
+    shared_down_scale: torch.Tensor
     wo_a_output_q: torch.Tensor
     wo_a_output_s_storage: torch.Tensor
     wo_a_gemm_output: torch.Tensor
@@ -147,6 +163,13 @@ class DSV4WholeLayerRuntime:
                 torch.Tensor,
             ]
         ] = None
+        self._q_lora_workspace: Optional[
+            tuple[torch.device, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None
+        self._shared_down_workspace: Optional[
+            tuple[torch.device, torch.Tensor, torch.Tensor]
+        ] = None
+        self._mhc_pre_workspace: Optional[tuple] = None
 
     @property
     def handles(self) -> tuple[DSV4LayerHandle, ...]:
@@ -183,6 +206,24 @@ class DSV4WholeLayerRuntime:
         )
 
         load_clustered_mqa_extension()
+        from sglang.jit_kernel.dsv4.e2e import (
+            load_mhc_pre_norm_mxfp8_quant_extension,
+        )
+
+        load_mhc_pre_norm_mxfp8_quant_extension(160)
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
+
+        fp8_backend = get_fp8_gemm_runner_backend()
+        effective_deep_gemm = fp8_backend.is_deep_gemm() or (
+            fp8_backend.is_auto() and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        )
+        if not effective_deep_gemm or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            raise RuntimeError(
+                "DSV4 Huge q_lora RMSNorm+block-FP8 fusion requires the "
+                "Blackwell DeepGEMM UE8M0 backend; got "
+                f"{fp8_backend}"
+            )
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
         if (
             self._clustered_logits_workspace is None
@@ -224,6 +265,12 @@ class DSV4WholeLayerRuntime:
             # The DecoderLayer.forward boundary owns dispatch.  Re-loading
             # weights refreshes all generation-tagged handles in one pass.
             handle.layer.enable_huge_kernel_runner(self, handle)
+            shared_experts = getattr(handle.layer.mlp, "shared_experts", None)
+            if shared_experts is not None:
+                # Bind the shared expert to its model-scoped GPU workspace so
+                # every layer reuses fixed addresses instead of entering the
+                # CUDA allocator from Python.
+                shared_experts.bind_dsv4_huge_runtime(self)
         return self._handles
 
     def begin_forward(
@@ -238,8 +285,7 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError("nested DSV4 huge-runtime forwards are unsupported")
         if not self._handles:
             raise RuntimeError("DSV4 huge runtime was not bound after weight loading")
-        if get_is_capture_mode():
-            raise RuntimeError("DSV4 huge runtime does not support CUDA graph capture")
+        is_graph_capture = get_is_capture_mode()
         mode = forward_batch.forward_mode
         if not mode.is_extend_without_speculative():
             raise RuntimeError(
@@ -257,6 +303,11 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError(
                 "DSV4 huge runtime requires aggregate M in 1..4096, "
                 f"got {num_tokens}"
+            )
+        if is_graph_capture and (batch_size != 1 or num_tokens != 4096):
+            raise RuntimeError(
+                "DSV4 huge breakable capture requires the exact static shape "
+                f"req=1, M=4096; got req={batch_size}, M={num_tokens}"
             )
         extend_lens = forward_batch.extend_seq_lens_cpu
         if extend_lens is None or len(extend_lens) != batch_size:
@@ -282,12 +333,30 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError(
                 "DSV4 huge runtime requires C4 indexer metadata for every EXTEND"
             )
+        if is_graph_capture:
+            sparse_cache = metadata.sparse_prefill_cache
+            if sparse_cache is None:
+                raise RuntimeError(
+                    "Huge Graph capture requires a preallocated sparse cache"
+                )
+            sparse_cache.rebuild_swa_c0_in_graph_(
+                req_to_token=attn_backend.req_to_token,
+                full_to_swa=(
+                    attn_backend.token_to_kv_pool.full_to_swa_index_mapping
+                ),
+            )
+            sparse_cache.rebuild_c4_in_graph_(page_table=core.page_table)
+            # Marks the capture object as graph-owned for SWA/C0/C4. Replay
+            # refreshes only the request descriptor and C128 buffers.
+            sparse_cache.graph_local_rebuild = True
         from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
             prepare_clustered_mqa_metadata,
         )
 
         # One GPU schedule and strided page-table view for the whole batch;
-        # all 21 C4 layers consume these exact objects without replanning.
+        # all 21 C4 layers consume these exact objects without replanning. In
+        # Breakable Graph mode the captured object keeps stable addresses and
+        # DSV4Metadata refreshes its live schedule in place before every replay.
         metadata.clustered_mqa_metadata = prepare_clustered_mqa_metadata(
             indexer_metadata=indexer_metadata,
             extend_lens_cpu=extend_lens,
@@ -299,6 +368,26 @@ class DSV4WholeLayerRuntime:
             output_s_storage,
             wo_a_gemm_output,
         ) = self._get_wo_a_workspace(
+            num_tokens,
+            positions.device,
+        )
+        q_lora_bf16, q_lora_fp8, q_lora_scale = self._get_q_lora_workspace(
+            num_tokens,
+            positions.device,
+        )
+        (
+            mhc_gemm_mul_storage,
+            mhc_gemm_sq_storage,
+            mhc_post,
+            mhc_comb,
+            mhc_layer_input,
+            mhc_output_fp8,
+            mhc_output_scale_storage,
+            mhc_output_scale,
+            mhc_routed_output_fp8,
+            mhc_routed_output_scale,
+        ) = self._get_mhc_pre_workspace(num_tokens, positions.device)
+        shared_down_fp8, shared_down_scale = self._get_shared_down_workspace(
             num_tokens,
             positions.device,
         )
@@ -316,6 +405,21 @@ class DSV4WholeLayerRuntime:
             extend_seq_lens=forward_batch.extend_seq_lens,
             out_cache_loc=forward_batch.out_cache_loc,
             attention_q_padded=attention_q_padded,
+            q_lora_bf16=q_lora_bf16,
+            q_lora_fp8=q_lora_fp8,
+            q_lora_scale=q_lora_scale,
+            mhc_gemm_mul_storage=mhc_gemm_mul_storage,
+            mhc_gemm_sq_storage=mhc_gemm_sq_storage,
+            mhc_post=mhc_post,
+            mhc_comb=mhc_comb,
+            mhc_layer_input=mhc_layer_input,
+            mhc_output_fp8=mhc_output_fp8,
+            mhc_output_scale_storage=mhc_output_scale_storage,
+            mhc_output_scale=mhc_output_scale,
+            mhc_routed_output_fp8=mhc_routed_output_fp8,
+            mhc_routed_output_scale=mhc_routed_output_scale,
+            shared_down_fp8=shared_down_fp8,
+            shared_down_scale=shared_down_scale,
             wo_a_output_q=output_q,
             wo_a_output_s_storage=output_s_storage,
             wo_a_gemm_output=wo_a_gemm_output,
@@ -343,7 +447,9 @@ class DSV4WholeLayerRuntime:
                 return (
                     attention_q_padded[:num_tokens],
                     output_q[:num_tokens],
-                    output_s_storage[: 2 * num_tokens * 32].view(2, num_tokens, 32),
+                    output_s_storage[
+                        : 2 * 8 * ((num_tokens + 3) // 4 * 4)
+                    ].view(2, 8, (num_tokens + 3) // 4 * 4),
                     wo_a_gemm_output[:num_tokens],
                 )
         # Decoder layers execute serially on one stream. Allocate the supported
@@ -358,11 +464,11 @@ class DSV4WholeLayerRuntime:
             dtype=torch.float8_e4m3fn,
             device=device,
         )
-        # Keep this flat so [2,T,32] can be an exact contiguous view for every
-        # T. Slicing a [2,capacity,32] tensor on dim 1 would not be contiguous.
+        # Keep this flat so each dynamic align(T, 4) gets the exact physical
+        # [G, packed-K, aligned-M] stride required by DeepGEMM.
         output_s_storage = torch.empty(
-            (2 * _MAX_FORWARD_TOKENS * 32,),
-            dtype=torch.float32,
+            (2 * 8 * _MAX_FORWARD_TOKENS,),
+            dtype=torch.int32,
             device=device,
         )
         wo_a_gemm_output = torch.empty(
@@ -380,9 +486,209 @@ class DSV4WholeLayerRuntime:
         return (
             attention_q_padded[:num_tokens],
             output_q[:num_tokens],
-            output_s_storage[: 2 * num_tokens * 32].view(2, num_tokens, 32),
+            output_s_storage[
+                : 2 * 8 * ((num_tokens + 3) // 4 * 4)
+            ].view(2, 8, (num_tokens + 3) // 4 * 4),
             wo_a_gemm_output[:num_tokens],
         )
+
+    def _get_q_lora_workspace(
+        self,
+        num_tokens: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        workspace = self._q_lora_workspace
+        if workspace is None or workspace[0] != device:
+            # q_lora_rank=1024 and block-FP8 group=128 are strict DSV4-Flash
+            # invariants validated during runtime construction. Decoder layers
+            # execute serially, so one set of addresses serves all 43 layers.
+            q_lora_bf16 = torch.empty(
+                (_MAX_FORWARD_TOKENS, 1024),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            q_lora_fp8 = torch.empty(
+                (_MAX_FORWARD_TOKENS, 1024),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            # DeepGEMM packs four UE8M0 group scales per int32. q_lora has
+            # 1024/128=8 groups, hence two packed columns. The one-dimensional
+            # backing store yields an exact ceil(M/4)*4 TMA stride per batch
+            # without allocating in the per-layer hot path.
+            q_lora_scale_storage = torch.empty(
+                (_MAX_FORWARD_TOKENS * 2,),
+                dtype=torch.int32,
+                device=device,
+            )
+            workspace = (
+                device,
+                q_lora_bf16,
+                q_lora_fp8,
+                q_lora_scale_storage,
+            )
+            self._q_lora_workspace = workspace
+        _, q_lora_bf16, q_lora_fp8, q_lora_scale_storage = workspace
+        aligned_m = (num_tokens + 3) // 4 * 4
+        q_lora_scale = (
+            q_lora_scale_storage[: 2 * aligned_m]
+            .view(2, aligned_m)
+            .transpose(0, 1)[:num_tokens]
+        )
+        return (
+            q_lora_bf16[:num_tokens],
+            q_lora_fp8[:num_tokens],
+            q_lora_scale,
+        )
+
+    def _get_mhc_pre_workspace(
+        self,
+        num_tokens: int,
+        device: torch.device,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Return exact-M views over one model-scoped mHC producer workspace."""
+
+        workspace = self._mhc_pre_workspace
+        if workspace is None or workspace[0] != device:
+            # The split heuristic is capped at 64 for hc*hidden=16384. Keep the
+            # backing arrays flat so every (splits,M,24) view has an exact M
+            # stride rather than inheriting MAX_FORWARD_TOKENS as a pitch.
+            gemm_mul_storage = torch.empty(
+                (_MAX_MHC_SPLITS * _MAX_FORWARD_TOKENS * 24,),
+                dtype=torch.float32,
+                device=device,
+            )
+            gemm_sq_storage = torch.empty(
+                (_MAX_MHC_SPLITS * _MAX_FORWARD_TOKENS,),
+                dtype=torch.float32,
+                device=device,
+            )
+            post = torch.empty(
+                (_MAX_FORWARD_TOKENS, 4), dtype=torch.float32, device=device
+            )
+            comb = torch.empty(
+                (_MAX_FORWARD_TOKENS, 4, 4), dtype=torch.float32, device=device
+            )
+            # This buffer becomes the input/output of the in-place MoE path,
+            # so preserve the symmetric allocation property of native mhc_pre.
+            from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+                use_symmetric_memory,
+            )
+            from sglang.srt.distributed.parallel_state import get_tp_group
+            from sglang.srt.layers.dp_attention import is_allocation_symmetric
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                layer_input = torch.empty(
+                    (_MAX_FORWARD_TOKENS, 4096),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+            output_fp8 = torch.empty(
+                (_MAX_FORWARD_TOKENS, 4096),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            output_scale_storage = torch.empty(
+                (8 * _MAX_FORWARD_TOKENS,), dtype=torch.int32, device=device
+            )
+            routed_output_fp8 = torch.empty(
+                (_MAX_FORWARD_TOKENS, 4096),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            routed_output_scale = torch.empty(
+                (_MAX_FORWARD_TOKENS, 128),
+                dtype=torch.uint8,
+                device=device,
+            )
+            workspace = (
+                device,
+                gemm_mul_storage,
+                gemm_sq_storage,
+                post,
+                comb,
+                layer_input,
+                output_fp8,
+                output_scale_storage,
+                routed_output_fp8,
+                routed_output_scale,
+            )
+            self._mhc_pre_workspace = workspace
+
+        (
+            _,
+            gemm_mul_storage,
+            gemm_sq_storage,
+            post,
+            comb,
+            layer_input,
+            output_fp8,
+            output_scale_storage,
+            routed_output_fp8,
+            routed_output_scale,
+        ) = workspace
+        aligned_m = (num_tokens + 3) // 4 * 4
+        physical_scale = output_scale_storage[: 8 * aligned_m].view(8, aligned_m)
+        logical_scale = physical_scale.transpose(0, 1)[:num_tokens]
+        return (
+            gemm_mul_storage,
+            gemm_sq_storage,
+            post[:num_tokens],
+            comb[:num_tokens],
+            layer_input[:num_tokens],
+            output_fp8[:num_tokens],
+            physical_scale,
+            logical_scale,
+            routed_output_fp8[:num_tokens],
+            routed_output_scale[:num_tokens],
+        )
+
+    def _get_shared_down_workspace(
+        self,
+        num_tokens: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        workspace = self._shared_down_workspace
+        if workspace is None or workspace[0] != device:
+            # DSV4-Flash has one 512-wide shared expert.  Its group-128 scale
+            # row contains four UE8M0 bytes, hence exactly one packed int32.
+            shared_down_fp8 = torch.empty(
+                (_MAX_FORWARD_TOKENS, 512),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
+            shared_down_scale_storage = torch.empty(
+                (_MAX_FORWARD_TOKENS,),
+                dtype=torch.int32,
+                device=device,
+            )
+            workspace = (
+                device,
+                shared_down_fp8,
+                shared_down_scale_storage,
+            )
+            self._shared_down_workspace = workspace
+        _, shared_down_fp8, shared_down_scale_storage = workspace
+        aligned_m = (num_tokens + 3) // 4 * 4
+        shared_down_scale = (
+            shared_down_scale_storage[:aligned_m]
+            .view(1, aligned_m)
+            .transpose(0, 1)[:num_tokens]
+        )
+        return shared_down_fp8[:num_tokens], shared_down_scale
 
     def execute_layer(
         self,
@@ -474,8 +780,19 @@ class DSV4WholeLayerRuntime:
                 "DSV4 huge runtime requires dsv4 for both attention phases, "
                 f"got prefill/decode={prefill_backend!r}/{decode_backend!r}"
             )
-        if view.cuda_graph_config.prefill.backend != Backend.DISABLED:
-            raise RuntimeError("DSV4 huge runtime requires prefill CUDA graph disabled")
+        prefill_graph = view.cuda_graph_config.prefill
+        if prefill_graph.backend not in (Backend.DISABLED, Backend.BREAKABLE):
+            raise RuntimeError(
+                "DSV4 huge runtime requires prefill CUDA graph disabled or "
+                f"breakable, got {prefill_graph.backend!r}"
+            )
+        if prefill_graph.backend == Backend.BREAKABLE and tuple(
+            prefill_graph.bs or ()
+        ) != (4096,):
+            raise RuntimeError(
+                "DSV4 huge breakable prefill CUDA graph requires the single "
+                f"exact bucket [4096], got {prefill_graph.bs!r}"
+            )
         if view.cuda_graph_config.decode.backend != Backend.DISABLED:
             raise RuntimeError("DSV4 huge runtime requires decode CUDA graph disabled")
         if not torch.cuda.is_available() or torch.version.hip is not None:
@@ -519,6 +836,20 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError(
                 f"layer {layer_id}: huge WO_A fusion requires FP8 wo_a weights"
             )
+        if attn.q_norm.weight.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"layer {layer_id}: Huge q_lora RMSNorm+block-FP8 fusion requires "
+                f"BF16 q_norm weights, got {attn.q_norm.weight.dtype}"
+            )
+        q_b_quant = getattr(attn.wq_b, "quant_method", None)
+        q_b_block_size = getattr(q_b_quant, "weight_block_size", None)
+        if not getattr(q_b_quant, "block_quant", False) or list(
+            q_b_block_size or ()
+        ) != [128, 128]:
+            raise RuntimeError(
+                f"layer {layer_id}: Huge fused q_lora producer requires wq_b "
+                f"block-FP8 [128, 128], got {q_b_quant!r} / {q_b_block_size!r}"
+            )
         if layer._post_attention_layernorm_weight_bf16 is None:
             raise RuntimeError(
                 f"layer {layer_id}: huge mHC fusion requires the cached BF16 "
@@ -560,6 +891,22 @@ def _execute_common(
         layer.hc_attn_base,
         norm=layer.input_layernorm,
         forward_batch=descriptor.forward_batch,
+        huge_output_buffers=(
+            descriptor.mhc_post,
+            descriptor.mhc_comb.view(descriptor.num_tokens, 16),
+            descriptor.mhc_layer_input,
+        ),
+        huge_gemm_workspace=(
+            descriptor.mhc_gemm_mul_storage,
+            descriptor.mhc_gemm_sq_storage,
+        ),
+        huge_quant_output=(
+            descriptor.mhc_output_fp8,
+            descriptor.mhc_output_scale_storage,
+            descriptor.mhc_routed_output_fp8,
+            descriptor.mhc_routed_output_scale,
+            False,
+        ),
     )
     if not norm_fused:
         hidden_states = layer.input_layernorm(hidden_states)
@@ -570,23 +917,22 @@ def _execute_common(
         x=hidden_states,
         positions=descriptor.positions,
         forward_batch=descriptor.forward_batch,
-        x_quant=None,
+        x_quant=(descriptor.mhc_output_fp8, descriptor.mhc_output_scale),
         e2e_handle=handle,
         e2e_descriptor=descriptor,
     )
 
-    # Keep the numerically stable GPU primitives until the single-entry mHC
-    # implementation reproduces their reduction order.  The fused scalar-FMA
-    # path passes per-operator 2e-2 tolerance, but at M=4096 its small error
-    # accumulates across 43 layers and fails the model-level cosine gate.
-    # This is still a strict Huge CUDA path and never enters _forward_native.
-    residual, post, comb, hidden_states = _separate_mhc_post_ffn_pre(
-        layer=layer,
-        descriptor=descriptor,
-        hidden_states=hidden_states,
-        residual=residual,
-        post=post,
-        comb=comb,
+    # Consume attention post state, then let the second fused mHC producer
+    # directly generate the shared-expert gate input in FP8/UE8M0 form.
+    residual, post, comb, hidden_states, shared_x_quant, routed_x_quant = (
+        _separate_mhc_post_ffn_pre(
+            layer=layer,
+            descriptor=descriptor,
+            hidden_states=hidden_states,
+            residual=residual,
+            post=post,
+            comb=comb,
+        )
     )
 
     hidden_states = layer._run_moe_ffn_dp_sync(
@@ -594,6 +940,8 @@ def _execute_common(
         descriptor.forward_batch,
         input_ids=descriptor.input_ids,
         input_ids_global=descriptor.input_ids_global,
+        shared_x_quant=shared_x_quant,
+        routed_x_quant=routed_x_quant,
     )
     hidden_states = layer.hc_post(hidden_states, residual, post, comb)
     return hidden_states, None, None, None
@@ -649,7 +997,14 @@ def _separate_mhc_post_ffn_pre(
     residual: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    tuple[torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor],
+]:
     """Numerically stable Huge CUDA path for non-target tiny-M batches."""
 
     residual = layer.hc_post(hidden_states, residual, post, comb)
@@ -660,10 +1015,36 @@ def _separate_mhc_post_ffn_pre(
         layer.hc_ffn_base,
         norm=layer.post_attention_layernorm,
         forward_batch=descriptor.forward_batch,
+        huge_output_buffers=(
+            descriptor.mhc_post,
+            descriptor.mhc_comb.view(descriptor.num_tokens, 16),
+            descriptor.mhc_layer_input,
+        ),
+        huge_gemm_workspace=(
+            descriptor.mhc_gemm_mul_storage,
+            descriptor.mhc_gemm_sq_storage,
+        ),
+        huge_quant_output=(
+            descriptor.mhc_output_fp8,
+            descriptor.mhc_output_scale_storage,
+            descriptor.mhc_routed_output_fp8,
+            descriptor.mhc_routed_output_scale,
+            True,
+        ),
     )
     if not norm_fused:
         hidden_states = layer.post_attention_layernorm(hidden_states)
-    return residual, post, comb, hidden_states
+    return (
+        residual,
+        post,
+        comb,
+        hidden_states,
+        (descriptor.mhc_output_fp8, descriptor.mhc_output_scale),
+        (
+            descriptor.mhc_routed_output_fp8,
+            descriptor.mhc_routed_output_scale,
+        ),
+    )
 
 
 def _execute_c0(

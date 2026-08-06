@@ -16,6 +16,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
+    StandardTopKOutputPacked,
     TopKConfig,
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
@@ -50,6 +51,9 @@ class HashTopK(nn.Module):
             num_fused_shared_experts > 0 and get_server_args().enable_waterfill
         )
         self.waterfill_balancer = None
+        self.fuse_packed_routing = (
+            get_server_args().dsv4_worker_backend == "huge_kernel"
+        )
 
         if self.enable_waterfill:
             # Waterfill appends the shared expert after EPLB maps routed IDs.
@@ -192,6 +196,22 @@ class HashTopK(nn.Module):
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
             from sglang.jit_kernel.dsv4 import hash_topk
 
+            packed_topk = None
+            if self.fuse_packed_routing:
+                if (
+                    self.num_fused_shared_experts != 0
+                    or num_token_non_padded is not None
+                    or expert_location_dispatch_info is not None
+                ):
+                    raise RuntimeError(
+                        "DSV4 Huge fused HashTopK packing received unsupported metadata"
+                    )
+                packed_topk = torch.empty(
+                    (router_logits.shape[0], self.topk),
+                    dtype=torch.int32,
+                    device=router_logits.device,
+                )
+
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
                 input_ids=input_ids,
@@ -199,8 +219,12 @@ class HashTopK(nn.Module):
                 num_fused_shared_experts=self.num_fused_shared_experts,
                 routed_scaling_factor=self.routed_scaling_factor,
                 scoring_func=self.score_func,
+                packed_out=packed_topk,
             )
         else:
+            if self.fuse_packed_routing:
+                raise RuntimeError("DSV4 Huge requires the fused CUDA HashTopK path")
+            packed_topk = None
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
         if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
@@ -264,9 +288,19 @@ class HashTopK(nn.Module):
         get_global_expert_distribution_recorder().on_select_experts(
             topk_ids=recorder_topk_ids
         )
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
-        )
+        if packed_topk is None:
+            topk_output = StandardTopKOutput(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+            )
+        else:
+            topk_output = StandardTopKOutputPacked(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+                packed_topk_ids=packed_topk,
+            )
         topk_output = self._apply_waterfill(topk_output, hidden_states.shape[0])
         if is_hip():
             _zero_topk_weights_padded_region(

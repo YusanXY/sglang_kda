@@ -49,11 +49,12 @@ __global__ void inverse_rope_fp8_wo_a_kernel(
     const float* __restrict__ freqs_real,
     const PosT* __restrict__ positions,
     fp8_e4m3_t* __restrict__ output_q,
-    float* __restrict__ output_s,
+    uint32_t* __restrict__ output_s,
     int64_t total_scale_groups,
     int64_t num_tokens,
     int hidden_groups,
     int outer_groups,
+    int64_t aligned_num_tokens,
     int64_t input_stride_t) {
   static_assert(kHeadDim == 512);
   static_assert(kRopeDim == 64);
@@ -64,11 +65,25 @@ __global__ void inverse_rope_fp8_wo_a_kernel(
 
   const int64_t local_group = threadIdx.x / kThreadsPerGroup;
   const int lane = threadIdx.x % kThreadsPerGroup;
-  const int64_t scale_group =
-      static_cast<int64_t>(blockIdx.x) * kGroupsPerBlock + local_group;
+  // A 512-wide head contains four 128-value quant groups, and only its final
+  // group owns RoPE values.  Arrange each warp by group phase across four
+  // heads: warps 0..2 are wholly NOPE and warp 3 is wholly RoPE.  The former
+  // contiguous mapping put one RoPE subgroup in every warp and predicated off
+  // 24/32 lanes throughout the complex multiply.
+  constexpr int kGroupsPerHead = kHeadDim / kQuantGroup;
+  constexpr int kSubgroupsPerWarp = 32 / kThreadsPerGroup;
+  constexpr int kHeadsPerBlock = kGroupsPerBlock / kGroupsPerHead;
+  const int blocks_per_token_outer = hidden_groups / kGroupsPerBlock;
+  const int block_in_token_outer = blockIdx.x % blocks_per_token_outer;
+  const int64_t token_outer = blockIdx.x / blocks_per_token_outer;
+  const int group_phase = local_group / kSubgroupsPerWarp;
+  const int head_in_block = local_group % kSubgroupsPerWarp;
+  const int hidden_group =
+      (block_in_token_outer * kHeadsPerBlock + head_in_block) *
+          kGroupsPerHead +
+      group_phase;
+  const int64_t scale_group = token_outer * hidden_groups + hidden_group;
   if (scale_group < total_scale_groups) {
-    const int hidden_group = scale_group % hidden_groups;
-    const int64_t token_outer = scale_group / hidden_groups;
     const int outer = token_outer % outer_groups;
     const int64_t token = token_outer / outer_groups;
 
@@ -133,9 +148,6 @@ __global__ void inverse_rope_fp8_wo_a_kernel(
     constexpr float kFP8MaxInv = 1.0f / kFP8E4M3Max;
     const int32_t scale_ue8m0 = cast_to_ue8m0(absmax * kFP8MaxInv);
     const float quant_mul = inv_scale_ue8m0(scale_ue8m0);
-    const float scale =
-        __uint_as_float(static_cast<uint32_t>(scale_ue8m0) << 23);
-
     int4 packed;
     auto* packed_pairs = reinterpret_cast<fp8x2_e4m3_t*>(&packed);
 #pragma unroll
@@ -146,11 +158,21 @@ __global__ void inverse_rope_fp8_wo_a_kernel(
     *reinterpret_cast<int4*>(
         output_q + output_offset + lane * kVec) = packed;
 
+    // DeepGEMM consumes four UE8M0 exponents packed in one int32.  Each
+    // subgroup owns a distinct byte of that word; byte-granular global stores
+    // preserve the final ABI without shuffles, a barrier, or a pack launch.
     if (lane == 0) {
-      // Physical group-major [G, T, D/128], matching existing WO_A ABI.
-      output_s[(static_cast<int64_t>(outer) * num_tokens + token) *
-                   hidden_groups +
-               hidden_group] = scale;
+      constexpr int kScalesPerWord = 4;
+      const int packed_hidden_groups = hidden_groups / kScalesPerWord;
+      const int packed_hidden_group = hidden_group / kScalesPerWord;
+      const int64_t packed_word =
+          (static_cast<int64_t>(outer) * packed_hidden_groups +
+           packed_hidden_group) *
+              aligned_num_tokens +
+          token;
+      reinterpret_cast<uint8_t*>(output_s)[
+          packed_word * sizeof(uint32_t) + hidden_group % kScalesPerWord] =
+          static_cast<uint8_t>(scale_ue8m0);
     }
   }
 
@@ -176,7 +198,8 @@ struct InverseRopeFP8WoAQuantUE8M0Kernel {
     auto TSize = SymbolicSize{"num_tokens"};
     auto GSize = SymbolicSize{"num_outer_groups"};
     auto DSize = SymbolicSize{"hidden_dim"};
-    auto SSize = SymbolicSize{"hidden_groups"};
+    auto PSize = SymbolicSize{"packed_hidden_groups"};
+    auto ASize = SymbolicSize{"aligned_num_tokens"};
 
     TensorMatcher({TSize, GSize, DSize})
         .with_strides({-1, DSize, 1})
@@ -197,15 +220,17 @@ struct InverseRopeFP8WoAQuantUE8M0Kernel {
         .with_dtype<fp8_e4m3_t>()
         .with_device(device)
         .verify(output_q);
-    TensorMatcher({GSize, TSize, SSize})
-        .with_dtype<float>()
+    TensorMatcher({GSize, PSize, ASize})
+        .with_dtype<int32_t>()
         .with_device(device)
         .verify(output_s);
 
     const int64_t num_tokens = TSize.unwrap();
     const int outer_groups = static_cast<int>(GSize.unwrap());
     const int hidden = static_cast<int>(DSize.unwrap());
-    const int hidden_groups = static_cast<int>(SSize.unwrap());
+    const int hidden_groups = hidden / static_cast<int>(kQuantGroup);
+    const int packed_hidden_groups = static_cast<int>(PSize.unwrap());
+    const int64_t aligned_num_tokens = ASize.unwrap();
     const int64_t input_stride_t = input.stride(0);
 
     RuntimeCheck(hidden == 4096, "TP4 fused WO_A hidden dim must be 4096");
@@ -213,8 +238,11 @@ struct InverseRopeFP8WoAQuantUE8M0Kernel {
     RuntimeCheck(hidden % kHeadDim == 0, "group hidden must contain whole heads");
     RuntimeCheck(hidden % kQuantGroup == 0, "hidden must be divisible by 128");
     RuntimeCheck(
-        hidden_groups == hidden / static_cast<int>(kQuantGroup),
-        "output scale hidden-group mismatch");
+        packed_hidden_groups == hidden_groups / 4,
+        "packed output scale hidden-group mismatch");
+    RuntimeCheck(
+        aligned_num_tokens >= num_tokens && aligned_num_tokens % 4 == 0,
+        "packed output scale token extent must be align(T, 4)");
     RuntimeCheck(
         reinterpret_cast<uintptr_t>(input.data_ptr()) % sizeof(int4) == 0,
         "input pointer must be 16-byte aligned");
@@ -239,11 +267,12 @@ struct InverseRopeFP8WoAQuantUE8M0Kernel {
               static_cast<const float*>(freqs_real.data_ptr()),
               static_cast<const int32_t*>(positions.data_ptr()),
               static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
-              static_cast<float*>(output_s.data_ptr()),
+              static_cast<uint32_t*>(output_s.data_ptr()),
               total_scale_groups,
               num_tokens,
               hidden_groups,
               outer_groups,
+              aligned_num_tokens,
               input_stride_t);
     } else {
       LaunchKernel(grid, block, device.unwrap())
@@ -253,11 +282,12 @@ struct InverseRopeFP8WoAQuantUE8M0Kernel {
               static_cast<const float*>(freqs_real.data_ptr()),
               static_cast<const int64_t*>(positions.data_ptr()),
               static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
-              static_cast<float*>(output_s.data_ptr()),
+              static_cast<uint32_t*>(output_s.data_ptr()),
               total_scale_groups,
               num_tokens,
               hidden_groups,
               outer_groups,
+              aligned_num_tokens,
               input_stride_t);
     }
   }

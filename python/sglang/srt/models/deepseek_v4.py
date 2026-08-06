@@ -28,6 +28,7 @@ from sglang.jit_kernel.dsv4 import (
     fused_q_norm_rope,
     fused_rope_inplace,
     inverse_rope_fp8_wo_a_ue8m0,
+    rmsnorm_mxfp8_quant,
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
 )
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
@@ -656,8 +657,9 @@ class MQALayer(MqaAttentionBase):
         q: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        q_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(q)
+        q, _ = self.wq_b(q_quant if q_quant is not None else q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if q_out is None:
             q_out = torch.empty_like(q)
@@ -902,6 +904,9 @@ class MQALayer(MqaAttentionBase):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        huge_q_lora_workspace: Optional[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
@@ -1019,8 +1024,32 @@ class MQALayer(MqaAttentionBase):
             if q_out is not None:
                 q_out.copy_(q)
         else:
-            q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            if huge_q_lora_workspace is not None:
+                q_lora_bf16, q_lora_fp8, q_lora_scale = huge_q_lora_workspace
+                if q_lora_bf16.shape != q_lora.shape:
+                    raise RuntimeError(
+                        f"layer {self.layer_id}: Huge q_lora workspace shape "
+                        f"{tuple(q_lora_bf16.shape)} != {tuple(q_lora.shape)}"
+                    )
+                rmsnorm_mxfp8_quant(
+                    q_lora,
+                    self.q_norm.weight.data,
+                    q_lora_bf16,
+                    q_lora_fp8,
+                    q_lora_scale,
+                    self.q_norm.variance_epsilon,
+                    group_size=128,
+                )
+                q_lora = q_lora_bf16
+                q = self._compute_q_b(
+                    q_lora,
+                    positions,
+                    q_out,
+                    q_quant=(q_lora_fp8, q_lora_scale),
+                )
+            else:
+                q_lora = self.q_norm(q_lora)
+                q = self._compute_q_b(q_lora, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -1196,6 +1225,15 @@ class MQALayer(MqaAttentionBase):
                 )
             kv = None
         else:
+            huge_q_lora_workspace = (
+                (
+                    e2e_descriptor.q_lora_bf16,
+                    e2e_descriptor.q_lora_fp8,
+                    e2e_descriptor.q_lora_scale,
+                )
+                if huge_mode
+                else None
+            )
             q, kv = self._forward_prepare(
                 x,
                 positions,
@@ -1203,6 +1241,7 @@ class MQALayer(MqaAttentionBase):
                 attn_backend,
                 q_out,
                 x_quant=x_quant,
+                huge_q_lora_workspace=huge_q_lora_workspace,
             )
 
         # The cache write is always fused / already done by _forward_prepare* --
@@ -1228,7 +1267,15 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if (
+                forward_batch.forward_mode.is_extend()
+                and is_in_breakable_cuda_graph()
+                and not huge_mode
+            ):
+                # Generic BCG rebuilds attention against live metadata at an
+                # eager break. Strict Huge owns capture-stable core/indexer,
+                # sparse-cache and clustered-MQA buffers, so it can keep the
+                # attention launch inside the enclosing graph segment.
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
@@ -1481,6 +1528,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_base: torch.Tensor,
         norm: Optional[nn.Module] = None,
         forward_batch: Optional[ForwardBatch] = None,
+        huge_output_buffers=None,
+        huge_gemm_workspace=None,
+        huge_quant_output=None,
     ):
         """If *norm* is given and the TileLang path is active, the returned
         hidden_states are already post-norm (the norm is fused into the kernel)."""
@@ -1524,6 +1574,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             if norm is not None:
                 norm_kwargs["norm_weight"] = norm.weight.data
                 norm_kwargs["norm_eps"] = norm.variance_epsilon
+            if huge_output_buffers is not None:
+                if huge_gemm_workspace is None or huge_quant_output is None:
+                    raise RuntimeError(
+                        "DSV4 Huge mHC pre requires output, GEMM, and quant "
+                        "workspaces together"
+                    )
+                norm_kwargs["output_buffers"] = huge_output_buffers
+                norm_kwargs["gemm_workspace"] = huge_gemm_workspace
+                norm_kwargs["quant_output"] = huge_quant_output
 
             post, comb, y = mhc_pre(
                 residual=x,
@@ -1819,6 +1878,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         *,
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
+        shared_x_quant=None,
+        routed_x_quant=None,
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -1832,6 +1893,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
+        if (shared_x_quant is not None or routed_x_quant is not None) and (
+            _use_cp or _use_tp_moe_gather or _use_tp_attn_a2a_scatter
+        ):
+            raise RuntimeError(
+                "DSV4 Huge MoE prequantization requires DP1 without "
+                "CP or attention/MoE gather-scatter"
+            )
         # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
         # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
         # The experts ARE TP-sharded by intermediate (moe_tp_size==tp_size), so
@@ -1911,6 +1979,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
+                shared_x_quant=shared_x_quant,
+                routed_x_quant=routed_x_quant,
             )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)

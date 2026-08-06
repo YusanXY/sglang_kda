@@ -893,6 +893,15 @@ def run_one_case(
                     )
                     if data["meta_info"]["completion_tokens"] == 1:
                         last_ttft = time.perf_counter() - tic
+                        if return_logprob:
+                            first_token_logprobs = data["meta_info"].get(
+                                "output_token_logprobs"
+                            )
+                            print(
+                                "SGLANG_BENCH_FIRST_TOKEN_LOGPROBS "
+                                + json.dumps(first_token_logprobs),
+                                flush=True,
+                            )
 
     print("SGLANG_BENCH_MEASURED_REQUEST_END", flush=True)
 
