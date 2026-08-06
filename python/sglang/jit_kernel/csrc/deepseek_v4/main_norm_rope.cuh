@@ -39,11 +39,17 @@ SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
 constexpr uint32_t kFusedQBlockSize = 128;
 constexpr uint32_t kFusedQNumWarps = kFusedQBlockSize / device::kWarpThreads;
 
+// The FP8 indexer quant path is bandwidth/issue limited at the req16 shape.
+// Eight warps amortize block scheduling without changing the other Q kernels.
+constexpr uint32_t kFusedQIndexerBlockSize = 256;
+constexpr uint32_t kFusedQIndexerNumWarps = kFusedQIndexerBlockSize / device::kWarpThreads;
+
 // 8 warps per block: block-per-token work-item dispatch (K kernel).
 constexpr uint32_t kFusedKBlockSize = 256;
 constexpr uint32_t kFusedKNumWarps = kFusedKBlockSize / device::kWarpThreads;
 
 #define Q_KERNEL __global__ __launch_bounds__(kFusedQBlockSize, 16)
+#define Q_INDEXER_KERNEL __global__ __launch_bounds__(kFusedQIndexerBlockSize, 2048 / kFusedQIndexerBlockSize)
 #define K_KERNEL __global__ __launch_bounds__(kFusedKBlockSize, 8)
 
 template <int64_t kRopeDim>
@@ -455,7 +461,8 @@ struct FusedQIndexerRopeHadamardQuantParams {
 };
 
 template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
-Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
+Q_INDEXER_KERNEL void
+fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;
@@ -472,7 +479,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
 
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
-  const auto work_id = blockIdx.x * kFusedQNumWarps + warp_id;
+  const auto work_id = blockIdx.x * kFusedQIndexerNumWarps + warp_id;
   // V4 ropes the trailing kRopeDim dims (kRopeFirst=false); V3.2 ropes the
   // leading kRopeDim dims (kRopeFirst=true). Select the owning lanes per layout.
   const bool is_rope_lane = kRopeFirst ? (lane_id < kRopeSize) : (lane_id >= kWarpThreads - kRopeSize);
@@ -668,11 +675,11 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .num_heads = num_heads,
     };
     const auto total_works = batch_size * num_heads;
-    const auto num_blocks = div_ceil(total_works, kFusedQNumWarps);
+    const auto num_blocks = div_ceil(total_works, kFusedQIndexerNumWarps);
     const auto k_int32 = kernel<int32_t>;
     const auto k_int64 = kernel<int64_t>;
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
-    LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap())  //
+    LaunchKernel(num_blocks, kFusedQIndexerBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(k, params);
   }
 };

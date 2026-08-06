@@ -10,6 +10,9 @@ from sglang.jit_kernel.dsv4 import (
     compress_norm_rope_store,
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
+from sglang.jit_kernel.dsv4.elementwise import (
+    _jit_main_q_indexer_rope_hadamard_quant_module,
+)
 from sglang.jit_kernel.hadamard import hadamard_transform
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
     apply_rotary_emb_triton,
@@ -221,6 +224,41 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     torch.testing.assert_close(q_fp4.view(torch.uint8), ref_fp4)
     torch.testing.assert_close(q_sf, ref_sf)
     torch.testing.assert_close(weights_out.squeeze(-1), weight.float() * weight_scale)
+
+
+def test_fp8_fused_q_indexer_eight_warp_launch_covers_every_work_item() -> None:
+    """Guard the device work-id stride against the host launch geometry."""
+    torch.manual_seed(301)
+    batch_size = 17
+    num_heads = 64
+    rope_dim = 64
+    q = torch.randn(
+        batch_size, num_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    weight = torch.randn(batch_size, num_heads, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(batch_size, device="cuda", dtype=torch.int32)
+    freqs_cis = precompute_freqs_cis(rope_dim, 64, 0, 10000, 1, 32, 1).to("cuda")
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+
+    q_fp8 = torch.full(
+        q.shape, float("nan"), device="cuda", dtype=torch.float8_e4m3fn
+    )
+    weights_out = torch.full(
+        (batch_size, num_heads, 1), float("nan"), device="cuda"
+    )
+    module = _jit_main_q_indexer_rope_hadamard_quant_module(q.dtype)
+    module.forward(
+        q,
+        q_fp8,
+        weight,
+        weights_out,
+        HEAD_DIM**-0.5 * num_heads**-0.5,
+        freqs_real,
+        positions,
+    )
+
+    assert torch.isfinite(q_fp8.float()).all()
+    assert torch.isfinite(weights_out).all()
 
 
 if __name__ == "__main__":

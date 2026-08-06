@@ -3,6 +3,7 @@
 import ast
 import inspect
 import textwrap
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -150,3 +151,20 @@ def test_high_load_huge_runtime_does_not_route_c4_back_to_q1_logits():
     assert "self.dsv4_huge_use_clustered_mqa = self.dsv4_huge_mode" in backend_init
     assert "max_prefill_tokens == 4096" not in runtime_init
     assert "max_prefill_tokens == 4096" not in backend_init
+
+
+def test_fp8_q_indexer_owns_req16_block_specialization():
+    source = (
+        Path(__file__).parents[4]
+        / "python/sglang/jit_kernel/csrc/deepseek_v4/main_norm_rope.cuh"
+    ).read_text()
+
+    # Keep the eight-warp tuning local to the high-load FP8 indexer.  The
+    # generic Q and FP4 indexer paths retain their four-warp launch contract.
+    assert "kFusedQBlockSize = 128" in source
+    assert "kFusedQIndexerBlockSize = 256" in source
+    assert "Q_INDEXER_KERNEL void\nfused_q_indexer_rope_hadamard_quant" in source
+    assert "Q_KERNEL void\nfused_q_indexer_rope_hadamard_fp4_quant" in source
+    assert "blockIdx.x * kFusedQIndexerNumWarps + warp_id" in source
+    assert "div_ceil(total_works, kFusedQIndexerNumWarps)" in source
+    assert "LaunchKernel(num_blocks, kFusedQIndexerBlockSize" in source
