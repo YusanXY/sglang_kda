@@ -20,11 +20,11 @@ logger = logging.getLogger(__name__)
 
 DSV4_HUGE_CONTEXT_CAPACITY = 73728
 DSV4_HUGE_MAX_EXTEND_TOKENS_PER_REQUEST = 4096
-# The Eager req128 path may aggregate 32 real requests per ForwardBatch while
-# preserving the strict 4096-token per-request cap. This halves the measured
-# workload from eight M65536 waves to four M131072 waves without changing
-# request semantics. Breakable Graph remains limited to its frozen buckets.
-DSV4_HUGE_MAX_EXTEND_TOKENS = 32 * DSV4_HUGE_MAX_EXTEND_TOKENS_PER_REQUEST
+# Eager may aggregate all 128 real requests into one ForwardBatch while
+# preserving the strict 4096-token per-request cap.  The selected aggregate
+# bucket also sizes the model-scoped GPU workspaces; Breakable Graph remains
+# limited to its frozen req1/req16 buckets.
+DSV4_HUGE_MAX_EXTEND_TOKENS = 128 * DSV4_HUGE_MAX_EXTEND_TOKENS_PER_REQUEST
 DSV4_HUGE_MAX_REQUESTS = 128
 DSV4_HUGE_PAGE_SIZE = 256
 # req=128 high-load target: 16384 cached + 4096 new tokens per request.
@@ -43,7 +43,12 @@ DSV4_HUGE_TP_SIZE = 4
 DSV4_HUGE_EP_SIZE = 4
 DSV4_FLASH_COMPRESS_RATIOS = (0, 0) + (4, 128) * 20 + (4,)
 DSV4_HUGE_GRAPH_PREFILL_TOKENS = (4096, 65536)
-DSV4_HUGE_EAGER_PREFILL_TOKENS = (*DSV4_HUGE_GRAPH_PREFILL_TOKENS, 131072)
+DSV4_HUGE_EAGER_PREFILL_TOKENS = (
+    *DSV4_HUGE_GRAPH_PREFILL_TOKENS,
+    131072,
+    262144,
+    524288,
+)
 
 
 def _is_deepseek_v4_flash(model_config) -> bool:
@@ -177,12 +182,12 @@ def validate_dsv4_huge_kernel_startup(
                 f"got {prefill_graph.backend!r}"
             )
         elif (
-            server_args.max_prefill_tokens == 131072
+            server_args.max_prefill_tokens >= 131072
             and prefill_graph.backend != Backend.DISABLED
         ):
             errors.append(
-                "req32/M131072 is an Eager-only specialization; prefill CUDA "
-                "graph must be disabled"
+                "aggregate M>=131072 is an Eager-only specialization; "
+                "prefill CUDA graph must be disabled"
             )
         elif prefill_graph.backend == Backend.BREAKABLE:
             expected_buckets = (
@@ -237,7 +242,8 @@ def validate_dsv4_huge_kernel_forward(
     num_tokens = forward_batch.extend_num_tokens
     if num_tokens is None or not 1 <= num_tokens <= DSV4_HUGE_MAX_EXTEND_TOKENS:
         raise ValueError(
-            "dsv4 huge_kernel aggregate EXTEND M must be in [1, 131072]; "
+            "dsv4 huge_kernel aggregate EXTEND M must be in "
+            f"[1, {DSV4_HUGE_MAX_EXTEND_TOKENS}]; "
             f"got {num_tokens!r}"
         )
     extend_lens = forward_batch.extend_seq_lens_cpu
