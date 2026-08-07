@@ -21,7 +21,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_m
 
 CompressRatio = Literal[0, 4, 128]
 
-_MAX_FORWARD_TOKENS = 65536
+_MAX_FORWARD_TOKENS = 131072
 _MAX_FORWARD_REQUESTS = 128
 _MAX_MHC_SPLITS = 64
 
@@ -150,7 +150,7 @@ class DSV4WholeLayerRuntime:
         self._config = config
         self._server_args = server_args
         # Both strict buckets are Q16-aligned and fit the clustered kernel's
-        # fixed M<=65536 capacity.  Keep this selected once per model so the
+        # fixed M<=131072 capacity. Keep this selected once per model so the
         # high-load path cannot silently fall back to the Q1 DeepGEMM producer.
         self._use_clustered_mqa = True
         self._generation = 0
@@ -310,7 +310,7 @@ class DSV4WholeLayerRuntime:
             )
         if not 1 <= num_tokens <= _MAX_FORWARD_TOKENS:
             raise RuntimeError(
-                "DSV4 huge runtime requires aggregate M in 1..65536, "
+                "DSV4 huge runtime requires aggregate M in 1..131072, "
                 f"got {num_tokens}"
             )
         if is_graph_capture and (batch_size, num_tokens) not in (
@@ -811,10 +811,10 @@ class DSV4WholeLayerRuntime:
                     f"DSV4 huge runtime requires --{name.replace('_', '-')}="
                     f"{expected!r}, got {actual!r}"
                 )
-        if view.max_prefill_tokens not in (4096, 65536):
+        if view.max_prefill_tokens not in (4096, 65536, 131072):
             raise RuntimeError(
                 "DSV4 huge runtime requires --max-prefill-tokens to select "
-                "4096 or 65536, got "
+                "4096, 65536, or 131072, got "
                 f"{view.max_prefill_tokens!r}"
             )
         if view.chunked_prefill_size != view.max_prefill_tokens:
@@ -835,6 +835,14 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError(
                 "DSV4 huge runtime requires prefill CUDA graph disabled or "
                 f"breakable, got {prefill_graph.backend!r}"
+            )
+        if (
+            view.max_prefill_tokens == 131072
+            and prefill_graph.backend != Backend.DISABLED
+        ):
+            raise RuntimeError(
+                "DSV4 huge req32/M131072 specialization is Eager-only; "
+                "prefill CUDA graph must be disabled"
             )
         if prefill_graph.backend == Backend.BREAKABLE:
             expected_buckets = (

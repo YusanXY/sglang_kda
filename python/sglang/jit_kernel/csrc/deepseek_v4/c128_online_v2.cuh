@@ -637,15 +637,14 @@ inline std::tuple<uint32_t, uint32_t> _plan_prefill_partial(const OnlinePrefillS
       const uint32_t chunk_off = pos - chunk_start;
       const uint32_t last_pos = seg_end - 1;
       const uint32_t last_ragged = counter + (last_pos - prefix_len);
-      RuntimeCheck(last_ragged < (1u << 16), "PlanC.ragged_id is uint16; ragged ", last_ragged, " overflows");
       RuntimeCheck(seg_len <= 128u);
       // Stash batch_id in `read_page_0` for stage 1 to translate. A
       // chunk-aligned segment never loads, so we still need stage 1 to fill
       // a slot in -- the kernel keys the load on `chunk_offset != 0`.
       const auto plan = CompressPlan{
           .seq_len = last_pos + 1u,
-          .ragged_id = static_cast<uint16_t>(last_ragged),
           .buffer_len = static_cast<uint16_t>(seg_len),
+          .ragged_id = last_ragged,
           .read_page_0 = static_cast<int32_t>(i),  // batch_id placeholder
           .read_page_1 = -1,                       // filled by stage 1 with committed-bank slot
       };

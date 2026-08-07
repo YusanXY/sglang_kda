@@ -22,26 +22,32 @@ struct alignas(16) DecodePlan {
 
 /// \brief Per-token compress plan (used by c4/c128 prefill). Layout: 16 bytes.
 struct alignas(16) CompressPlan {
-  uint32_t seq_len;
-  uint16_t ragged_id;
-  uint16_t buffer_len;
+  // `seq_len` is bounded by the model context (73728) and `buffer_len` by the
+  // largest compressor window (128).  Keep both in one 32-bit word so
+  // `ragged_id` can address aggregate eager-prefill batches larger than 64K
+  // without growing the hot plan from 16 to 32 bytes.
+  uint32_t seq_len : 24;
+  uint32_t buffer_len : 8;
+  uint32_t ragged_id;
   int32_t read_page_0;
   /// \brief Stage 0 (CPU): batch_id (used to look up page table).
   /// \brief Stage 1 (GPU): final state-pool write location.
   int32_t read_page_1;
 
+  static constexpr uint32_t kInvalidSeqLen = (1u << 24) - 1u;
+
   static SGL_DEVICE __host__ CompressPlan invalid() {
-    return CompressPlan{-1u, 0, 0, -1, -1};
+    return CompressPlan{kInvalidSeqLen, 0, 0, -1, -1};
   }
 
   SGL_DEVICE __host__ bool is_invalid() const {
-    return seq_len == -1u;
+    return seq_len == kInvalidSeqLen;
   }
 };
 
 /// \brief Per-token write plan (used by c4/c128 prefill). Layout: 8 bytes.
 struct alignas(8) WritePlan {
-  /// \brief Stage 0 (CPU): packed `(batch_id << 16) | ragged_id`.
+  /// \brief Stage 0 (CPU): packed batch/ragged id (20 ragged bits, 12 batch bits).
   /// \brief Stage 1 (GPU): just `ragged_id`.
   uint32_t ragged_id;
   /// \brief Stage 0 (CPU): position + 1 (used to look up state slot).

@@ -20,11 +20,11 @@ logger = logging.getLogger(__name__)
 
 DSV4_HUGE_CONTEXT_CAPACITY = 73728
 DSV4_HUGE_MAX_EXTEND_TOKENS_PER_REQUEST = 4096
-# The first high-load specialization is one real req=16 ForwardBatch with
-# 4096 new tokens per request.  Keep this independent from the per-request
-# limit: the old implementation accidentally serialized it into sixteen
-# aggregate-M=4096 batches and therefore hid most of the fusion opportunity.
-DSV4_HUGE_MAX_EXTEND_TOKENS = 16 * DSV4_HUGE_MAX_EXTEND_TOKENS_PER_REQUEST
+# The Eager req128 path may aggregate 32 real requests per ForwardBatch while
+# preserving the strict 4096-token per-request cap. This halves the measured
+# workload from eight M65536 waves to four M131072 waves without changing
+# request semantics. Breakable Graph remains limited to its frozen buckets.
+DSV4_HUGE_MAX_EXTEND_TOKENS = 32 * DSV4_HUGE_MAX_EXTEND_TOKENS_PER_REQUEST
 DSV4_HUGE_MAX_REQUESTS = 128
 DSV4_HUGE_PAGE_SIZE = 256
 # req=128 high-load target: 16384 cached + 4096 new tokens per request.
@@ -43,6 +43,7 @@ DSV4_HUGE_TP_SIZE = 4
 DSV4_HUGE_EP_SIZE = 4
 DSV4_FLASH_COMPRESS_RATIOS = (0, 0) + (4, 128) * 20 + (4,)
 DSV4_HUGE_GRAPH_PREFILL_TOKENS = (4096, 65536)
+DSV4_HUGE_EAGER_PREFILL_TOKENS = (*DSV4_HUGE_GRAPH_PREFILL_TOKENS, 131072)
 
 
 def _is_deepseek_v4_flash(model_config) -> bool:
@@ -120,10 +121,10 @@ def validate_dsv4_huge_kernel_startup(
         if actual != expected:
             errors.append(f"{field} must be {expected!r}, got {actual!r}")
 
-    if server_args.max_prefill_tokens not in DSV4_HUGE_GRAPH_PREFILL_TOKENS:
+    if server_args.max_prefill_tokens not in DSV4_HUGE_EAGER_PREFILL_TOKENS:
         errors.append(
             "max_prefill_tokens must select a strict Huge aggregate bucket in "
-            f"{DSV4_HUGE_GRAPH_PREFILL_TOKENS!r}, got "
+            f"{DSV4_HUGE_EAGER_PREFILL_TOKENS!r}, got "
             f"{server_args.max_prefill_tokens!r}"
         )
     if server_args.chunked_prefill_size != server_args.max_prefill_tokens:
@@ -174,6 +175,14 @@ def validate_dsv4_huge_kernel_startup(
             errors.append(
                 "prefill CUDA graph backend must be disabled or breakable, "
                 f"got {prefill_graph.backend!r}"
+            )
+        elif (
+            server_args.max_prefill_tokens == 131072
+            and prefill_graph.backend != Backend.DISABLED
+        ):
+            errors.append(
+                "req32/M131072 is an Eager-only specialization; prefill CUDA "
+                "graph must be disabled"
             )
         elif prefill_graph.backend == Backend.BREAKABLE:
             expected_buckets = (
@@ -228,7 +237,7 @@ def validate_dsv4_huge_kernel_forward(
     num_tokens = forward_batch.extend_num_tokens
     if num_tokens is None or not 1 <= num_tokens <= DSV4_HUGE_MAX_EXTEND_TOKENS:
         raise ValueError(
-            "dsv4 huge_kernel aggregate EXTEND M must be in [1, 65536]; "
+            "dsv4 huge_kernel aggregate EXTEND M must be in [1, 131072]; "
             f"got {num_tokens!r}"
         )
     extend_lens = forward_batch.extend_seq_lens_cpu
@@ -320,17 +329,13 @@ def validate_dsv4_huge_kernel_bench_args(bench_args) -> None:
             "every request must contribute 1..4096 uncached tokens after "
             f"--cache-hit-rate is applied, got {invalid_new_lens}"
         )
-    if batch_sizes and bench_args.input_len:
-        new_per_request = bench_args.input_len[0] - int(
-            bench_args.input_len[0] * cache_hit_rate
-        )
-        aggregate_m = batch_sizes[0] * new_per_request
-        if aggregate_m > DSV4_HUGE_MAX_EXTEND_TOKENS:
-            errors.append(
-                "aggregate uncached tokens must be <=65536, got "
-                f"batch={batch_sizes[0]} * new/request={new_per_request} "
-                f"= {aggregate_m}"
-            )
+    # ``batch_size * new_per_request`` is the complete benchmark workload,
+    # not the shape of one ModelRunner forward.  The Huge scheduler keeps the
+    # strict 4096-token per-request cap and admits at most the configured
+    # aggregate M=131072 into each Eager ForwardBatch. Req=128 therefore runs
+    # as multiple real req=32/M=131072 GPU batches; rejecting the outer 524288
+    # token workload here would conflate request semantics with the internal
+    # workspace bound.
     if errors:
         details = "\n  - ".join(errors)
         raise ValueError(

@@ -25,7 +25,7 @@ PAGE_SIZE = 64
 QUERIES_PER_CLUSTER = 16
 # One true req=16 high-load forward contributes 16*4096 query rows.  This is
 # a capacity bound only; req=1 continues to take an exact 4096-row view.
-MAX_TOTAL_Q = 65536
+MAX_TOTAL_Q = 131072
 MAX_C4_CONTEXT = 18432
 
 _HERE = Path(__file__).resolve().parent
@@ -125,6 +125,7 @@ def load_clustered_mqa_extension():
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "-U__CUDA_NO_HALF2_OPERATORS__",
+                "-DSGLANG_DSV4_TOPK_WARP_BITSET_SORT=1",
             ],
             extra_ldflags=["-lcuda"],
             with_cuda=True,

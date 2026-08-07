@@ -5,6 +5,9 @@
 #include <string>
 
 #include "v2_sm100_mqa_logits.cuh"
+#ifndef SGLANG_DSV4_TOPK_WARP_BITSET_SORT
+#error "clustered MQA combined-only TopK requires warp-bitset sort"
+#endif
 #define SGLANG_DSV4_TOPK_DEVICE_ONLY
 #include "../../deepseek_v4/topk_v2.cuh"
 #undef SGLANG_DSV4_TOPK_DEVICE_ONLY
@@ -156,16 +159,38 @@ void launch_topk512_sparse_prefill(
     config.attrs = &pdl_attr;
     config.numAttrs = 1;
 
+    // Strict no-Graph high-load Huge consumes only combined_indices in the
+    // following sparse-attention stage.  Select the combined-only template at
+    // the real clustered MQA+TopK launch boundary: the standalone TVM-FFI
+    // transform wrapper is not used by this path.  Keep lower-load Huge
+    // configurations on their existing CUDA specialization.
+    const bool combined_only =
+        (num_reqs == 16 && batch_size == 16 * 4096) ||
+        (num_reqs == 32 && batch_size == 32 * 4096) ||
+        (num_reqs == 128 && batch_size == 128 * 4096);
     cudaError_t status;
-    if (max_context_len <= static_cast<int>(kReg2MaxSeqLen)) {
-        status = cudaLaunchKernelEx(
-            &config, topk_main_kernel<true, 0>, params);
-    } else if (max_context_len <= static_cast<int>(kReg4MaxSeqLen)) {
-        status = cudaLaunchKernelEx(
-            &config, topk_main_kernel<true, 1>, params);
+    if (combined_only) {
+        if (max_context_len <= static_cast<int>(kReg2MaxSeqLen)) {
+            status = cudaLaunchKernelEx(
+                &config, topk_main_kernel<true, 0, true>, params);
+        } else if (max_context_len <= static_cast<int>(kReg4MaxSeqLen)) {
+            status = cudaLaunchKernelEx(
+                &config, topk_main_kernel<true, 1, true>, params);
+        } else {
+            status = cudaLaunchKernelEx(
+                &config, topk_main_kernel<true, 2, true>, params);
+        }
     } else {
-        status = cudaLaunchKernelEx(
-            &config, topk_main_kernel<true, 2>, params);
+        if (max_context_len <= static_cast<int>(kReg2MaxSeqLen)) {
+            status = cudaLaunchKernelEx(
+                &config, topk_main_kernel<true, 0>, params);
+        } else if (max_context_len <= static_cast<int>(kReg4MaxSeqLen)) {
+            status = cudaLaunchKernelEx(
+                &config, topk_main_kernel<true, 1>, params);
+        } else {
+            status = cudaLaunchKernelEx(
+                &config, topk_main_kernel<true, 2>, params);
+        }
     }
     if (status != cudaSuccess) {
         throw std::runtime_error(

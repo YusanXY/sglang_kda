@@ -26,14 +26,18 @@ using R2T_T = int32_t;
 using F2S_T = int64_t;
 using IDX_T = int64_t;
 
-/// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
+inline constexpr uint32_t kPackedRaggedBits = 20;
+inline constexpr uint32_t kPackedRaggedMask = (1u << kPackedRaggedBits) - 1u;
+inline constexpr uint32_t kPackedBatchLimit = 1u << (32u - kPackedRaggedBits);
+
+/// NOTE: stage 0 temporarily packs ragged id [19:0] and batch id [31:20].
 SGL_DEVICE __host__ PlanW pack_w(uint32_t ragged_id, uint32_t batch_id, int32_t seq_len) {
-  return {static_cast<uint32_t>(ragged_id | batch_id << 16), seq_len};
+  return {static_cast<uint32_t>(ragged_id | batch_id << kPackedRaggedBits), seq_len};
 }
 
-/// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
+/// NOTE: unpack the stage-0 representation before publishing the final plan.
 SGL_DEVICE uint2 unpack_w(PlanW plan) {
-  return {static_cast<uint16_t>(plan.ragged_id), static_cast<uint16_t>(plan.ragged_id >> 16)};
+  return {plan.ragged_id & kPackedRaggedMask, plan.ragged_id >> kPackedRaggedBits};
 }
 
 struct Prefill0Params {
@@ -220,8 +224,8 @@ __global__ __launch_bounds__(1024, 1)  //
         const uint32_t out_idx = atomicAdd(&counter_c, 1u);
         params.plan_c[out_idx] = {
             .seq_len = static_cast<uint32_t>(position + 1),
-            .ragged_id = static_cast<uint16_t>(ragged_id),
             .buffer_len = static_cast<uint16_t>(buffer_len),
+            .ragged_id = ragged_id,
             .read_page_0 = -1,
             .read_page_1 = static_cast<int32_t>(batch_id),
         };
@@ -255,8 +259,8 @@ __global__ __launch_bounds__(1024, 1)  //
           const uint32_t out_idx = atomicAdd(&counter_c, 1u);
           params.plan_c[out_idx] = {
               .seq_len = static_cast<uint32_t>(position + 1),
-              .ragged_id = static_cast<uint16_t>(ragged_id),
               .buffer_len = static_cast<uint16_t>(buffer_len),
+              .ragged_id = ragged_id,
               .read_page_0 = -1,
               .read_page_1 = static_cast<int32_t>(batch_id),
           };
@@ -528,12 +532,13 @@ inline PrefillPlan plan_compress_prefill(
   const auto f2s_ptr = static_cast<const F2S_T*>(full_to_state.data_ptr());
 
   const auto batch_size = static_cast<uint32_t>(B.unwrap());
-  // ragged_id stores an index, not a count.  uint16_t therefore covers the
-  // complete M=65536 range [0, 65535].
-  constexpr auto kMaxTokenCount =
-      static_cast<uint32_t>(std::numeric_limits<uint16_t>::max()) + 1u;
+  // The temporary WritePlan representation reserves 20 bits for ragged ids;
+  // CompressPlan itself stores the final id as uint32_t.  This covers the
+  // eager M=131072/M=262144 aggregate paths without increasing plan stride.
+  constexpr auto kMaxTokenCount = 1u << kPackedRaggedBits;
   RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
-  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokenCount);
+  RuntimeCheck(
+      batch_size <= num_q_tokens && num_q_tokens <= kMaxTokenCount && batch_size <= kPackedBatchLimit);
   // `swa_page_size` >= `ring_size` >= `compress_ratio`
   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
 
@@ -615,8 +620,8 @@ inline PrefillPlan plan_compress_prefill(
         const auto buffer_len = window_size - std::min(j + 1, window_size);
         plan_c_ptr[counter_c++] = {
             .seq_len = static_cast<uint32_t>(position + 1),
-            .ragged_id = static_cast<uint16_t>(ragged_id),
             .buffer_len = static_cast<uint16_t>(buffer_len),
+            .ragged_id = static_cast<uint32_t>(ragged_id),
             // to be filled by kernel
             .read_page_0 = -1,
             .read_page_1 = static_cast<int32_t>(i),
@@ -787,8 +792,8 @@ inline PrefillPlan plan_compress_prefill_legacy(
         const auto buffer_len = window_size - std::min(j + 1, window_size);
         plan_c_ptr[counter_c++] = {
             .seq_len = static_cast<uint32_t>(position + 1),
-            .ragged_id = static_cast<uint16_t>(ragged_id),
             .buffer_len = static_cast<uint16_t>(buffer_len),
+            .ragged_id = static_cast<uint32_t>(ragged_id),
             // to be filled by kernel
             .read_page_0 = -1,
             .read_page_1 = static_cast<int32_t>(i),

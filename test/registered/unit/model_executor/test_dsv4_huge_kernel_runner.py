@@ -302,11 +302,20 @@ def test_bench_contract_requires_single_prefill_ttft_point():
             correctness_test=False,
         )
     )
-    with pytest.raises(ValueError, match="aggregate uncached tokens"):
+    validate_dsv4_huge_kernel_bench_args(
+        SimpleNamespace(
+            batch_size=(128,),
+            input_len=(20480,),
+            output_len=(1,),
+            cache_hit_rate=0.8,
+            correctness_test=False,
+        )
+    )
+    with pytest.raises(ValueError, match="1..4096 uncached tokens"):
         validate_dsv4_huge_kernel_bench_args(
             SimpleNamespace(
                 batch_size=(128,),
-                input_len=(4096,),
+                input_len=(4097,),
                 output_len=(1,),
                 correctness_test=False,
             )

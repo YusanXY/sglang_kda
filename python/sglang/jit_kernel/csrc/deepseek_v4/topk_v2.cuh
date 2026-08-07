@@ -186,6 +186,21 @@ struct TopKLaunchParams {
       combined_lens[batch_id] = static_cast<int32_t>(plan.topk_len + plan.swa_len);
     }
   }
+
+  SGL_DEVICE void sparse_prefill_swa_epilogue(
+      uint32_t batch_id,
+      const SparsePrefillEpiloguePlan& plan) const {
+    auto* combined_row =
+        combined_indices + batch_id * combined_indices_stride;
+    for (uint32_t t = threadIdx.x; t < plan.swa_len; t += blockDim.x) {
+      combined_row[plan.topk_len + t] =
+          plan.swa_offset + static_cast<int32_t>(t);
+    }
+    if (threadIdx.x == 0) {
+      combined_lens[batch_id] =
+          static_cast<int32_t>(plan.topk_len + plan.swa_len);
+    }
+  }
 };
 
 /**
@@ -298,23 +313,33 @@ SGL_DEVICE uint32_t block_exclusive_sum_warps(
   return storage->warp_offsets[warp] + inclusive - value;
 }
 
+template <bool kCombinedOnly>
 SGL_DEVICE void write_bitset_word(
     TopKProblem& problem,
+    int32_t* __restrict__ combined_out,
+    int32_t combined_offset,
     uint32_t word,
     uint32_t bits,
     uint32_t write_base) {
   while (bits != 0) {
     const uint32_t bit = static_cast<uint32_t>(__ffs(bits) - 1);
-    problem.transform_output(
-        write_base++, static_cast<int32_t>(word * 32 + bit));
+    const int32_t raw = static_cast<int32_t>(word * 32 + bit);
+    if constexpr (kCombinedOnly) {
+      combined_out[write_base++] = raw + combined_offset;
+    } else {
+      problem.transform_output(write_base++, raw);
+    }
     bits &= bits - 1;
   }
 }
 
+template <bool kCombinedOnly>
 SGL_DEVICE void problem_transform_warp_bitset512(
     TopKProblem& problem,
     const int32_t* source_ptr,
-    WarpBitsetSortStorage* storage) {
+    WarpBitsetSortStorage* storage,
+    int32_t* __restrict__ combined_out,
+    int32_t combined_offset) {
   const uint32_t tx = threadIdx.x;
   const uint32_t num_words = (problem.seq_len + 31) >> 5;
   for (uint32_t word = tx; word < num_words; word += kBlockSize) {
@@ -354,20 +379,28 @@ SGL_DEVICE void problem_transform_warp_bitset512(
   }
 
   if (tx < num_words) {
-    write_bitset_word(problem, tx, bits0, prefix0);
+    write_bitset_word<kCombinedOnly>(
+        problem, combined_out, combined_offset, tx, bits0, prefix0);
   }
   const uint32_t word1 = tx + kBlockSize;
   if (word1 < num_words) {
-    write_bitset_word(
+    write_bitset_word<kCombinedOnly>(
         problem,
+        combined_out,
+        combined_offset,
         word1,
         bits1,
         storage->first_chunk_total + prefix1);
   }
 }
 
+template <bool kCombinedOnly = false>
 SGL_DEVICE void problem_transform(
-    TopKProblem& problem, int32_t* output_ptr, void* sort_smem) {
+    TopKProblem& problem,
+    int32_t* output_ptr,
+    void* sort_smem,
+    int32_t* combined_out = nullptr,
+    int32_t combined_offset = 0) {
   static_assert(kMaxTopK % kBlockSize == 0);
   // The radix selector emits all elements above the threshold through an
   // atomic counter. The selected set is exact, but its order depends on CTA
@@ -382,10 +415,12 @@ SGL_DEVICE void problem_transform(
 #ifdef SGLANG_DSV4_TOPK_WARP_BITSET_SORT
   if (problem.topk == kHugeIndexSortTopK &&
       problem.seq_len <= kHugeIndexSortMaxSeqLen) {
-    problem_transform_warp_bitset512(
+    problem_transform_warp_bitset512<kCombinedOnly>(
         problem,
         source_ptr,
-        static_cast<WarpBitsetSortStorage*>(sort_smem));
+        static_cast<WarpBitsetSortStorage*>(sort_smem),
+        combined_out,
+        combined_offset);
     return;
   }
 #endif
@@ -431,7 +466,7 @@ SGL_DEVICE void problem_transform(
  * - Level 2: max_seq_len <= cluster_floor  -> trivial + register<4/5> + streaming
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
-template <bool kPDL, int kLevel>
+template <bool kPDL, int kLevel, bool kCombinedOnly = false>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
@@ -501,18 +536,44 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
     device::PDLWaitPrimary<kPDLFinal>();
   }
 
-  // page-table transform pass (gathers kept out of the hot scatter loop),
-  // then trigger the dependent kernel only after the full output is written.
-  device::PDLTriggerSecondary<kPDL>();
-  __syncthreads();
-  problem_transform(problem, params.get_output_ptr(blockIdx.x), &smem);
-  if (params.combined_indices != nullptr && threadIdx.x == 0) {
-    params.prepare_sparse_prefill_epilogue(blockIdx.x, &sparse_epilogue_plan);
-  }
-  __syncthreads();
-  if (params.combined_indices != nullptr) {
-    params.sparse_prefill_epilogue(
-        blockIdx.x, sparse_epilogue_plan, epilogue_indices_ptr);
+  // The strict req16 Huge path consumes only combined_indices.  Emit the
+  // sorted compressed coordinates directly into that final attention input:
+  // this removes page-table gathers plus the page_indices/raw_indices stores
+  // and their subsequent global reload.  All other paths retain the original
+  // observable buffers and implementation.
+  if constexpr (kCombinedOnly) {
+    if (threadIdx.x == 0) {
+      params.prepare_sparse_prefill_epilogue(
+          blockIdx.x, &sparse_epilogue_plan);
+    }
+    device::PDLTriggerSecondary<kPDL>();
+    __syncthreads();
+    auto* combined_row =
+        params.combined_indices +
+        blockIdx.x * params.combined_indices_stride;
+    problem_transform<true>(
+        problem,
+        params.get_output_ptr(blockIdx.x),
+        &smem,
+        combined_row,
+        sparse_epilogue_plan.compressed_offset);
+    params.sparse_prefill_swa_epilogue(
+        blockIdx.x, sparse_epilogue_plan);
+  } else {
+    // Page-table transform pass (gathers kept out of the hot scatter loop),
+    // then trigger the dependent kernel only after the full output is written.
+    device::PDLTriggerSecondary<kPDL>();
+    __syncthreads();
+    problem_transform(problem, params.get_output_ptr(blockIdx.x), &smem);
+    if (params.combined_indices != nullptr && threadIdx.x == 0) {
+      params.prepare_sparse_prefill_epilogue(
+          blockIdx.x, &sparse_epilogue_plan);
+    }
+    __syncthreads();
+    if (params.combined_indices != nullptr) {
+      params.sparse_prefill_epilogue(
+          blockIdx.x, sparse_epilogue_plan, epilogue_indices_ptr);
+    }
   }
 }
 
@@ -855,19 +916,23 @@ struct TopKKernel {
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
 #ifdef SGLANG_DSV4_TOPK_WARP_BITSET_SORT
-    // Strict Huge req16 is validated before model execution: 16 requests each
-    // contribute 4096 new tokens after a 16384-token prefix, so every C4 row
-    // is in [4097, 5120].  CUDA Graph retains the 18432-token capacity in L;
-    // dispatch from immutable host-visible shape fields to compile level 0
-    // without reading seq_lens back from the GPU.
+    // Strict no-Graph Huge req16 is validated before model execution: 16
+    // requests each contribute 4096 new tokens after a 16384-token prefix, so
+    // every C4 row is in [4097, 5120] and Eager sizes the score stride to
+    // exactly 5120.  Dispatch only from immutable host-visible shape fields;
+    // no seq_lens device-to-host read or runtime fallback is permitted.
     const bool strict_req16_incremental =
         batch_size == 16 * 4096 && num_reqs == 16 && topk == 512 &&
-        page_bits == 6 &&
-        max_seq_len == 73728 / 4 + (1u << page_bits);
+        page_bits == 6 && max_seq_len == (16384 + 4096) / 4;
     if (strict_req16_incremental) {
       LaunchKernel(batch_size, kBlockSize, device)
           .config({.use_pdl = kUsePDL})
-          .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0>, params);
+          .launch(
+              topk_main_kernel<
+                  kUsePDL,
+                  /*kLevel=*/0,
+                  /*kCombinedOnly=*/true>,
+              params);
     } else
 #endif
     if (use_cluster) {
