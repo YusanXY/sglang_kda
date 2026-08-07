@@ -167,7 +167,6 @@ void launch_topk512_sparse_prefill(
     const bool combined_only =
         (num_reqs == 16 && batch_size == 16 * 4096) ||
         (num_reqs == 32 && batch_size == 32 * 4096) ||
-        (num_reqs == 64 && batch_size == 64 * 4096) ||
         (num_reqs == 128 && batch_size == 128 * 4096);
     cudaError_t status;
     if (combined_only) {

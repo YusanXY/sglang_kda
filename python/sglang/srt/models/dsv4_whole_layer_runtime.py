@@ -21,7 +21,7 @@ from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_m
 
 CompressRatio = Literal[0, 4, 128]
 
-_MAX_FORWARD_TOKENS = 524288
+_MAX_FORWARD_TOKENS = 131072
 _MAX_FORWARD_REQUESTS = 128
 _MAX_MHC_SPLITS = 64
 
@@ -149,11 +149,6 @@ class DSV4WholeLayerRuntime:
         self._validate_static_config(config, server_args)
         self._config = config
         self._server_args = server_args
-        # Size every model-scoped buffer to the explicitly selected Eager
-        # aggregate bucket.  Req16 keeps the small 65536 capacity, while the
-        # req128 high-load path may choose 131072/262144/524288 without
-        # allocator work inside a forward.
-        self._forward_token_capacity = int(server_args.max_prefill_tokens)
         # Both strict buckets are Q16-aligned and fit the clustered kernel's
         # fixed M<=131072 capacity. Keep this selected once per model so the
         # high-load path cannot silently fall back to the Q1 DeepGEMM producer.
@@ -213,6 +208,7 @@ class DSV4WholeLayerRuntime:
         if self._use_clustered_mqa:
             from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
                 MAX_C4_CONTEXT,
+                MAX_TOTAL_Q,
                 load_clustered_mqa_extension,
             )
 
@@ -246,7 +242,7 @@ class DSV4WholeLayerRuntime:
             # and the measured incremental request then reuse one GPU address,
             # so neither allocator growth nor a new TMA row stride enters TTFT.
             self._clustered_logits_workspace = torch.empty(
-                (self._forward_token_capacity, MAX_C4_CONTEXT),
+                (MAX_TOTAL_Q, MAX_C4_CONTEXT),
                 dtype=torch.float32,
                 device=workspace_device,
             )
@@ -312,10 +308,9 @@ class DSV4WholeLayerRuntime:
                 "DSV4 huge runtime requires 1..128 requests per EXTEND, "
                 f"got {batch_size}"
             )
-        if not 1 <= num_tokens <= self._forward_token_capacity:
+        if not 1 <= num_tokens <= _MAX_FORWARD_TOKENS:
             raise RuntimeError(
-                "DSV4 huge runtime requires aggregate M in 1.."
-                f"{self._forward_token_capacity}, "
+                "DSV4 huge runtime requires aggregate M in 1..131072, "
                 f"got {num_tokens}"
             )
         if is_graph_capture and (batch_size, num_tokens) not in (
@@ -480,24 +475,24 @@ class DSV4WholeLayerRuntime:
         # Decoder layers execute serially on one stream. Allocate the supported
         # aggregate-M capacity once; exact-T prefix views remain contiguous.
         attention_q_padded = torch.empty(
-            (self._forward_token_capacity, 64, 512),
+            (_MAX_FORWARD_TOKENS, 64, 512),
             dtype=torch.bfloat16,
             device=device,
         )
         output_q = torch.empty(
-            (self._forward_token_capacity, 2, 4096),
+            (_MAX_FORWARD_TOKENS, 2, 4096),
             dtype=torch.float8_e4m3fn,
             device=device,
         )
         # Keep this flat so each dynamic align(T, 4) gets the exact physical
         # [G, packed-K, aligned-M] stride required by DeepGEMM.
         output_s_storage = torch.empty(
-            (2 * 8 * self._forward_token_capacity,),
+            (2 * 8 * _MAX_FORWARD_TOKENS,),
             dtype=torch.int32,
             device=device,
         )
         wo_a_gemm_output = torch.empty(
-            (self._forward_token_capacity, 2, 1024),
+            (_MAX_FORWARD_TOKENS, 2, 1024),
             dtype=torch.bfloat16,
             device=device,
         )
@@ -528,12 +523,12 @@ class DSV4WholeLayerRuntime:
             # invariants validated during runtime construction. Decoder layers
             # execute serially, so one set of addresses serves all 43 layers.
             q_lora_bf16 = torch.empty(
-                (self._forward_token_capacity, 1024),
+                (_MAX_FORWARD_TOKENS, 1024),
                 dtype=torch.bfloat16,
                 device=device,
             )
             q_lora_fp8 = torch.empty(
-                (self._forward_token_capacity, 1024),
+                (_MAX_FORWARD_TOKENS, 1024),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
@@ -542,7 +537,7 @@ class DSV4WholeLayerRuntime:
             # backing store yields an exact ceil(M/4)*4 TMA stride per batch
             # without allocating in the per-layer hot path.
             q_lora_scale_storage = torch.empty(
-                (self._forward_token_capacity * 2,),
+                (_MAX_FORWARD_TOKENS * 2,),
                 dtype=torch.int32,
                 device=device,
             )
@@ -592,12 +587,12 @@ class DSV4WholeLayerRuntime:
             # backing arrays flat so every (splits,M,24) view has an exact M
             # stride rather than inheriting MAX_FORWARD_TOKENS as a pitch.
             gemm_mul_storage = torch.empty(
-                (_MAX_MHC_SPLITS * self._forward_token_capacity * 24,),
+                (_MAX_MHC_SPLITS * _MAX_FORWARD_TOKENS * 24,),
                 dtype=torch.float32,
                 device=device,
             )
             gemm_sq_storage = torch.empty(
-                (_MAX_MHC_SPLITS * self._forward_token_capacity,),
+                (_MAX_MHC_SPLITS * _MAX_FORWARD_TOKENS,),
                 dtype=torch.float32,
                 device=device,
             )
@@ -606,16 +601,16 @@ class DSV4WholeLayerRuntime:
             # layer reads ``out`` before overwriting ``mid``, so this is a
             # graph-stable ping-pong without allocator traffic in the hot path.
             residual_mid = torch.empty(
-                (self._forward_token_capacity, 4, 4096),
+                (_MAX_FORWARD_TOKENS, 4, 4096),
                 dtype=torch.bfloat16,
                 device=device,
             )
             residual_out = torch.empty_like(residual_mid)
             post = torch.empty(
-                (self._forward_token_capacity, 4), dtype=torch.float32, device=device
+                (_MAX_FORWARD_TOKENS, 4), dtype=torch.float32, device=device
             )
             comb = torch.empty(
-                (self._forward_token_capacity, 4, 4), dtype=torch.float32, device=device
+                (_MAX_FORWARD_TOKENS, 4, 4), dtype=torch.float32, device=device
             )
             # This buffer becomes the input/output of the in-place MoE path,
             # so preserve the symmetric allocation property of native mhc_pre.
@@ -629,25 +624,25 @@ class DSV4WholeLayerRuntime:
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 layer_input = torch.empty(
-                    (self._forward_token_capacity, 4096),
+                    (_MAX_FORWARD_TOKENS, 4096),
                     dtype=torch.bfloat16,
                     device=device,
                 )
             output_fp8 = torch.empty(
-                (self._forward_token_capacity, 4096),
+                (_MAX_FORWARD_TOKENS, 4096),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
             output_scale_storage = torch.empty(
-                (8 * self._forward_token_capacity,), dtype=torch.int32, device=device
+                (8 * _MAX_FORWARD_TOKENS,), dtype=torch.int32, device=device
             )
             routed_output_fp8 = torch.empty(
-                (self._forward_token_capacity, 4096),
+                (_MAX_FORWARD_TOKENS, 4096),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
             routed_output_scale = torch.empty(
-                (self._forward_token_capacity, 128),
+                (_MAX_FORWARD_TOKENS, 128),
                 dtype=torch.uint8,
                 device=device,
             )
@@ -709,12 +704,12 @@ class DSV4WholeLayerRuntime:
             # DSV4-Flash has one 512-wide shared expert.  Its group-128 scale
             # row contains four UE8M0 bytes, hence exactly one packed int32.
             shared_down_fp8 = torch.empty(
-                (self._forward_token_capacity, 512),
+                (_MAX_FORWARD_TOKENS, 512),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
             shared_down_scale_storage = torch.empty(
-                (self._forward_token_capacity,),
+                (_MAX_FORWARD_TOKENS,),
                 dtype=torch.int32,
                 device=device,
             )
@@ -816,10 +811,10 @@ class DSV4WholeLayerRuntime:
                     f"DSV4 huge runtime requires --{name.replace('_', '-')}="
                     f"{expected!r}, got {actual!r}"
                 )
-        if view.max_prefill_tokens not in (4096, 65536, 131072, 262144, 524288):
+        if view.max_prefill_tokens not in (4096, 65536, 131072):
             raise RuntimeError(
                 "DSV4 huge runtime requires --max-prefill-tokens to select "
-                "4096, 65536, 131072, 262144, or 524288, got "
+                "4096, 65536, or 131072, got "
                 f"{view.max_prefill_tokens!r}"
             )
         if view.chunked_prefill_size != view.max_prefill_tokens:
@@ -842,11 +837,11 @@ class DSV4WholeLayerRuntime:
                 f"breakable, got {prefill_graph.backend!r}"
             )
         if (
-            view.max_prefill_tokens >= 131072
+            view.max_prefill_tokens == 131072
             and prefill_graph.backend != Backend.DISABLED
         ):
             raise RuntimeError(
-                "DSV4 huge aggregate M>=131072 is Eager-only; "
+                "DSV4 huge req32/M131072 specialization is Eager-only; "
                 "prefill CUDA graph must be disabled"
             )
         if prefill_graph.backend == Backend.BREAKABLE:
