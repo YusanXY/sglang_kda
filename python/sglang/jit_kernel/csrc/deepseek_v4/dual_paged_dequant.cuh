@@ -66,22 +66,13 @@ __global__ void dual_paged_dequant_kernel(
         in_page * kScaleBytesPerToken;
     T* output_row = output + output_token * kOutputDim;
 
-    // Scale bytes are 8-byte aligned in both cache layouts.  Fetch them once
-    // as a vector in lane 0 and broadcast two words, instead of issuing seven
-    // scalar global loads and seven warp shuffles per token.
-    uint2 packed_scales = {0u, 0u};
-    if (lane == 0) {
-      packed_scales = *reinterpret_cast<const uint2*>(
-          cache + token_scale_base);
-    }
-    packed_scales.x = __shfl_sync(0xffffffffu, packed_scales.x, 0);
-    packed_scales.y = __shfl_sync(0xffffffffu, packed_scales.y, 0);
-
 #pragma unroll
     for (int tile = 0; tile < kScaleTiles; ++tile) {
-      const uint32_t scale_exp = tile < 4
-          ? ((packed_scales.x >> (tile * 8)) & 0xffu)
-          : ((packed_scales.y >> ((tile - 4) * 8)) & 0xffu);
+      uint32_t scale_exp = 0;
+      if (lane == 0) {
+        scale_exp = cache[token_scale_base + tile];
+      }
+      scale_exp = __shfl_sync(0xffffffffu, scale_exp, 0);
       // UE8M0 stores the biased FP32 exponent directly.  Exponent zero is
       // below the normal FP32 range and is flushed exactly like the Triton
       // reference implementation.
