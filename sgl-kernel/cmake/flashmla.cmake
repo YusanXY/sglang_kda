@@ -135,7 +135,7 @@ if(FLASHMLA_ENABLE_SM100)
     # this as a second checked patch so the independently useful output-only
     # specialization remains reproducible and revertible on its own.
     set(FLASHMLA_TP4_TOKEN_SHARD_MARKER
-        "void run_fwd_phase1_tp4_sharded_output_kernel(")
+        "constexpr int TP4_RESCALE_VOTE_BARRIER = 4;")
     file(READ "${FLASHMLA_HEAD64_PHASE1}"
         FLASHMLA_HEAD64_PHASE1_CONTENT_AFTER_OUTPUT_ONLY)
     string(FIND "${FLASHMLA_HEAD64_PHASE1_CONTENT_AFTER_OUTPUT_ONLY}"
@@ -145,7 +145,7 @@ if(FLASHMLA_ENABLE_SM100)
         find_program(FLASHMLA_PATCH_EXECUTABLE patch REQUIRED)
         execute_process(
             COMMAND "${FLASHMLA_PATCH_EXECUTABLE}" -p1 -i
-                "${CMAKE_CURRENT_LIST_DIR}/patches/flashmla-sm100-head64-tp4-token-shard-v5.patch"
+                "${CMAKE_CURRENT_LIST_DIR}/patches/flashmla-sm100-head64-tp4-token-shard-v6-uniform-rescale.patch"
             WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
             RESULT_VARIABLE FLASHMLA_TP4_TOKEN_SHARD_PATCH_RESULT
             OUTPUT_VARIABLE FLASHMLA_TP4_TOKEN_SHARD_PATCH_STDOUT
@@ -156,9 +156,9 @@ if(FLASHMLA_ENABLE_SM100)
                 "${FLASHMLA_TP4_TOKEN_SHARD_PATCH_STDOUT}\n"
                 "${FLASHMLA_TP4_TOKEN_SHARD_PATCH_STDERR}")
         endif()
-        message(STATUS "Patched FlashMLA SM100 h64 TP4 token-sharded sparse prefill")
+        message(STATUS "Patched FlashMLA SM100 h64 TP4 token-sharded sparse prefill v6")
     else()
-        message(STATUS "FlashMLA SM100 h64 TP4 token-sharded sparse prefill already patched")
+        message(STATUS "FlashMLA SM100 h64 TP4 token-sharded sparse prefill v6 already patched")
     endif()
 endif()
 
