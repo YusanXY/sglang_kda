@@ -318,10 +318,10 @@ class DSV4WholeLayerRuntime:
         """Replicate C4 WO weights once so projection stays token sharded.
 
         The first C4 all-to-all makes every rank the owner of one contiguous
-        token quarter and all eight attention output groups.  Replicating the
-        two projection weights at load time lets that owner finish WO_A/WO_B
-        locally.  The eager hot path then needs only one final BF16 all-gather,
-        rather than a packed-output all-to-all followed by WO_B all-reduce.
+        token quarter and all eight attention output groups. Replicating WO_A
+        at load time lets that owner project before a 4x-smaller packed return
+        all-to-all. WO_B remains locally sharded and keeps its original
+        all-reduce numerical contract.
 
         DeepGEMM scale tensors are logical transposes over contiguous physical
         storage.  Gather the physical words and restore the documented strides
@@ -393,32 +393,14 @@ class DSV4WholeLayerRuntime:
                     8, 8, 1024
                 ).permute(0, 2, 1)
 
-                attn._dsv4_huge_full_wo_b_weight = tp_group.all_gather(
-                    local_wo_b_weight.contiguous(), dim=1
-                )
-                wo_b_words = local_wo_b_scale.untyped_storage().nbytes() // 4
-                local_wo_b_physical = local_wo_b_scale.as_strided(
-                    (wo_b_words,), (1,)
-                )
-                full_wo_b_physical = tp_group.all_gather(
-                    local_wo_b_physical, dim=0
-                )
-                attn._dsv4_huge_full_wo_b_scale = full_wo_b_physical.view(
-                    16, 4096
-                ).transpose(0, 1)
-
                 if (
                     tuple(attn._dsv4_huge_full_wo_a_weight.shape)
                     != (8192, 4096)
                     or attn._dsv4_huge_full_wo_a_scale.stride()
                     != (8192, 1, 1024)
-                    or tuple(attn._dsv4_huge_full_wo_b_weight.shape)
-                    != (4096, 8192)
-                    or attn._dsv4_huge_full_wo_b_scale.stride()
-                    != (1, 4096)
                 ):
                     raise RuntimeError(
-                        f"layer {layer_id}: failed to construct full C4 WO layouts"
+                        f"layer {layer_id}: failed to construct full C4 WO_A layout"
                     )
 
     def begin_forward(
@@ -717,24 +699,21 @@ class DSV4WholeLayerRuntime:
             )
             q_recv = torch.empty_like(q_local)
             # After the first Q all-to-all and FlashMLA complete, both BF16
-            # buffers are dead for the current layer.  Reinterpret their first
-            # 8256 bytes/token as the packed FP8+scale send/receive rows.  The
-            # aliases are built once here; the 21 C4 layers perform no view or
-            # allocation work on the hot path.
-            packed_row_bytes = 8256
+            # buffers are dead for the current layer. Reinterpret their first
+            # 2064 bytes/token as post-WO_A FP8+scale send/receive rows. Each
+            # row carries one rank's 2048 WO_B inputs and sixteen scales.
+            packed_row_bytes = 2064
             packed_send = q_local.view(torch.uint8).reshape(-1)[
                 : _MAX_FORWARD_TOKENS * packed_row_bytes
             ].view(_MAX_FORWARD_TOKENS, packed_row_bytes)
             packed_recv = q_recv.view(torch.uint8).reshape(-1)[
                 : _MAX_FORWARD_TOKENS * packed_row_bytes
             ].view(_MAX_FORWARD_TOKENS, packed_row_bytes)
-            packed_recv_q = packed_recv[:, :8192].view(
+            packed_recv_q = packed_recv[:, :2048].view(
                 torch.float8_e4m3fn
-            ).view(_MAX_FORWARD_TOKENS, 2, 4096)
-            # v10 C4 projects only the local token shard through replicated
-            # WO_A/WO_B weights, then gathers the final hidden states.  Q is
-            # dead by that point, so its first half is the exact contiguous
-            # [max_tokens, hidden_size] gather destination at zero extra bytes.
+            ).view(_MAX_FORWARD_TOKENS, 2048)
+            # Retain the alias field for descriptor ABI stability across the
+            # profiled v10/v12 experiments; v12 does not launch an all-gather.
             projected_gather = q_local.view(-1)[
                 : _MAX_FORWARD_TOKENS * 4096
             ].view(_MAX_FORWARD_TOKENS, 4096)

@@ -1330,7 +1330,17 @@ def prepare_block_fp8_matmul_inputs(
 
     assert A.shape[-1] == B.shape[-1]
     assert A.shape[:-1] == As.shape[:-1]
-    assert A.is_contiguous()
+    # DeepGEMM's Blackwell TMA path accepts a padded leading dimension as long
+    # as K remains contiguous and both the base and row starts are 16B aligned.
+    # DSV4 huge-kernel uses the row tail to carry packed UE8M0 scales through
+    # TP all-to-all, avoiding a second full-size FP8 transpose/copy before WO_B.
+    assert A.is_contiguous() or (
+        A.ndim == 2
+        and A.stride(1) == 1
+        and A.stride(0) >= A.shape[1]
+        and A.data_ptr() % 16 == 0
+        and (A.stride(0) * A.element_size()) % 16 == 0
+    ), f"unsupported block-FP8 activation layout: {A.shape=} {A.stride()=}"
 
     if As.dtype == torch.float:
         assert triton.cdiv(A.shape[-1], block_k) == As.shape[-1]

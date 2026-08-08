@@ -1486,33 +1486,32 @@ class MQALayer(MqaAttentionBase):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         if tp4_token_shard_attention:
-            from sglang.srt.layers.quantization.fp8_utils import (
-                deepgemm_w8a8_block_fp8_linear_with_fallback,
+            from sglang.jit_kernel.dsv4.e2e import (
+                tp4_pack_wo_b_input_ue8m0,
+                tp4_unpack_wo_b_scale_ue8m0,
             )
 
-            wo_b_weight = getattr(self, "_dsv4_huge_full_wo_b_weight", None)
-            wo_b_scale = getattr(self, "_dsv4_huge_full_wo_b_scale", None)
-            projected_gather = e2e_descriptor.attention_projected_gather
+            packed_send = e2e_descriptor.attention_packed_send
+            packed_recv = e2e_descriptor.attention_packed_recv
+            packed_recv_q = e2e_descriptor.attention_packed_recv_q
             if (
-                wo_b_weight is None
-                or wo_b_scale is None
-                or projected_gather is None
+                packed_send is None
+                or packed_recv is None
+                or packed_recv_q is None
             ):
                 raise RuntimeError(
-                    f"layer {self.layer_id}: full C4 WO_B/gather buffers were not bound"
+                    f"layer {self.layer_id}: packed C4 WO_B buffers were not bound"
                 )
-            projected_local = deepgemm_w8a8_block_fp8_linear_with_fallback(
-                input=o.flatten(1),
-                weight=wo_b_weight,
-                block_size=[128, 128],
-                weight_scale=wo_b_scale,
-                input_scale=None,
-                bias=None,
+            tp4_pack_wo_b_input_ue8m0(o, packed_send)
+            get_tp_group().all_to_all_single(packed_recv, packed_send)
+            aligned_tokens = (e2e_descriptor.num_tokens + 3) // 4 * 4
+            wo_b_scale_storage = e2e_descriptor.wo_a_output_s_storage.view(-1)[
+                : 4 * aligned_tokens
+            ].view(4, aligned_tokens)
+            wo_b_input_scale = tp4_unpack_wo_b_scale_ue8m0(
+                packed_recv, wo_b_scale_storage
             )
-            get_tp_group().all_gather_into_tensor(
-                projected_gather, projected_local.contiguous()
-            )
-            o = projected_gather
+            o, _ = self.wo_b((packed_recv_q, wo_b_input_scale))
         else:
             o, _ = self.wo_b(o.flatten(1))
             if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:

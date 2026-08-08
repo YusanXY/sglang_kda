@@ -559,4 +559,156 @@ struct TP4PackedOutputUE8M0Kernel {
   }
 };
 
+// v12 moves the return all-to-all behind WO_A.  One destination rank owns
+// two 1024-wide WO_A groups, so each communicated row contains 2048 FP8 codes
+// plus sixteen UE8M0 bytes (one per 128 values): 2064 bytes/token instead of
+// the v9 attention-output row's 8256 bytes/token.
+constexpr int64_t kTP4PackedWoBQBytes = 2048;
+constexpr int64_t kTP4PackedWoBScaleBytes = 2048 / kQuantGroup;
+constexpr int64_t kTP4PackedWoBRowBytes =
+    kTP4PackedWoBQBytes + kTP4PackedWoBScaleBytes;
+
+template <typename T, bool kUsePDL>
+__global__ void tp4_pack_wo_b_input_kernel(
+    const T* __restrict__ input,
+    uint8_t* __restrict__ packed_output,
+    int64_t shard_tokens) {
+  static_assert(sizeof(T) == 2);
+  device::PDLWaitPrimary<kUsePDL>();
+
+  const int64_t row = blockIdx.x;
+  const int destination = static_cast<int>(row / shard_tokens);
+  const int64_t token = row - static_cast<int64_t>(destination) * shard_tokens;
+  const int group = threadIdx.x / kThreadsPerGroup;
+  const int lane = threadIdx.x % kThreadsPerGroup;
+  constexpr int kGroupsPerDestination = kTP4PackedWoBQBytes / kQuantGroup;
+  static_assert(kGroupsPerDestination == kGroupsPerBlock);
+  if (destination < 4 && group < kGroupsPerDestination) {
+    constexpr int kVec = kInputVecBytes / sizeof(T);
+    const int64_t input_offset =
+        token * (4 * kTP4PackedWoBQBytes) +
+        static_cast<int64_t>(destination) * kTP4PackedWoBQBytes +
+        static_cast<int64_t>(group) * kQuantGroup;
+    int4 raw[kInputInt4Count];
+    T* values_t = reinterpret_cast<T*>(raw);
+#pragma unroll
+    for (uint32_t i = 0; i < kInputInt4Count; ++i) {
+      raw[i] = reinterpret_cast<const int4*>(
+          input + input_offset + lane * kVec)[i];
+    }
+    float values[kVec];
+    float local_absmax = kLocalAbsmaxFloor;
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+      values[i] = static_cast<float>(values_t[i]);
+      local_absmax = fmaxf(local_absmax, fabsf(values[i]));
+    }
+    const float absmax = subgroup_reduce_max<kThreadsPerGroup>(local_absmax);
+    constexpr float kFP8MaxInv = 1.0f / kFP8E4M3Max;
+    const int32_t scale_ue8m0 = cast_to_ue8m0(absmax * kFP8MaxInv);
+    const float quant_mul = inv_scale_ue8m0(scale_ue8m0);
+    int4 packed;
+    auto* packed_pairs = reinterpret_cast<fp8x2_e4m3_t*>(&packed);
+#pragma unroll
+    for (int i = 0; i < kVec; i += 2) {
+      packed_pairs[i / 2] =
+          pack_fp8(values[i] * quant_mul, values[i + 1] * quant_mul);
+    }
+    const int64_t row_offset = row * kTP4PackedWoBRowBytes;
+    *reinterpret_cast<int4*>(
+        packed_output + row_offset + group * kQuantGroup + lane * kVec) =
+        packed;
+    if (lane == 0) {
+      packed_output[
+          row_offset + kTP4PackedWoBQBytes + group] =
+          static_cast<uint8_t>(scale_ue8m0);
+    }
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+template <bool kUsePDL>
+__global__ void tp4_unpack_wo_b_scale_kernel(
+    const uint8_t* __restrict__ packed_input,
+    uint32_t* __restrict__ output_s,
+    int64_t num_tokens,
+    int64_t aligned_num_tokens) {
+  device::PDLWaitPrimary<kUsePDL>();
+  const int64_t token = blockIdx.x;
+  constexpr int kPackedScalesPerToken =
+      kTP4PackedWoBScaleBytes / sizeof(uint32_t);
+  if (token < num_tokens && threadIdx.x < kPackedScalesPerToken) {
+    const uint8_t* row = packed_input + token * kTP4PackedWoBRowBytes;
+    output_s[static_cast<int64_t>(threadIdx.x) * aligned_num_tokens + token] =
+        reinterpret_cast<const uint32_t*>(
+            row + kTP4PackedWoBQBytes)[threadIdx.x];
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+template <typename T, int kHeadDim, int kRopeDim, bool kUsePDL>
+struct TP4PackedWoBInputUE8M0Kernel {
+  static void pack(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView packed_output) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto SSize = SymbolicSize{"shard_tokens"};
+    auto TSize = SymbolicSize{"packed_tokens"};
+    TensorMatcher({SSize, 8, 1024})
+        .with_strides({8192, 1024, 1})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(input);
+    TensorMatcher({TSize, kTP4PackedWoBRowBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(packed_output);
+    const int64_t shard_tokens = SSize.unwrap();
+    const int64_t packed_tokens = TSize.unwrap();
+    RuntimeCheck(
+        packed_tokens == 4 * shard_tokens,
+        "TP4 WO_B pack requires four destination shards");
+    if (packed_tokens == 0) return;
+    LaunchKernel(dim3(packed_tokens), dim3(128), device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_pack_wo_b_input_kernel<T, kUsePDL>,
+            static_cast<const T*>(input.data_ptr()),
+            static_cast<uint8_t*>(packed_output.data_ptr()),
+            shard_tokens);
+  }
+
+  static void unpack_scale(
+      tvm::ffi::TensorView packed_input,
+      tvm::ffi::TensorView output_s) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto TSize = SymbolicSize{"num_tokens"};
+    auto ASize = SymbolicSize{"aligned_num_tokens"};
+    TensorMatcher({TSize, kTP4PackedWoBRowBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(packed_input);
+    TensorMatcher({4, ASize})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(output_s);
+    const int64_t num_tokens = TSize.unwrap();
+    const int64_t aligned_num_tokens = ASize.unwrap();
+    RuntimeCheck(
+        aligned_num_tokens >= num_tokens && aligned_num_tokens % 4 == 0,
+        "TP4 WO_B scale storage must use align(T, 4)");
+    if (num_tokens == 0) return;
+    LaunchKernel(dim3(num_tokens), dim3(32), device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_unpack_wo_b_scale_kernel<kUsePDL>,
+            static_cast<const uint8_t*>(packed_input.data_ptr()),
+            static_cast<uint32_t*>(output_s.data_ptr()),
+            num_tokens,
+            aligned_num_tokens);
+  }
+};
+
 }  // namespace

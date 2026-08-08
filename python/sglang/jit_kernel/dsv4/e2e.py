@@ -486,6 +486,11 @@ def _jit_tp4_packed_output_module(
                 "unpack_scale",
                 f"TP4PackedOutputUE8M0Kernel<{args}>::unpack_scale",
             ),
+            ("pack_wob", f"TP4PackedWoBInputUE8M0Kernel<{args}>::pack"),
+            (
+                "unpack_wob_scale",
+                f"TP4PackedWoBInputUE8M0Kernel<{args}>::unpack_scale",
+            ),
         ],
         extra_cuda_cflags=["--use_fast_math"],
     )
@@ -619,6 +624,108 @@ def tp4_unpack_attention_scale_ue8m0(
     return output_s_storage.permute(2, 0, 1)[:num_tokens]
 
 
+_TP4_PACKED_WOB_ROW_BYTES = 2048 + 2048 // _QUANT_GROUP_SIZE
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_pack_wo_b_input_ue8m0",
+    mutates_args=["packed_output"],
+)
+def _tp4_pack_wo_b_input_custom_op(
+    input: torch.Tensor,
+    packed_output: torch.Tensor,
+) -> None:
+    module = _jit_tp4_packed_output_module(
+        input.dtype,
+        _HEAD_DIM,
+        _ROPE_DIM,
+        is_arch_support_pdl(),
+    )
+    module.pack_wob(input, packed_output)
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_unpack_wo_b_scale_ue8m0",
+    mutates_args=["output_s"],
+)
+def _tp4_unpack_wo_b_scale_custom_op(
+    packed_input: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    module = _jit_tp4_packed_output_module(
+        torch.bfloat16,
+        _HEAD_DIM,
+        _ROPE_DIM,
+        is_arch_support_pdl(),
+    )
+    module.unpack_wob_scale(packed_input, output_s)
+
+
+@debug_kernel_api
+def tp4_pack_wo_b_input_ue8m0(
+    input: torch.Tensor,
+    packed_output: torch.Tensor,
+) -> torch.Tensor:
+    """Quantize local-token full WO_A output into four NCCL destinations."""
+    if input.device.type != "cuda" or torch.version.hip is not None:
+        raise RuntimeError("TP4 packed WO_B input requires NVIDIA CUDA")
+    if (
+        input.dtype != torch.bfloat16
+        or input.ndim != 3
+        or input.shape[1:] != (8, 1024)
+        or not input.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 packed WO_B input must be contiguous BF16 [shard_T,8,1024]"
+        )
+    expected_output = (input.shape[0] * 4, _TP4_PACKED_WOB_ROW_BYTES)
+    if (
+        packed_output.shape != expected_output
+        or packed_output.dtype != torch.uint8
+        or packed_output.device != input.device
+        or not packed_output.is_contiguous()
+    ):
+        raise RuntimeError(
+            "packed WO_B output must be contiguous CUDA uint8 "
+            f"{expected_output}"
+        )
+    if input.numel():
+        _tp4_pack_wo_b_input_custom_op(input, packed_output)
+    return packed_output
+
+
+@debug_kernel_api
+def tp4_unpack_wo_b_scale_ue8m0(
+    packed_input: torch.Tensor,
+    output_s_storage: torch.Tensor,
+) -> torch.Tensor:
+    """Transpose received WO_B UE8M0 tails into DeepGEMM input layout."""
+    if (
+        packed_input.ndim != 2
+        or packed_input.shape[1] != _TP4_PACKED_WOB_ROW_BYTES
+        or packed_input.dtype != torch.uint8
+        or packed_input.device.type != "cuda"
+        or not packed_input.is_contiguous()
+    ):
+        raise RuntimeError(
+            f"packed WO_B input must be CUDA uint8 [T,{_TP4_PACKED_WOB_ROW_BYTES}]"
+        )
+    num_tokens = packed_input.shape[0]
+    aligned_tokens = (num_tokens + 3) // 4 * 4
+    if (
+        output_s_storage.shape != (4, aligned_tokens)
+        or output_s_storage.dtype != torch.int32
+        or output_s_storage.device != packed_input.device
+        or not output_s_storage.is_contiguous()
+    ):
+        raise RuntimeError(
+            "WO_B scale storage must be contiguous int32 [4,align(T,4)]"
+        )
+    if packed_input.numel():
+        _tp4_unpack_wo_b_scale_custom_op(packed_input, output_s_storage)
+    return output_s_storage.transpose(0, 1)[:num_tokens]
+
+
 __all__ = [
     "inverse_rope_fp8_wo_a_ue8m0",
     "load_mhc_post_vec8_extension",
@@ -626,5 +733,7 @@ __all__ = [
     "mhc_post_vec8",
     "mhc_pre_norm_mxfp8_quant",
     "tp4_pack_attention_output_ue8m0",
+    "tp4_pack_wo_b_input_ue8m0",
     "tp4_unpack_attention_scale_ue8m0",
+    "tp4_unpack_wo_b_scale_ue8m0",
 ]
