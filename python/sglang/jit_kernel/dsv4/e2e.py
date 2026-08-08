@@ -475,12 +475,15 @@ def _jit_tp4_packed_output_module(
 ) -> Module:
     args = make_cpp_args(input_dtype, head_dim, rope_dim, use_pdl)
     return load_jit(
-        make_name("tp4_packed_attention_output_ue8m0"),
+        make_name("tp4_packed_attention_output_scale_only_ue8m0"),
         *args,
         cuda_files=["deepseek_v4/inverse_rope_fp8_wo_a.cuh"],
         cuda_wrappers=[
             ("pack", f"TP4PackedOutputUE8M0Kernel<{args}>::pack"),
-            ("unpack", f"TP4PackedOutputUE8M0Kernel<{args}>::unpack"),
+            (
+                "unpack_scale",
+                f"TP4PackedOutputUE8M0Kernel<{args}>::unpack_scale",
+            ),
         ],
         extra_cuda_cflags=["--use_fast_math"],
     )
@@ -506,12 +509,11 @@ def _tp4_pack_attention_output_custom_op(
 
 
 @register_custom_op(
-    op_name="dsv4_tp4_unpack_attention_output_ue8m0",
-    mutates_args=["output_q", "output_s"],
+    op_name="dsv4_tp4_unpack_attention_scale_ue8m0",
+    mutates_args=["output_s"],
 )
-def _tp4_unpack_attention_output_custom_op(
+def _tp4_unpack_attention_scale_custom_op(
     packed_input: torch.Tensor,
-    output_q: torch.Tensor,
     output_s: torch.Tensor,
 ) -> None:
     module = _jit_tp4_packed_output_module(
@@ -520,7 +522,7 @@ def _tp4_unpack_attention_output_custom_op(
         _ROPE_DIM,
         is_arch_support_pdl(),
     )
-    module.unpack(packed_input, output_q, output_s)
+    module.unpack_scale(packed_input, output_s)
 
 
 @debug_kernel_api
@@ -576,12 +578,15 @@ def tp4_pack_attention_output_ue8m0(
 
 
 @debug_kernel_api
-def tp4_unpack_attention_output_ue8m0(
+def tp4_unpack_attention_scale_ue8m0(
     packed_input: torch.Tensor,
-    output_q: torch.Tensor,
     output_s_storage: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Unpack a received TP4 FP8 row into DeepGEMM WO_A operands."""
+) -> torch.Tensor:
+    """Transpose only the received UE8M0 tail into DeepGEMM's scale layout.
+
+    The FP8 prefix remains in ``packed_input`` and is consumed through a
+    prebuilt ``[T,2,4096]`` view with token stride 8256.
+    """
 
     if (
         packed_input.ndim != 2
@@ -594,13 +599,6 @@ def tp4_unpack_attention_output_ue8m0(
             "packed_input must be contiguous CUDA uint8 [T, 8256]"
         )
     num_tokens = packed_input.shape[0]
-    if (
-        output_q.shape != (num_tokens, 2, 4096)
-        or output_q.dtype != torch.float8_e4m3fn
-        or output_q.device != packed_input.device
-        or not output_q.is_contiguous()
-    ):
-        raise RuntimeError("TP4 unpack output_q must be contiguous FP8 [T,2,4096]")
     aligned_tokens = (num_tokens + 3) // 4 * 4
     if (
         output_s_storage.shape != (2, 8, aligned_tokens)
@@ -612,12 +610,11 @@ def tp4_unpack_attention_output_ue8m0(
             "TP4 unpack scale storage must be contiguous int32 [2,8,align(T,4)]"
         )
     if packed_input.numel():
-        _tp4_unpack_attention_output_custom_op(
+        _tp4_unpack_attention_scale_custom_op(
             packed_input,
-            output_q,
             output_s_storage,
         )
-    return output_q, output_s_storage.permute(2, 0, 1)[:num_tokens]
+    return output_s_storage.permute(2, 0, 1)[:num_tokens]
 
 
 __all__ = [
@@ -627,5 +624,5 @@ __all__ = [
     "mhc_post_vec8",
     "mhc_pre_norm_mxfp8_quant",
     "tp4_pack_attention_output_ue8m0",
-    "tp4_unpack_attention_output_ue8m0",
+    "tp4_unpack_attention_scale_ue8m0",
 ]

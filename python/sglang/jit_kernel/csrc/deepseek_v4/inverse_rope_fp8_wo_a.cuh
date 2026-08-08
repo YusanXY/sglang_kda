@@ -417,9 +417,8 @@ __global__ void tp4_pack_inverse_rope_fp8_wo_a_kernel(
 }
 
 template <bool kUsePDL>
-__global__ void tp4_unpack_fp8_wo_a_kernel(
+__global__ void tp4_unpack_fp8_wo_a_scale_kernel(
     const uint8_t* __restrict__ packed_input,
-    fp8_e4m3_t* __restrict__ output_q,
     uint32_t* __restrict__ output_s,
     int64_t num_tokens,
     int64_t aligned_num_tokens) {
@@ -427,28 +426,14 @@ __global__ void tp4_unpack_fp8_wo_a_kernel(
   const int64_t token = blockIdx.x;
   if (token < num_tokens) {
     const uint8_t* row = packed_input + token * kTP4PackedRowBytes;
-    uint8_t* q = reinterpret_cast<uint8_t*>(output_q) +
-        token * kTP4PackedQBytes;
-    constexpr int kCopyBytes = 32;
-    const int64_t byte_offset = threadIdx.x * kCopyBytes;
-    *reinterpret_cast<int4*>(q + byte_offset) =
-        *reinterpret_cast<const int4*>(row + byte_offset);
-    *reinterpret_cast<int4*>(q + byte_offset + sizeof(int4)) =
-        *reinterpret_cast<const int4*>(
-            row + byte_offset + sizeof(int4));
-
-    if (threadIdx.x < kTP4PackedScaleBytes) {
-      const int scale = threadIdx.x;
-      const int outer = scale / (4096 / kQuantGroup);
-      const int hidden_group = scale % (4096 / kQuantGroup);
-      const int packed_hidden_group = hidden_group / 4;
-      const int packed_byte = hidden_group % 4;
-      reinterpret_cast<uint8_t*>(output_s)[
-          ((static_cast<int64_t>(outer) * 8 + packed_hidden_group) *
-               aligned_num_tokens +
-           token) *
-              sizeof(uint32_t) +
-          packed_byte] = row[kTP4PackedQBytes + scale];
+    // The FP8 Q prefix is already a legal strided DeepGEMM operand. Only the
+    // 64 scale bytes need a token-major -> group-major transpose. One warp
+    // handles one token; 16 lanes move one packed uint32 each.
+    constexpr int kPackedScalesPerToken = kTP4PackedScaleBytes / sizeof(uint32_t);
+    if (threadIdx.x < kPackedScalesPerToken) {
+      const int packed_scale = threadIdx.x;
+      output_s[static_cast<int64_t>(packed_scale) * aligned_num_tokens + token] =
+          reinterpret_cast<const uint32_t*>(row + kTP4PackedQBytes)[packed_scale];
     }
   }
   device::PDLTriggerSecondary<kUsePDL>();
@@ -540,9 +525,8 @@ struct TP4PackedOutputUE8M0Kernel {
     }
   }
 
-  static void unpack(
+  static void unpack_scale(
       tvm::ffi::TensorView packed_input,
-      tvm::ffi::TensorView output_q,
       tvm::ffi::TensorView output_s) {
     using namespace host;
     auto device = SymbolicDevice{};
@@ -553,10 +537,6 @@ struct TP4PackedOutputUE8M0Kernel {
         .with_dtype<uint8_t>()
         .with_device(device)
         .verify(packed_input);
-    TensorMatcher({TSize, 2, 4096})
-        .with_dtype<fp8_e4m3_t>()
-        .with_device(device)
-        .verify(output_q);
     TensorMatcher({2, 8, ASize})
         .with_dtype<int32_t>()
         .with_device(device)
@@ -567,11 +547,10 @@ struct TP4PackedOutputUE8M0Kernel {
         aligned_num_tokens >= num_tokens && aligned_num_tokens % 4 == 0,
         "TP4 unpack scale storage must use align(T, 4)");
     if (num_tokens == 0) return;
-    LaunchKernel(dim3(num_tokens), dim3(256), device.unwrap())
+    LaunchKernel(dim3(num_tokens), dim3(32), device.unwrap())
         .enable_pdl(kUsePDL)(
-            tp4_unpack_fp8_wo_a_kernel<kUsePDL>,
+            tp4_unpack_fp8_wo_a_scale_kernel<kUsePDL>,
             static_cast<const uint8_t*>(packed_input.data_ptr()),
-            static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
             static_cast<uint32_t*>(output_s.data_ptr()),
             num_tokens,
             aligned_num_tokens);

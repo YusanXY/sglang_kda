@@ -1337,7 +1337,7 @@ class MQALayer(MqaAttentionBase):
                             e2e_descriptor.attention_q_recv,
                             e2e_descriptor.attention_packed_send,
                             e2e_descriptor.attention_packed_recv,
-                            e2e_descriptor.wo_a_output_q,
+                            e2e_descriptor.attention_packed_recv_q,
                             e2e_descriptor.wo_a_output_s_storage,
                             self.freqs_cis,
                             positions,
@@ -1361,9 +1361,10 @@ class MQALayer(MqaAttentionBase):
                 )
             if tp4_token_shard_attention:
                 # The backend already inverse-rotated and quantized on the
-                # token-shard owner, moved one packed FP8+scale row through
-                # NCCL, and unpacked directly into DeepGEMM's two operands.
-                o_fp8 = e2e_descriptor.wo_a_output_q
+                # token-shard owner and moved one packed FP8+scale row through
+                # NCCL. DeepGEMM directly reads the strided FP8 prefix; only
+                # the 64-byte scale tail is transposed after communication.
+                o_fp8 = o
                 o_s = e2e_descriptor.wo_a_output_s_storage.permute(2, 0, 1)[
                     : o_fp8.shape[0]
                 ]

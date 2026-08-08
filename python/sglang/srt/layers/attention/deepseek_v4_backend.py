@@ -2143,7 +2143,7 @@ class DeepseekV4AttnBackend(
                 q_recv,
                 packed_send,
                 packed_recv,
-                output_q,
+                packed_recv_q,
                 output_s_storage,
                 freqs_cis,
                 positions,
@@ -2172,10 +2172,14 @@ class DeepseekV4AttnBackend(
             ):
                 raise RuntimeError("TP4 token-sharded workspaces must be contiguous")
             if (
-                output_q.shape != (q_flat.shape[0], 2, 4096)
-                or output_q.dtype != torch.float8_e4m3fn
+                packed_recv_q.shape != (q_flat.shape[0], 2, 4096)
+                or packed_recv_q.dtype != torch.float8_e4m3fn
+                or packed_recv_q.stride() != (8256, 4096, 1)
             ):
-                raise RuntimeError("TP4 FP8 output must be [M,2,4096]")
+                raise RuntimeError(
+                    "TP4 packed FP8 Q view must be [M,2,4096] with "
+                    "stride=(8256,4096,1)"
+                )
             num_tokens = q_flat.shape[0]
             tp_group = get_tp_group()
             if tp_group.world_size != 4 or num_tokens % 4 != 0:
@@ -2205,7 +2209,7 @@ class DeepseekV4AttnBackend(
             )
             from sglang.jit_kernel.dsv4.e2e import (
                 tp4_pack_attention_output_ue8m0,
-                tp4_unpack_attention_output_ue8m0,
+                tp4_unpack_attention_scale_ue8m0,
             )
 
             tp4_pack_attention_output_ue8m0(
@@ -2215,15 +2219,13 @@ class DeepseekV4AttnBackend(
                 packed_send,
             )
             tp_group.all_to_all_single(packed_recv, packed_send)
-            tp4_unpack_attention_output_ue8m0(
+            tp4_unpack_attention_scale_ue8m0(
                 packed_recv,
-                output_q,
                 output_s_storage,
             )
-            # The caller consumes output_q/output_s_storage directly.  Return
-            # q_flat only to preserve the AttentionBackend Tensor ABI without
-            # allocating a dead BF16 output.
-            return q_flat
+            # DeepGEMM accepts the packed row's Q prefix with token stride
+            # 8256. The caller consumes this view and group-major scales.
+            return packed_recv_q
 
         kda_sparse_prefill = get_kda_operator(
             "deepseek_v4.sparse_prefill_attention"
