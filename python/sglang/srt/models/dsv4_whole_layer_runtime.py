@@ -110,6 +110,13 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_wob_q_chunks: Any
     attention_wob_s_chunks: Any
     attention_wob_partial_chunks: Any
+    attention_wob_output_handle: Any
+    attention_wob_output_peer0: Optional[torch.Tensor]
+    attention_wob_output_peer1: Optional[torch.Tensor]
+    attention_wob_output_peer2: Optional[torch.Tensor]
+    attention_wob_output_peer3: Optional[torch.Tensor]
+    attention_wob_output_rank: int
+    attention_wob_direct_gather: bool
     attention_symm_handle: Any
     attention_symm_peer0: Optional[torch.Tensor]
     attention_symm_peer1: Optional[torch.Tensor]
@@ -193,6 +200,12 @@ class DSV4WholeLayerRuntime:
         self._use_tp4_local_wob = (
             os.environ.get("SGLANG_DSV4_HUGE_TP4_LOCAL_WOB", "0") == "1"
         )
+        self._use_tp4_local_wob_direct_gather = (
+            os.environ.get(
+                "SGLANG_DSV4_HUGE_TP4_LOCAL_WOB_DIRECT_GATHER", "0"
+            )
+            == "1"
+        )
         if self._use_tp4_symmetric_wob and not self._use_tp4_token_shard_attention:
             raise RuntimeError(
                 "TP4 symmetric WO_B A2A requires TP4 token-sharded attention"
@@ -208,6 +221,13 @@ class DSV4WholeLayerRuntime:
         if self._use_tp4_local_wob and self._use_tp4_symmetric_wob:
             raise RuntimeError(
                 "TP4 local WO_B and symmetric/direct-push WO_B are exclusive"
+            )
+        if (
+            self._use_tp4_local_wob_direct_gather
+            and not self._use_tp4_local_wob
+        ):
+            raise RuntimeError(
+                "TP4 direct output gather requires the local WO_B path"
             )
         self._generation = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
@@ -241,6 +261,7 @@ class DSV4WholeLayerRuntime:
             ]
         ] = None
         self._tp4_symmetric_workspace: Optional[tuple] = None
+        self._tp4_local_wob_output_workspace: Optional[tuple] = None
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
         ] = None
@@ -312,6 +333,8 @@ class DSV4WholeLayerRuntime:
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
         if self._use_tp4_symmetric_wob:
             self._bind_tp4_symmetric_workspace(workspace_device)
+        if self._use_tp4_local_wob_direct_gather:
+            self._bind_tp4_local_wob_output_workspace(workspace_device)
         if self._use_clustered_mqa and (
             self._clustered_logits_workspace is None
             or self._clustered_logits_workspace.device != workspace_device
@@ -547,6 +570,43 @@ class DSV4WholeLayerRuntime:
             tp_group.rank_in_group,
         )
 
+    def _bind_tp4_local_wob_output_workspace(
+        self, device: torch.device
+    ) -> None:
+        """Bind one max-capacity symmetric BF16 output on every TP rank."""
+        from torch.distributed import _symmetric_memory as symm_mem
+
+        from sglang.srt.distributed import get_tp_group
+
+        cached = self._tp4_local_wob_output_workspace
+        if cached is not None and cached[0] == device:
+            return
+        tp_group = get_tp_group()
+        if tp_group.world_size != 4:
+            raise RuntimeError(
+                "TP4 direct output gather requires TP=4, got "
+                f"{tp_group.world_size}"
+            )
+        local_output = symm_mem.empty(
+            (_MAX_FORWARD_TOKENS, 4096),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        handle = symm_mem.rendezvous(local_output, tp_group.device_group)
+        peers = tuple(
+            handle.get_buffer(
+                rank, local_output.shape, local_output.dtype
+            )
+            for rank in range(4)
+        )
+        self._tp4_local_wob_output_workspace = (
+            device,
+            handle,
+            local_output,
+            peers,
+            tp_group.rank_in_group,
+        )
+
     def begin_forward(
         self,
         *,
@@ -679,6 +739,46 @@ class DSV4WholeLayerRuntime:
             ) = (
                 self._get_tp4_attention_workspace(num_tokens, positions.device)
             )
+            if (
+                self._use_tp4_local_wob_direct_gather
+                and tp4_token_shard_attention
+            ):
+                output_workspace = self._tp4_local_wob_output_workspace
+                if (
+                    output_workspace is None
+                    or output_workspace[0] != positions.device
+                ):
+                    raise RuntimeError(
+                        "TP4 local WO_B output workspace was not bound"
+                    )
+                (
+                    _,
+                    attention_wob_output_handle,
+                    attention_wob_output_storage,
+                    attention_wob_output_peers,
+                    attention_wob_output_rank,
+                ) = output_workspace
+                owner_tokens = num_tokens // 4
+                attention_projected_gather = attention_wob_output_storage[
+                    :num_tokens
+                ]
+                owner_begin = attention_wob_output_rank * owner_tokens
+                attention_projected_local = attention_projected_gather[
+                    owner_begin : owner_begin + owner_tokens
+                ]
+                attention_wob_output_peer0 = attention_wob_output_peers[0]
+                attention_wob_output_peer1 = attention_wob_output_peers[1]
+                attention_wob_output_peer2 = attention_wob_output_peers[2]
+                attention_wob_output_peer3 = attention_wob_output_peers[3]
+                attention_wob_direct_gather = True
+            else:
+                attention_wob_output_handle = None
+                attention_wob_output_peer0 = None
+                attention_wob_output_peer1 = None
+                attention_wob_output_peer2 = None
+                attention_wob_output_peer3 = None
+                attention_wob_output_rank = -1
+                attention_wob_direct_gather = False
             if self._use_tp4_symmetric_wob and tp4_token_shard_attention:
                 symmetric = self._tp4_symmetric_workspace
                 if symmetric is None or symmetric[0] != positions.device:
@@ -728,6 +828,13 @@ class DSV4WholeLayerRuntime:
             attention_wob_q_chunks = None
             attention_wob_s_chunks = None
             attention_wob_partial_chunks = None
+            attention_wob_output_handle = None
+            attention_wob_output_peer0 = None
+            attention_wob_output_peer1 = None
+            attention_wob_output_peer2 = None
+            attention_wob_output_peer3 = None
+            attention_wob_output_rank = -1
+            attention_wob_direct_gather = False
             attention_symm_handle = None
             attention_symm_peer0 = None
             attention_symm_peer1 = None
@@ -785,6 +892,13 @@ class DSV4WholeLayerRuntime:
             attention_wob_q_chunks=attention_wob_q_chunks,
             attention_wob_s_chunks=attention_wob_s_chunks,
             attention_wob_partial_chunks=attention_wob_partial_chunks,
+            attention_wob_output_handle=attention_wob_output_handle,
+            attention_wob_output_peer0=attention_wob_output_peer0,
+            attention_wob_output_peer1=attention_wob_output_peer1,
+            attention_wob_output_peer2=attention_wob_output_peer2,
+            attention_wob_output_peer3=attention_wob_output_peer3,
+            attention_wob_output_rank=attention_wob_output_rank,
+            attention_wob_direct_gather=attention_wob_direct_gather,
             attention_symm_handle=attention_symm_handle,
             attention_symm_peer0=attention_symm_peer0,
             attention_symm_peer1=attention_symm_peer1,

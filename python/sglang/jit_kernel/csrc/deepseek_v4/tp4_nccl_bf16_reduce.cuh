@@ -86,6 +86,43 @@ __global__ void tp4_nccl_ring_bf16_reduce_kernel(
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// Replicate one rank-owned output shard into the corresponding slice of the
+// other three peer-visible output buffers.  The reducer writes the local
+// symmetric slice directly, so this kernel deliberately skips the local peer:
+// it performs only the three NVLink writes required by an all-gather.
+template <typename T, bool kUsePDL>
+__global__ void tp4_direct_push_bf16_gather_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ destination0,
+    T* __restrict__ destination1,
+    T* __restrict__ destination2,
+    int64_t num_elements,
+    int64_t output_element_offset) {
+  static_assert(sizeof(T) == sizeof(__nv_bfloat16));
+  device::PDLWaitPrimary<kUsePDL>();
+  using Copy = int4;
+  constexpr int kElementsPerCopy = sizeof(Copy) / sizeof(T);
+  const int64_t num_copies = num_elements / kElementsPerCopy;
+  const int64_t output_copy_offset = output_element_offset / kElementsPerCopy;
+  const Copy* source = reinterpret_cast<const Copy*>(input);
+  Copy* output0 =
+      reinterpret_cast<Copy*>(destination0) + output_copy_offset;
+  Copy* output1 =
+      reinterpret_cast<Copy*>(destination1) + output_copy_offset;
+  Copy* output2 =
+      reinterpret_cast<Copy*>(destination2) + output_copy_offset;
+  const int64_t thread =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t index = thread; index < num_copies; index += stride) {
+    const Copy value = source[index];
+    output0[index] = value;
+    output1[index] = value;
+    output2[index] = value;
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template <typename T, bool kUsePDL>
 struct TP4NcclRingBF16ReduceKernel {
   static void run(
@@ -123,6 +160,88 @@ struct TP4NcclRingBF16ReduceKernel {
             static_cast<const T*>(input3.data_ptr()),
             static_cast<T*>(output.data_ptr()),
             num_elements);
+  }
+
+  static void direct_push_gather(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView peer0,
+      tvm::ffi::TensorView peer1,
+      tvm::ffi::TensorView peer2,
+      tvm::ffi::TensorView peer3,
+      int64_t source_rank) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto M = SymbolicSize{"owner_tokens"};
+    constexpr int64_t kHidden = 4096;
+    constexpr int64_t kMaxTokens = 131072;
+    TensorMatcher({M, kHidden}).with_dtype<T>().with_device(device).verify(input);
+    TensorMatcher({kMaxTokens, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(peer0);
+    TensorMatcher({kMaxTokens, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(peer1);
+    TensorMatcher({kMaxTokens, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(peer2);
+    TensorMatcher({kMaxTokens, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(peer3);
+    const int64_t owner_tokens = M.unwrap();
+    RuntimeCheck(
+        owner_tokens == 16384 || owner_tokens == 32768,
+        "TP4 direct BF16 gather only supports Req16/Req128 owner shards");
+    RuntimeCheck(
+        source_rank >= 0 && source_rank < 4,
+        "TP4 direct BF16 gather requires source_rank in [0, 4)");
+    const int64_t num_elements = owner_tokens * kHidden;
+    auto* output0 = static_cast<T*>(peer0.data_ptr());
+    auto* output1 = static_cast<T*>(peer1.data_ptr());
+    auto* output2 = static_cast<T*>(peer2.data_ptr());
+    auto* output3 = static_cast<T*>(peer3.data_ptr());
+    T* destination0 = nullptr;
+    T* destination1 = nullptr;
+    T* destination2 = nullptr;
+    switch (source_rank) {
+      case 0:
+        destination0 = output1;
+        destination1 = output2;
+        destination2 = output3;
+        break;
+      case 1:
+        destination0 = output2;
+        destination1 = output3;
+        destination2 = output0;
+        break;
+      case 2:
+        destination0 = output3;
+        destination1 = output0;
+        destination2 = output1;
+        break;
+      default:
+        destination0 = output0;
+        destination1 = output1;
+        destination2 = output2;
+        break;
+    }
+    constexpr int kThreads = 256;
+    // Req16 saturates the peer links at 8192 CTAs; Req128 benefits from twice
+    // that parallelism because every rank pushes a 256 MiB owner shard.
+    const int blocks = owner_tokens == 16384 ? 8192 : 16384;
+    LaunchKernel(dim3(blocks), dim3(kThreads), device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_direct_push_bf16_gather_kernel<T, kUsePDL>,
+            static_cast<const T*>(input.data_ptr()),
+            destination0,
+            destination1,
+            destination2,
+            num_elements,
+            source_rank * num_elements);
   }
 };
 

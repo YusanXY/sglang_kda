@@ -1487,6 +1487,7 @@ class MQALayer(MqaAttentionBase):
 
         if tp4_token_shard_attention and e2e_descriptor.tp4_local_wob:
             from sglang.jit_kernel.dsv4.e2e import (
+                tp4_direct_push_bf16_gather,
                 tp4_nccl_ring_bf16_reduce,
                 tp4_quantize_local_wo_b_input_ue8m0,
             )
@@ -1533,9 +1534,30 @@ class MQALayer(MqaAttentionBase):
                     partial,
                 )
             tp4_nccl_ring_bf16_reduce(wo_b_partial_chunks, projected_local)
-            get_tp_group().all_gather_into_tensor(
-                projected_gather, projected_local
-            )
+            if e2e_descriptor.attention_wob_direct_gather:
+                output_handle = e2e_descriptor.attention_wob_output_handle
+                output_peers = (
+                    e2e_descriptor.attention_wob_output_peer0,
+                    e2e_descriptor.attention_wob_output_peer1,
+                    e2e_descriptor.attention_wob_output_peer2,
+                    e2e_descriptor.attention_wob_output_peer3,
+                )
+                if output_handle is None or any(
+                    peer is None for peer in output_peers
+                ):
+                    raise RuntimeError(
+                        f"layer {self.layer_id}: incomplete direct output buffers"
+                    )
+                tp4_direct_push_bf16_gather(
+                    projected_local,
+                    output_peers,
+                    e2e_descriptor.attention_wob_output_rank,
+                )
+                output_handle.barrier(channel=self.layer_id & 1)
+            else:
+                get_tp_group().all_gather_into_tensor(
+                    projected_gather, projected_local
+                )
             o = projected_gather
         elif tp4_token_shard_attention:
             from sglang.jit_kernel.dsv4.e2e import (

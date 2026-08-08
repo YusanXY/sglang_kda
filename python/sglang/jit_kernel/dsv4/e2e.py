@@ -469,11 +469,15 @@ def inverse_rope_fp8_wo_a_ue8m0(
 def _jit_tp4_nccl_ring_bf16_reduce_module(use_pdl: bool) -> Module:
     args = make_cpp_args(torch.bfloat16, use_pdl)
     return load_jit(
-        make_name("tp4_nccl_ring_bf16_reduce_exact_v1"),
+        make_name("tp4_nccl_ring_bf16_reduce_exact_v2"),
         *args,
         cuda_files=["deepseek_v4/tp4_nccl_bf16_reduce.cuh"],
         cuda_wrappers=[
             ("run", f"TP4NcclRingBF16ReduceKernel<{args}>::run"),
+            (
+                "direct_push_gather",
+                f"TP4NcclRingBF16ReduceKernel<{args}>::direct_push_gather",
+            ),
         ],
     )
 
@@ -496,6 +500,24 @@ def _tp4_nccl_ring_bf16_reduce_custom_op(
 ) -> None:
     module = _jit_tp4_nccl_ring_bf16_reduce_module(is_arch_support_pdl())
     module.run(input0, input1, input2, input3, output)
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_direct_push_bf16_gather",
+    mutates_args=["peer0", "peer1", "peer2", "peer3"],
+)
+def _tp4_direct_push_bf16_gather_custom_op(
+    input: torch.Tensor,
+    peer0: torch.Tensor,
+    peer1: torch.Tensor,
+    peer2: torch.Tensor,
+    peer3: torch.Tensor,
+    source_rank: int,
+) -> None:
+    module = _jit_tp4_nccl_ring_bf16_reduce_module(is_arch_support_pdl())
+    module.direct_push_gather(
+        input, peer0, peer1, peer2, peer3, source_rank
+    )
 
 
 @debug_kernel_api
@@ -530,6 +552,42 @@ def tp4_nccl_ring_bf16_reduce(
         raise RuntimeError("TP4 exact reduction output must not alias an input")
     _tp4_nccl_ring_bf16_reduce_custom_op(*partials, output)
     return output
+
+
+@debug_kernel_api
+def tp4_direct_push_bf16_gather(
+    input: torch.Tensor,
+    peers: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    source_rank: int,
+) -> None:
+    """Push a reduced owner shard into the three remote symmetric buffers."""
+    owner_tokens = input.shape[0]
+    if owner_tokens not in (16384, 32768) or input.shape != (
+        owner_tokens,
+        4096,
+    ):
+        raise RuntimeError(
+            "TP4 direct BF16 gather requires [16384|32768, 4096] input"
+        )
+    if source_rank not in range(4) or len(peers) != 4:
+        raise RuntimeError("TP4 direct BF16 gather requires four peers and TP rank")
+    expected_peer_shape = (131072, 4096)
+    for peer in peers:
+        if (
+            peer.shape != expected_peer_shape
+            or peer.dtype != torch.bfloat16
+            or peer.device != input.device
+            or not peer.is_contiguous()
+        ):
+            raise RuntimeError(
+                "TP4 direct BF16 gather peers must be contiguous CUDA BF16 "
+                f"{expected_peer_shape} on {input.device}"
+            )
+    if input.dtype != torch.bfloat16 or not input.is_contiguous():
+        raise RuntimeError("TP4 direct BF16 gather input must be contiguous BF16")
+    _tp4_direct_push_bf16_gather_custom_op(
+        input, *peers, source_rank
+    )
 
 
 _TP4_PACKED_OUTPUT_ROW_BYTES = 2 * 4096 + 2 * (4096 // _QUANT_GROUP_SIZE)
@@ -1043,6 +1101,7 @@ __all__ = [
     "tp4_pack_attention_output_ue8m0",
     "tp4_pack_wo_b_input_ue8m0",
     "tp4_direct_push_wo_b_input_ue8m0",
+    "tp4_direct_push_bf16_gather",
     "tp4_nccl_ring_bf16_reduce",
     "tp4_peer_pull_wo_b_input_ue8m0",
     "tp4_quantize_local_wo_b_input_ue8m0",
