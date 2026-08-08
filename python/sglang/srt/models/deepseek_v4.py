@@ -1487,6 +1487,7 @@ class MQALayer(MqaAttentionBase):
 
         if tp4_token_shard_attention:
             from sglang.jit_kernel.dsv4.e2e import (
+                tp4_direct_push_wo_b_input_ue8m0,
                 tp4_pack_wo_b_input_ue8m0,
                 tp4_peer_pull_wo_b_input_ue8m0,
                 tp4_unpack_wo_b_scale_ue8m0,
@@ -1503,7 +1504,6 @@ class MQALayer(MqaAttentionBase):
                 raise RuntimeError(
                     f"layer {self.layer_id}: packed C4 WO_B buffers were not bound"
                 )
-            tp4_pack_wo_b_input_ue8m0(o, packed_send)
             aligned_tokens = (e2e_descriptor.num_tokens + 3) // 4 * 4
             wo_b_scale_storage = e2e_descriptor.wo_a_output_s_storage.view(-1)[
                 : 4 * aligned_tokens
@@ -1517,24 +1517,40 @@ class MQALayer(MqaAttentionBase):
                     e2e_descriptor.attention_symm_peer3,
                 )
                 symmetric_q = e2e_descriptor.attention_symm_recv_q
+                symmetric_scale = e2e_descriptor.attention_symm_recv_scale
                 if any(peer is None for peer in peers) or symmetric_q is None:
                     raise RuntimeError(
                         f"layer {self.layer_id}: incomplete symmetric WO_B buffers"
                     )
-                # Pack writes are stream ordered.  This GPU barrier makes all
-                # four peer buffers visible before the fused NVLink pull and
-                # scale-layout conversion; no host synchronization is used.
-                symmetric_handle.barrier(channel=self.layer_id & 1)
-                symmetric_q, wo_b_input_scale = (
-                    tp4_peer_pull_wo_b_input_ue8m0(
+                if e2e_descriptor.attention_symm_direct_push:
+                    if symmetric_scale is None:
+                        raise RuntimeError(
+                            f"layer {self.layer_id}: missing direct-push scale buffer"
+                        )
+                    # Quantization, destination routing and remote writes are
+                    # one GPU kernel.  The barrier only orders those completed
+                    # writes before each rank's local WO_B consumer.
+                    tp4_direct_push_wo_b_input_ue8m0(
+                        o,
                         peers,
-                        symmetric_q,
-                        wo_b_scale_storage,
                         e2e_descriptor.attention_symm_rank,
                     )
-                )
+                    symmetric_handle.barrier(channel=self.layer_id & 1)
+                    wo_b_input_scale = symmetric_scale.transpose(0, 1)
+                else:
+                    tp4_pack_wo_b_input_ue8m0(o, packed_send)
+                    symmetric_handle.barrier(channel=self.layer_id & 1)
+                    symmetric_q, wo_b_input_scale = (
+                        tp4_peer_pull_wo_b_input_ue8m0(
+                            peers,
+                            symmetric_q,
+                            wo_b_scale_storage,
+                            e2e_descriptor.attention_symm_rank,
+                        )
+                    )
                 o, _ = self.wo_b((symmetric_q, wo_b_input_scale))
             else:
+                tp4_pack_wo_b_input_ue8m0(o, packed_send)
                 get_tp_group().all_to_all_single(packed_recv, packed_send)
                 wo_b_input_scale = tp4_unpack_wo_b_scale_ue8m0(
                     packed_recv, wo_b_scale_storage

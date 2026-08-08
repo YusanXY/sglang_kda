@@ -495,6 +495,10 @@ def _jit_tp4_packed_output_module(
                 "peer_pull_wob",
                 f"TP4PackedWoBInputUE8M0Kernel<{args}>::peer_pull",
             ),
+            (
+                "direct_push_wob",
+                f"TP4PackedWoBInputUE8M0Kernel<{args}>::direct_push",
+            ),
         ],
         extra_cuda_cflags=["--use_fast_math"],
     )
@@ -695,6 +699,27 @@ def _tp4_peer_pull_wo_b_input_custom_op(
     )
 
 
+@register_custom_op(
+    op_name="dsv4_tp4_direct_push_wo_b_input_ue8m0",
+    mutates_args=["peer0", "peer1", "peer2", "peer3"],
+)
+def _tp4_direct_push_wo_b_input_custom_op(
+    input: torch.Tensor,
+    peer0: torch.Tensor,
+    peer1: torch.Tensor,
+    peer2: torch.Tensor,
+    peer3: torch.Tensor,
+    source_rank: int,
+) -> None:
+    module = _jit_tp4_packed_output_module(
+        input.dtype,
+        _HEAD_DIM,
+        _ROPE_DIM,
+        is_arch_support_pdl(),
+    )
+    module.direct_push_wob(input, peer0, peer1, peer2, peer3, source_rank)
+
+
 @debug_kernel_api
 def tp4_pack_wo_b_input_ue8m0(
     input: torch.Tensor,
@@ -824,6 +849,52 @@ def tp4_peer_pull_wo_b_input_ue8m0(
     return output_q, output_s_storage.transpose(0, 1)
 
 
+@debug_kernel_api
+def tp4_direct_push_wo_b_input_ue8m0(
+    input: torch.Tensor,
+    peers: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    source_rank: int,
+) -> None:
+    """Quantize WO_A output directly into four symmetric destination buffers."""
+    if (
+        input.device.type != "cuda"
+        or input.dtype != torch.bfloat16
+        or input.ndim != 3
+        or input.shape[1:] != (8, 1024)
+        or not input.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 direct-push input must be contiguous CUDA BF16 [shard_T,8,1024]"
+        )
+    if len(peers) != 4:
+        raise RuntimeError("TP4 direct-push requires exactly four peers")
+    num_tokens = input.shape[0] * 4
+    expected_numel = num_tokens * _TP4_PACKED_WOB_ROW_BYTES
+    for peer in peers:
+        if (
+            peer.ndim != 1
+            or peer.numel() != expected_numel
+            or peer.dtype != torch.uint8
+            or peer.device != input.device
+            or not peer.is_contiguous()
+        ):
+            raise RuntimeError(
+                "every TP4 direct-push peer must be contiguous CUDA uint8 "
+                f"[{expected_numel}] on {input.device}"
+            )
+    if source_rank not in range(4):
+        raise RuntimeError("TP4 direct-push source rank must be in [0,4)")
+    if input.numel():
+        _tp4_direct_push_wo_b_input_custom_op(
+            input,
+            peers[0],
+            peers[1],
+            peers[2],
+            peers[3],
+            source_rank,
+        )
+
+
 __all__ = [
     "inverse_rope_fp8_wo_a_ue8m0",
     "load_mhc_post_vec8_extension",
@@ -832,6 +903,7 @@ __all__ = [
     "mhc_pre_norm_mxfp8_quant",
     "tp4_pack_attention_output_ue8m0",
     "tp4_pack_wo_b_input_ue8m0",
+    "tp4_direct_push_wo_b_input_ue8m0",
     "tp4_peer_pull_wo_b_input_ue8m0",
     "tp4_unpack_attention_scale_ue8m0",
     "tp4_unpack_wo_b_scale_ue8m0",

@@ -699,6 +699,88 @@ __global__ void tp4_peer_pull_wo_b_input_kernel(
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// Quantize one source-rank WO_A shard and write each destination's 2048-wide
+// WO_B input directly into that destination's symmetric output buffer.  This
+// removes both the destination-major staging write and the later peer-pull.
+template <typename T, bool kUsePDL>
+__global__ void tp4_direct_push_wo_b_input_kernel(
+    const T* __restrict__ input,
+    uint8_t* __restrict__ peer0,
+    uint8_t* __restrict__ peer1,
+    uint8_t* __restrict__ peer2,
+    uint8_t* __restrict__ peer3,
+    int64_t shard_tokens,
+    int source_rank) {
+  static_assert(sizeof(T) == 2);
+  device::PDLWaitPrimary<kUsePDL>();
+  // Interleave destinations across consecutive CTAs.  Destination-major
+  // scheduling makes all four source GPUs initially hammer the same target;
+  // round-robin CTAs spread that traffic across all NVLink peers.
+  const int destination = static_cast<int>(blockIdx.x & 3);
+  const int64_t token = static_cast<int64_t>(blockIdx.x) >> 2;
+  const int group = threadIdx.x / kThreadsPerGroup;
+  const int lane = threadIdx.x % kThreadsPerGroup;
+  constexpr int kGroupsPerDestination = kTP4PackedWoBQBytes / kQuantGroup;
+  static_assert(kGroupsPerDestination == kGroupsPerBlock);
+  uint8_t* peers[4] = {peer0, peer1, peer2, peer3};
+  const int64_t num_tokens = 4 * shard_tokens;
+  const int64_t output_token =
+      static_cast<int64_t>(source_rank) * shard_tokens + token;
+  uint8_t* destination_base = peers[destination];
+  fp8_e4m3_t* destination_q = reinterpret_cast<fp8_e4m3_t*>(
+      destination_base + output_token * kTP4PackedWoBQBytes);
+
+  constexpr int kVec = kInputVecBytes / sizeof(T);
+  const int64_t input_offset =
+      token * (4 * kTP4PackedWoBQBytes) +
+      static_cast<int64_t>(destination) * kTP4PackedWoBQBytes +
+      static_cast<int64_t>(group) * kQuantGroup;
+  int4 raw[kInputInt4Count];
+  T* values_t = reinterpret_cast<T*>(raw);
+#pragma unroll
+  for (uint32_t i = 0; i < kInputInt4Count; ++i) {
+    raw[i] = reinterpret_cast<const int4*>(
+        input + input_offset + lane * kVec)[i];
+  }
+  float values[kVec];
+  float local_absmax = kLocalAbsmaxFloor;
+#pragma unroll
+  for (int i = 0; i < kVec; ++i) {
+    values[i] = static_cast<float>(values_t[i]);
+    local_absmax = fmaxf(local_absmax, fabsf(values[i]));
+  }
+  const float absmax = subgroup_reduce_max<kThreadsPerGroup>(local_absmax);
+  constexpr float kFP8MaxInv = 1.0f / kFP8E4M3Max;
+  const int32_t scale_ue8m0 = cast_to_ue8m0(absmax * kFP8MaxInv);
+  const float quant_mul = inv_scale_ue8m0(scale_ue8m0);
+  int4 packed;
+  auto* packed_pairs = reinterpret_cast<fp8x2_e4m3_t*>(&packed);
+#pragma unroll
+  for (int i = 0; i < kVec; i += 2) {
+    packed_pairs[i / 2] =
+        pack_fp8(values[i] * quant_mul, values[i + 1] * quant_mul);
+  }
+  reinterpret_cast<int4*>(destination_q + group * kQuantGroup + lane * kVec)[0] =
+      packed;
+  // Each warp owns four 8-lane quant groups.  Shuffle their scale bytes to
+  // lane zero and form one packed word without shared memory or a CTA-wide
+  // synchronization.
+  const int warp_lane = threadIdx.x & 31;
+  const uint32_t packed_scales =
+      static_cast<uint32_t>(__shfl_sync(0xffffffff, scale_ue8m0, 0)) |
+      (static_cast<uint32_t>(__shfl_sync(0xffffffff, scale_ue8m0, 8)) << 8) |
+      (static_cast<uint32_t>(__shfl_sync(0xffffffff, scale_ue8m0, 16)) << 16) |
+      (static_cast<uint32_t>(__shfl_sync(0xffffffff, scale_ue8m0, 24)) << 24);
+  if (warp_lane == 0) {
+    const int word = threadIdx.x >> 5;
+    uint32_t* destination_s = reinterpret_cast<uint32_t*>(
+        destination_base + num_tokens * kTP4PackedWoBQBytes);
+    destination_s[static_cast<int64_t>(word) * num_tokens + output_token] =
+        packed_scales;
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template <typename T, int kHeadDim, int kRopeDim, bool kUsePDL>
 struct TP4PackedWoBInputUE8M0Kernel {
   static void pack(
@@ -825,6 +907,48 @@ struct TP4PackedWoBInputUE8M0Kernel {
             num_tokens,
             aligned_num_tokens,
             static_cast<int>(destination_rank));
+  }
+
+  static void direct_push(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView peer0,
+      tvm::ffi::TensorView peer1,
+      tvm::ffi::TensorView peer2,
+      tvm::ffi::TensorView peer3,
+      int64_t source_rank) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto SSize = SymbolicSize{"shard_tokens"};
+    auto BSize = SymbolicSize{"symmetric_bytes"};
+    TensorMatcher({SSize, 8, 1024})
+        .with_strides({8192, 1024, 1})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(input);
+    TensorMatcher({BSize}).with_dtype<uint8_t>().with_device(device).verify(peer0);
+    TensorMatcher({BSize}).with_dtype<uint8_t>().with_device(device).verify(peer1);
+    TensorMatcher({BSize}).with_dtype<uint8_t>().with_device(device).verify(peer2);
+    TensorMatcher({BSize}).with_dtype<uint8_t>().with_device(device).verify(peer3);
+    const int64_t shard_tokens = SSize.unwrap();
+    const int64_t num_tokens = 4 * shard_tokens;
+    RuntimeCheck(
+        BSize.unwrap() == num_tokens * kTP4PackedWoBRowBytes,
+        "TP4 direct-push symmetric buffer has an invalid byte capacity");
+    RuntimeCheck(
+        source_rank >= 0 && source_rank < 4,
+        "TP4 direct-push source rank must be in [0,4)");
+    if (shard_tokens == 0) return;
+    LaunchKernel(dim3(num_tokens), dim3(128), device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_direct_push_wo_b_input_kernel<T, kUsePDL>,
+            static_cast<const T*>(input.data_ptr()),
+            static_cast<uint8_t*>(peer0.data_ptr()),
+            static_cast<uint8_t*>(peer1.data_ptr()),
+            static_cast<uint8_t*>(peer2.data_ptr()),
+            static_cast<uint8_t*>(peer3.data_ptr()),
+            shard_tokens,
+            static_cast<int>(source_rank));
   }
 };
 
