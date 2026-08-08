@@ -103,6 +103,7 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_packed_send: Optional[torch.Tensor]
     attention_packed_recv: Optional[torch.Tensor]
     attention_packed_recv_q: Optional[torch.Tensor]
+    attention_projected_gather: Optional[torch.Tensor]
     tp4_token_shard_attention: bool
     q_lora_bf16: torch.Tensor
     q_lora_fp8: torch.Tensor
@@ -194,6 +195,7 @@ class DSV4WholeLayerRuntime:
                 torch.Tensor,
                 torch.Tensor,
                 torch.Tensor,
+                torch.Tensor,
             ]
         ] = None
         self._shared_down_workspace: Optional[
@@ -257,6 +259,10 @@ class DSV4WholeLayerRuntime:
                 "Blackwell DeepGEMM UE8M0 backend; got "
                 f"{fp8_backend}"
             )
+        if self._use_tp4_token_shard_attention:
+            self._bind_c4_token_projection_weights(
+                layers, start_layer=start_layer, end_layer=end_layer
+            )
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
         if self._use_clustered_mqa and (
             self._clustered_logits_workspace is None
@@ -305,6 +311,115 @@ class DSV4WholeLayerRuntime:
                 # CUDA allocator from Python.
                 shared_experts.bind_dsv4_huge_runtime(self)
         return self._handles
+
+    def _bind_c4_token_projection_weights(
+        self, layers: Sequence[Any], *, start_layer: int, end_layer: int
+    ) -> None:
+        """Replicate C4 WO weights once so projection stays token sharded.
+
+        The first C4 all-to-all makes every rank the owner of one contiguous
+        token quarter and all eight attention output groups.  Replicating the
+        two projection weights at load time lets that owner finish WO_A/WO_B
+        locally.  The eager hot path then needs only one final BF16 all-gather,
+        rather than a packed-output all-to-all followed by WO_B all-reduce.
+
+        DeepGEMM scale tensors are logical transposes over contiguous physical
+        storage.  Gather the physical words and restore the documented strides
+        without dequantizing or requantizing, preserving every UE8M0 byte.
+        """
+        from sglang.srt.distributed import get_tp_group
+
+        tp_group = get_tp_group()
+        if tp_group.world_size != 4:
+            raise RuntimeError(
+                "C4 token-projection specialization requires TP=4, got "
+                f"{tp_group.world_size}"
+            )
+
+        with torch.no_grad():
+            for layer_id in range(start_layer, end_layer):
+                attn = layers[layer_id].self_attn
+                if int(attn.compress_ratio) != 4:
+                    continue
+
+                local_wo_a_weight = attn.wo_a.weight.data
+                local_wo_a_scale = attn.wo_a.weight_scale_inv.data
+                local_wo_b_weight = attn.wo_b.weight.data
+                local_wo_b_scale = attn.wo_b.weight_scale_inv.data
+                if tuple(local_wo_a_weight.shape) != (2048, 4096):
+                    raise RuntimeError(
+                        f"layer {layer_id}: unexpected local WO_A weight shape "
+                        f"{tuple(local_wo_a_weight.shape)}"
+                    )
+                if (
+                    tuple(local_wo_a_scale.shape) != (2, 1024, 8)
+                    or local_wo_a_scale.dtype != torch.int32
+                    or local_wo_a_scale.stride() != (8192, 1, 1024)
+                ):
+                    raise RuntimeError(
+                        f"layer {layer_id}: unexpected local WO_A scale layout "
+                        f"shape={tuple(local_wo_a_scale.shape)} "
+                        f"dtype={local_wo_a_scale.dtype} "
+                        f"stride={local_wo_a_scale.stride()}"
+                    )
+                if tuple(local_wo_b_weight.shape) != (4096, 2048):
+                    raise RuntimeError(
+                        f"layer {layer_id}: unexpected local WO_B weight shape "
+                        f"{tuple(local_wo_b_weight.shape)}"
+                    )
+                if (
+                    tuple(local_wo_b_scale.shape) != (4096, 4)
+                    or local_wo_b_scale.dtype != torch.int32
+                    or local_wo_b_scale.stride() != (1, 4096)
+                ):
+                    raise RuntimeError(
+                        f"layer {layer_id}: unexpected local WO_B scale layout "
+                        f"shape={tuple(local_wo_b_scale.shape)} "
+                        f"dtype={local_wo_b_scale.dtype} "
+                        f"stride={local_wo_b_scale.stride()}"
+                    )
+
+                attn._dsv4_huge_full_wo_a_weight = tp_group.all_gather(
+                    local_wo_a_weight.contiguous(), dim=0
+                )
+                wo_a_words = local_wo_a_scale.untyped_storage().nbytes() // 4
+                local_wo_a_physical = local_wo_a_scale.as_strided(
+                    (wo_a_words,), (1,)
+                )
+                full_wo_a_physical = tp_group.all_gather(
+                    local_wo_a_physical, dim=0
+                )
+                attn._dsv4_huge_full_wo_a_scale = full_wo_a_physical.view(
+                    8, 8, 1024
+                ).permute(0, 2, 1)
+
+                attn._dsv4_huge_full_wo_b_weight = tp_group.all_gather(
+                    local_wo_b_weight.contiguous(), dim=1
+                )
+                wo_b_words = local_wo_b_scale.untyped_storage().nbytes() // 4
+                local_wo_b_physical = local_wo_b_scale.as_strided(
+                    (wo_b_words,), (1,)
+                )
+                full_wo_b_physical = tp_group.all_gather(
+                    local_wo_b_physical, dim=0
+                )
+                attn._dsv4_huge_full_wo_b_scale = full_wo_b_physical.view(
+                    16, 4096
+                ).transpose(0, 1)
+
+                if (
+                    tuple(attn._dsv4_huge_full_wo_a_weight.shape)
+                    != (8192, 4096)
+                    or attn._dsv4_huge_full_wo_a_scale.stride()
+                    != (8192, 1, 1024)
+                    or tuple(attn._dsv4_huge_full_wo_b_weight.shape)
+                    != (4096, 8192)
+                    or attn._dsv4_huge_full_wo_b_scale.stride()
+                    != (1, 4096)
+                ):
+                    raise RuntimeError(
+                        f"layer {layer_id}: failed to construct full C4 WO layouts"
+                    )
 
     def begin_forward(
         self,
@@ -428,6 +543,7 @@ class DSV4WholeLayerRuntime:
                 attention_packed_send,
                 attention_packed_recv,
                 attention_packed_recv_q,
+                attention_projected_gather,
             ) = (
                 self._get_tp4_attention_workspace(num_tokens, positions.device)
             )
@@ -435,6 +551,7 @@ class DSV4WholeLayerRuntime:
             attention_q_local, attention_q_recv = None, None
             attention_packed_send, attention_packed_recv = None, None
             attention_packed_recv_q = None
+            attention_projected_gather = None
         q_lora_bf16, q_lora_fp8, q_lora_scale = self._get_q_lora_workspace(
             num_tokens,
             positions.device,
@@ -476,6 +593,7 @@ class DSV4WholeLayerRuntime:
             attention_packed_send=attention_packed_send,
             attention_packed_recv=attention_packed_recv,
             attention_packed_recv_q=attention_packed_recv_q,
+            attention_projected_gather=attention_projected_gather,
             tp4_token_shard_attention=tp4_token_shard_attention,
             q_lora_bf16=q_lora_bf16,
             q_lora_fp8=q_lora_fp8,
@@ -582,6 +700,7 @@ class DSV4WholeLayerRuntime:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         workspace = self._tp4_attention_workspace
         if workspace is None or workspace[0] != device:
@@ -612,6 +731,13 @@ class DSV4WholeLayerRuntime:
             packed_recv_q = packed_recv[:, :8192].view(
                 torch.float8_e4m3fn
             ).view(_MAX_FORWARD_TOKENS, 2, 4096)
+            # v10 C4 projects only the local token shard through replicated
+            # WO_A/WO_B weights, then gathers the final hidden states.  Q is
+            # dead by that point, so its first half is the exact contiguous
+            # [max_tokens, hidden_size] gather destination at zero extra bytes.
+            projected_gather = q_local.view(-1)[
+                : _MAX_FORWARD_TOKENS * 4096
+            ].view(_MAX_FORWARD_TOKENS, 4096)
             self._tp4_attention_workspace = (
                 device,
                 q_local,
@@ -619,15 +745,25 @@ class DSV4WholeLayerRuntime:
                 packed_send,
                 packed_recv,
                 packed_recv_q,
+                projected_gather,
             )
         else:
-            _, q_local, q_recv, packed_send, packed_recv, packed_recv_q = workspace
+            (
+                _,
+                q_local,
+                q_recv,
+                packed_send,
+                packed_recv,
+                packed_recv_q,
+                projected_gather,
+            ) = workspace
         return (
             q_local[:num_tokens],
             q_recv[:num_tokens],
             packed_send[:num_tokens],
             packed_recv[:num_tokens],
             packed_recv_q[:num_tokens],
+            projected_gather[:num_tokens],
         )
 
     def _get_q_lora_workspace(

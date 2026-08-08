@@ -161,8 +161,9 @@ static at::Tensor sgl_sparse_prefill_fwd_output(
 
 // Eager TP4 C4-prefill path.  q_sources is the direct NCCL all-to-all receive
 // layout [source_rank, token_shard, 16, 512].  FlashMLA reads that hierarchy as
-// 64 logical heads and writes [destination_rank, token_shard, 16, 512], ready
-// for the return all-to-all without pack/unpack kernels.
+// 64 logical heads and writes [token_shard, source_rank, 16, 512].  The token
+// owner can therefore project all eight output groups locally without a return
+// all-to-all.
 static at::Tensor sgl_sparse_prefill_fwd_tp4_sharded_output(
     const at::Tensor& q_sources,
     const at::Tensor& kv,
@@ -220,7 +221,7 @@ static at::Tensor sgl_sparse_prefill_fwd_tp4_sharded_output(
   at::cuda::CUDAGuard device_guard{
       static_cast<char>(q_sources.get_device())};
   auto out = torch::empty(
-      {kWorldSize, s_q, kLocalHeads, kHeadDim}, q_sources.options());
+      {s_q, kWorldSize, kLocalHeads, kHeadDim}, q_sources.options());
   SparseAttnFwdParams params = {
       s_q,
       s_kv,

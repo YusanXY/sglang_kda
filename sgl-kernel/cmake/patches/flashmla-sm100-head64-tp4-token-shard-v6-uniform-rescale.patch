@@ -136,8 +136,9 @@
 +                        cutlass::arch::fence_view_async_tmem_load();
 +                    }
 +                    bf16* output_base = params.out +
-+                        (((static_cast<int64_t>(output_head / kLocalHeads) * params.s_q + s_q_idx) *
-+                          kLocalHeads + output_head % kLocalHeads) * D_V) +
++                        (((static_cast<int64_t>(s_q_idx) * kWorldSize +
++                           output_head / kLocalHeads) * kLocalHeads +
++                          output_head % kLocalHeads) * D_V) +
 +                        c*(D_V/2) + (idx_in_warpgroup/64)*(D_V/4) + k*B_EPI;
 +                    CUTE_UNROLL
 +                    for (int i = 0; i < B_EPI/8; ++i) {
@@ -173,8 +174,8 @@
 +// TP4 C4-prefill specialization.  NCCL receives Q as
 +// [source_rank, token_shard, local_head, dim].  Describe the source-rank and
 +// local-head modes as one hierarchical 64-head TMA mode, avoiding a 1--2 GiB
-+// relayout kernel.  The epilogue writes [destination_rank, token_shard,
-+// local_head, dim], which is directly consumable by the return all-to-all.
++// relayout kernel.  The epilogue writes [token_shard, source_rank,
++// local_head, dim], which is directly consumable by full-group local WO_A/B.
 +template<int D_QK>
 +void run_fwd_phase1_tp4_sharded_output_kernel(
 +    const SparseAttnFwdParams& params) {

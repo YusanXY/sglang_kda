@@ -373,13 +373,14 @@ def inverse_rope_fp8_wo_a_ue8m0(
         input: Attention output viewed as ``[T, G, D]`` BF16.  The token
             stride may include padded TP heads; the group and hidden axes must
             remain dense.
-            For the TP4 Flash model, ``G=2`` and ``D=4096`` (8 heads/group,
-            512 values/head).
+            For the TP4 Flash model, ``G=2`` on the conventional head-sharded
+            path and ``G=8`` on the v10 token-sharded projection path;
+            ``D=4096`` (8 heads/group, 512 values/head).
         freqs_cis: The model complex64 RoPE table.
         positions: One int32/int64 position per token.
-        output_q: Preallocated contiguous FP8 ``[T, 2, 4096]`` workspace.
+        output_q: Preallocated contiguous FP8 ``[T, G, 4096]`` workspace.
         output_s_storage: Preallocated contiguous int32 packed-scale storage
-            ``[2, 8, align(T, 4)]``.
+            ``[G, 8, align(T, 4)]``.
 
     Returns:
         FP8 codes in contiguous ``[T, G, D]`` layout and a logical
@@ -401,9 +402,10 @@ def inverse_rope_fp8_wo_a_ue8m0(
             "dsv4 inverse-RoPE/WO_A fusion requires a [T, G, D] input"
         )
     num_tokens, num_groups, hidden = input.shape
-    if num_groups != 2 or hidden != 4096:
+    if num_groups not in (2, 8) or hidden != 4096:
         raise RuntimeError(
-            "dsv4 TP4 inverse-RoPE/WO_A specialization requires [T, 2, 4096], "
+            "dsv4 TP4 inverse-RoPE/WO_A specialization requires "
+            "[T, G, 4096] with G in {2, 8}, "
             f"got {tuple(input.shape)}"
         )
     if input.stride(2) != 1 or input.stride(1) != hidden:

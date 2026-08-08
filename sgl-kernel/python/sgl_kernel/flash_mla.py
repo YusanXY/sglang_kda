@@ -372,8 +372,8 @@ def flash_mla_sparse_fwd_tp4_sharded_output(
     """Run token-sharded TP4 sparse prefill in NCCL-native layouts.
 
     ``q_sources`` is ``[source_rank, token_shard, 16, 512]`` and the returned
-    tensor is ``[destination_rank, token_shard, 16, 512]``.  Both tensors are
-    contiguous and can be used directly as all-to-all receive/send buffers.
+    tensor is ``[token_shard, source_rank, 16, 512]``.  The output is contiguous
+    token-major storage for local full-group WO_A/WO_B projection.
     """
     if _flashmla_import_error is not None:
         raise _IMPORT_ERROR from _flashmla_import_error

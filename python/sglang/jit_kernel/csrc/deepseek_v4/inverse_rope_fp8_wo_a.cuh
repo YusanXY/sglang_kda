@@ -234,7 +234,9 @@ struct InverseRopeFP8WoAQuantUE8M0Kernel {
     const int64_t input_stride_t = input.stride(0);
 
     RuntimeCheck(hidden == 4096, "TP4 fused WO_A hidden dim must be 4096");
-    RuntimeCheck(outer_groups == 2, "TP4 fused WO_A outer groups must be 2");
+    RuntimeCheck(
+        outer_groups == 2 || outer_groups == 8,
+        "TP4 fused WO_A outer groups must be 2 or 8");
     RuntimeCheck(hidden % kHeadDim == 0, "group hidden must contain whole heads");
     RuntimeCheck(hidden % kQuantGroup == 0, "hidden must be divisible by 128");
     RuntimeCheck(

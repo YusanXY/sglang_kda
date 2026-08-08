@@ -2141,45 +2141,20 @@ class DeepseekV4AttnBackend(
                 raise RuntimeError("TP4 token-sharded local Q must be contiguous")
             (
                 q_recv,
-                packed_send,
-                packed_recv,
-                packed_recv_q,
-                output_s_storage,
-                freqs_cis,
-                positions,
+                _packed_send,
+                _packed_recv,
+                _packed_recv_q,
+                _output_s_storage,
+                _freqs_cis,
+                _positions,
             ) = tp4_token_shard_workspace
             if q_recv.shape != q_flat.shape:
                 raise RuntimeError(
                     "TP4 token-sharded attention workspace shape mismatch: "
                     f"q={tuple(q_flat.shape)}, recv={tuple(q_recv.shape)}"
                 )
-            expected_packed = (q_flat.shape[0], 8256)
-            if (
-                packed_send.shape != expected_packed
-                or packed_recv.shape != expected_packed
-                or packed_send.dtype != torch.uint8
-                or packed_recv.dtype != torch.uint8
-            ):
-                raise RuntimeError(
-                    "TP4 packed FP8 workspaces must be uint8 "
-                    f"{expected_packed}; got send={tuple(packed_send.shape)}, "
-                    f"recv={tuple(packed_recv.shape)}"
-                )
-            if (
-                not q_recv.is_contiguous()
-                or not packed_send.is_contiguous()
-                or not packed_recv.is_contiguous()
-            ):
-                raise RuntimeError("TP4 token-sharded workspaces must be contiguous")
-            if (
-                packed_recv_q.shape != (q_flat.shape[0], 2, 4096)
-                or packed_recv_q.dtype != torch.float8_e4m3fn
-                or packed_recv_q.stride() != (8256, 4096, 1)
-            ):
-                raise RuntimeError(
-                    "TP4 packed FP8 Q view must be [M,2,4096] with "
-                    "stride=(8256,4096,1)"
-                )
+            if not q_recv.is_contiguous():
+                raise RuntimeError("TP4 token-sharded Q receive must be contiguous")
             num_tokens = q_flat.shape[0]
             tp_group = get_tp_group()
             if tp_group.world_size != 4 or num_tokens % 4 != 0:
@@ -2187,9 +2162,8 @@ class DeepseekV4AttnBackend(
                     "TP4 token-sharded attention requires TP=4 and M divisible "
                     f"by four; got TP={tp_group.world_size}, M={num_tokens}"
                 )
-            # The first collective operates directly on the Q producer.  Once
-            # FlashMLA has consumed q_recv, both BF16 Q buffers are dead and
-            # their storage becomes the packed FP8 send/receive arena.
+            # The first collective operates directly on the Q producer and
+            # gives this rank all 64 heads for its contiguous token quarter.
             tp_group.all_to_all_single(q_recv, q_flat)
             shard_tokens = num_tokens // 4
             shard_begin = tp_group.rank_in_group * shard_tokens
@@ -2198,7 +2172,7 @@ class DeepseekV4AttnBackend(
                 flash_mla_sparse_fwd_tp4_sharded_output,
             )
 
-            output_dest_major = flash_mla_sparse_fwd_tp4_sharded_output(
+            output_token_major = flash_mla_sparse_fwd_tp4_sharded_output(
                 q_sources=q_recv.view(4, shard_tokens, 16, 512),
                 kv=kv,
                 indices=combined_indices[shard_begin:shard_end].unsqueeze(1),
@@ -2207,25 +2181,16 @@ class DeepseekV4AttnBackend(
                 attn_sink=attn_sink,
                 topk_length=combined_lens[shard_begin:shard_end],
             )
-            from sglang.jit_kernel.dsv4.e2e import (
-                tp4_pack_attention_output_ue8m0,
-                tp4_unpack_attention_scale_ue8m0,
-            )
-
-            tp4_pack_attention_output_ue8m0(
-                output_dest_major.view(num_tokens, 2, 4096),
-                freqs_cis,
-                positions[shard_begin:shard_end],
-                packed_send,
-            )
-            tp_group.all_to_all_single(packed_recv, packed_send)
-            tp4_unpack_attention_scale_ue8m0(
-                packed_recv,
-                output_s_storage,
-            )
-            # DeepGEMM accepts the packed row's Q prefix with token stride
-            # 8256. The caller consumes this view and group-major scales.
-            return packed_recv_q
+            expected_output = (shard_tokens, 4, 16, 512)
+            if tuple(output_token_major.shape) != expected_output:
+                raise RuntimeError(
+                    "TP4 token-major FlashMLA output mismatch: "
+                    f"{tuple(output_token_major.shape)} != {expected_output}"
+                )
+            # Each rank now owns one token quarter and all four source-rank
+            # head shards.  Preserve this token-major layout through full
+            # WO_A/WO_B projection; no attention-output all-to-all is needed.
+            return output_token_major.view(shard_tokens, 8, 4096)
 
         kda_sparse_prefill = get_kda_operator(
             "deepseek_v4.sparse_prefill_attention"

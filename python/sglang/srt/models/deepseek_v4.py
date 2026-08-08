@@ -1360,14 +1360,33 @@ class MQALayer(MqaAttentionBase):
                     "DSV4 huge output fusion requires Blackwell UE8M0 scales"
                 )
             if tp4_token_shard_attention:
-                # The backend already inverse-rotated and quantized on the
-                # token-shard owner and moved one packed FP8+scale row through
-                # NCCL. DeepGEMM directly reads the strided FP8 prefix; only
-                # the 64-byte scale tail is transposed after communication.
-                o_fp8 = o
-                o_s = e2e_descriptor.wo_a_output_s_storage.permute(2, 0, 1)[
-                    : o_fp8.shape[0]
-                ]
+                # The first Q all-to-all made this rank the owner of one token
+                # quarter and all eight output groups.  Quantize that
+                # token-major tensor directly; the existing global-token x2
+                # workspaces have exactly the same number of elements as the
+                # local-token x8 views, so this adds no hot-path allocation.
+                shard_tokens = o.shape[0]
+                if e2e_descriptor.num_tokens != shard_tokens * 4:
+                    raise RuntimeError(
+                        f"layer {self.layer_id}: C4 token shard mismatch "
+                        f"{shard_tokens} * 4 != {e2e_descriptor.num_tokens}"
+                    )
+                aligned_shard_tokens = (shard_tokens + 3) // 4 * 4
+                o_q_workspace = e2e_descriptor.wo_a_output_q.view(
+                    shard_tokens, 8, 4096
+                )
+                o_s_workspace = e2e_descriptor.wo_a_output_s_storage.view(
+                    8, 8, aligned_shard_tokens
+                )
+                tp_group = get_tp_group()
+                shard_begin = tp_group.rank_in_group * shard_tokens
+                o_fp8, o_s = inverse_rope_fp8_wo_a_ue8m0(
+                    o,
+                    self.freqs_cis,
+                    positions[shard_begin : shard_begin + shard_tokens],
+                    o_q_workspace,
+                    o_s_workspace,
+                )
             else:
                 # First Stage-2 GPU fusion: remove the inverse-RoPE BF16
                 # write/read and the following WO_A activation-quant launch.
@@ -1430,7 +1449,11 @@ class MQALayer(MqaAttentionBase):
                     "DSV4 huge output fusion did not produce WO_A FP8 operands"
                 )
             if huge_mode:
-                output = e2e_descriptor.wo_a_gemm_output
+                output = (
+                    e2e_descriptor.wo_a_gemm_output.view(T, G, R)
+                    if tp4_token_shard_attention
+                    else e2e_descriptor.wo_a_gemm_output
+                )
                 if output.shape != (T, G, R):
                     raise RuntimeError(
                         f"layer {self.layer_id}: huge WO_A GEMM workspace shape "
@@ -1438,10 +1461,22 @@ class MQALayer(MqaAttentionBase):
                     )
             else:
                 output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+            if tp4_token_shard_attention:
+                wo_a_weight = getattr(
+                    self, "_dsv4_huge_full_wo_a_weight", None
+                )
+                wo_a_scale = getattr(self, "_dsv4_huge_full_wo_a_scale", None)
+                if wo_a_weight is None or wo_a_scale is None:
+                    raise RuntimeError(
+                        f"layer {self.layer_id}: full C4 WO_A weights were not bound"
+                    )
+            else:
+                wo_a_weight = self.wo_a.weight
+                wo_a_scale = self.wo_a.weight_scale_inv.data
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
                 (o_fp8, o_s),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
+                (wo_a_weight.view(G, R, D), wo_a_scale),
                 output,
                 recipe=recipe,
             )
@@ -1450,9 +1485,38 @@ class MQALayer(MqaAttentionBase):
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
-        o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
-            o = attn_tp_all_reduce(o)
+        if tp4_token_shard_attention:
+            from sglang.srt.layers.quantization.fp8_utils import (
+                deepgemm_w8a8_block_fp8_linear_with_fallback,
+            )
+
+            wo_b_weight = getattr(self, "_dsv4_huge_full_wo_b_weight", None)
+            wo_b_scale = getattr(self, "_dsv4_huge_full_wo_b_scale", None)
+            projected_gather = e2e_descriptor.attention_projected_gather
+            if (
+                wo_b_weight is None
+                or wo_b_scale is None
+                or projected_gather is None
+            ):
+                raise RuntimeError(
+                    f"layer {self.layer_id}: full C4 WO_B/gather buffers were not bound"
+                )
+            projected_local = deepgemm_w8a8_block_fp8_linear_with_fallback(
+                input=o.flatten(1),
+                weight=wo_b_weight,
+                block_size=[128, 128],
+                weight_scale=wo_b_scale,
+                input_scale=None,
+                bias=None,
+            )
+            get_tp_group().all_gather_into_tensor(
+                projected_gather, projected_local.contiguous()
+            )
+            o = projected_gather
+        else:
+            o, _ = self.wo_b(o.flatten(1))
+            if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
+                o = attn_tp_all_reduce(o)
 
         return o
 
