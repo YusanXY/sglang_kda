@@ -42,6 +42,10 @@ def _jit_main_q_norm_rope_module(
         cuda_wrappers=[
             ("forward", f"FusedQNormRopeKernel<{args}>::forward"),
             ("tp4_route", f"FusedQNormRopeKernel<{args}>::tp4_route"),
+            (
+                "tp4_bulk_route_forward",
+                f"FusedQNormRopeKernel<{args}>::tp4_bulk_route_forward",
+            ),
         ],
     )
 
@@ -197,6 +201,36 @@ def fused_q_norm_rope_tp4_route(
     module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
     module.tp4_route(
         q_input,
+        q_output_peers[0],
+        q_output_peers[1],
+        q_output_peers[2],
+        q_output_peers[3],
+        freqs_real,
+        positions,
+        source_rank,
+        eps,
+    )
+
+
+def fused_q_norm_rope_tp4_bulk_route(
+    q_input: torch.Tensor,
+    q_local: torch.Tensor,
+    q_output_peers: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    source_rank: int,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    """Fuse the Host boundary around local Q production and bulk TP4 routing."""
+    if len(q_output_peers) != 4:
+        raise RuntimeError("TP4 bulk Q route requires exactly four peers")
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    head_dim = q_input.shape[-1]
+    rope_dim = freqs_real.shape[-1]
+    module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
+    module.tp4_bulk_route_forward(
+        q_input,
+        q_local,
         q_output_peers[0],
         q_output_peers[1],
         q_output_peers[2],

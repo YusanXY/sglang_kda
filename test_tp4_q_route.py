@@ -6,7 +6,7 @@ from torch.distributed import _symmetric_memory as symm_mem
 
 from sglang.jit_kernel.dsv4 import (
     fused_q_norm_rope,
-    fused_q_norm_rope_tp4_route,
+    fused_q_norm_rope_tp4_bulk_route,
 )
 
 
@@ -24,6 +24,7 @@ def main() -> None:
     )
     reference_local = torch.empty_like(q_input)
     reference_recv = torch.empty_like(q_input)
+    bulk_local = torch.empty_like(q_input)
     routed_recv = symm_mem.empty(
         (131072, heads, head_dim), dtype=torch.bfloat16, device=device
     )
@@ -37,8 +38,8 @@ def main() -> None:
 
     fused_q_norm_rope(q_input, reference_local, 1.0e-6, freqs, positions)
     dist.all_to_all_single(reference_recv, reference_local)
-    fused_q_norm_rope_tp4_route(
-        q_input, peers, rank, 1.0e-6, freqs, positions
+    fused_q_norm_rope_tp4_bulk_route(
+        q_input, bulk_local, peers, rank, 1.0e-6, freqs, positions
     )
     handle.barrier(channel=0)
     torch.cuda.synchronize()

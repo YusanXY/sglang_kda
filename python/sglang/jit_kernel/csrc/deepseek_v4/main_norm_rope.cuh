@@ -213,6 +213,49 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
 }
 
+// Bulk TP4 router used after the local Q producer.  One grid row owns one
+// contiguous token quarter, so every CTA has a uniform destination pointer
+// and moves aligned 16-byte vectors instead of issuing warp-granular peer
+// stores from the norm/RoPE producer.
+template <typename DType, bool kUsePDL>
+__global__ __launch_bounds__(256) void tp4_bulk_route_q_kernel(
+    const DType* __restrict__ input,
+    DType* __restrict__ peer0,
+    DType* __restrict__ peer1,
+    DType* __restrict__ peer2,
+    DType* __restrict__ peer3,
+    int64_t shard_elements,
+    int64_t source_rank) {
+  static_assert(sizeof(DType) == 2);
+  device::PDLWaitPrimary<kUsePDL>();
+  using Copy = int4;
+  constexpr int64_t kElementsPerCopy = sizeof(Copy) / sizeof(DType);
+  const int destination_rank = static_cast<int>(blockIdx.y);
+  const int64_t shard_copies = shard_elements / kElementsPerCopy;
+  const Copy* source = reinterpret_cast<const Copy*>(input) +
+      destination_rank * shard_copies;
+  Copy* destination = reinterpret_cast<Copy*>(peer0);
+  switch (destination_rank) {
+    case 1:
+      destination = reinterpret_cast<Copy*>(peer1);
+      break;
+    case 2:
+      destination = reinterpret_cast<Copy*>(peer2);
+      break;
+    case 3:
+      destination = reinterpret_cast<Copy*>(peer3);
+      break;
+  }
+  destination += source_rank * shard_copies;
+  const int64_t thread =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t index = thread; index < shard_copies; index += stride) {
+    destination[index] = source[index];
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
 struct FusedQNormRopeKernel {
   template <typename PosT>
@@ -366,6 +409,83 @@ struct FusedQNormRopeKernel {
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
     LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap())
         .enable_pdl(kUsePDL)(k, params);
+  }
+
+  static void tp4_bulk_route(
+      const tvm::ffi::TensorView q_local,
+      const tvm::ffi::TensorView peer0,
+      const tvm::ffi::TensorView peer1,
+      const tvm::ffi::TensorView peer2,
+      const tvm::ffi::TensorView peer3,
+      int64_t source_rank) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto H = SymbolicSize{"num_q_heads"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({B, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(q_local);
+    constexpr int64_t kMaxForwardTokens = 131072;
+    TensorMatcher({kMaxForwardTokens, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(peer0);
+    TensorMatcher({kMaxForwardTokens, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(peer1);
+    TensorMatcher({kMaxForwardTokens, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(peer2);
+    TensorMatcher({kMaxForwardTokens, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(peer3);
+    const int64_t batch_size = B.unwrap();
+    RuntimeCheck(
+        batch_size == 65536 || batch_size == 131072,
+        "TP4 bulk Q router only supports exact Req16/Req128 aggregate M");
+    RuntimeCheck(
+        source_rank >= 0 && source_rank < 4,
+        "TP4 bulk Q router requires source_rank in [0, 4)");
+    const int64_t shard_elements =
+        (batch_size / 4) * H.unwrap() * kHeadDim;
+    RuntimeCheck(
+        shard_elements % (sizeof(int4) / sizeof(DType)) == 0,
+        "TP4 bulk Q router requires int4-aligned token shards");
+    // Preserve the CTA budget that saturated direct-output peer writes in
+    // v17, split evenly over the four independent destinations.
+    const int total_blocks = batch_size == 65536 ? 8192 : 16384;
+    LaunchKernel(dim3(total_blocks / 4, 4), dim3(256), device_.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_bulk_route_q_kernel<DType, kUsePDL>,
+            static_cast<const DType*>(q_local.data_ptr()),
+            static_cast<DType*>(peer0.data_ptr()),
+            static_cast<DType*>(peer1.data_ptr()),
+            static_cast<DType*>(peer2.data_ptr()),
+            static_cast<DType*>(peer3.data_ptr()),
+            shard_elements,
+            source_rank);
+  }
+
+  static void tp4_bulk_route_forward(
+      const tvm::ffi::TensorView q_input,
+      const tvm::ffi::TensorView q_local,
+      const tvm::ffi::TensorView peer0,
+      const tvm::ffi::TensorView peer1,
+      const tvm::ffi::TensorView peer2,
+      const tvm::ffi::TensorView peer3,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      int64_t source_rank,
+      float eps) {
+    // One FFI/operator boundary launches both GPU kernels on the current
+    // stream; no Python-visible intermediate or host synchronization exists.
+    forward(q_input, q_local, freqs_cis, positions, eps);
+    tp4_bulk_route(q_local, peer0, peer1, peer2, peer3, source_rank);
   }
 };
 

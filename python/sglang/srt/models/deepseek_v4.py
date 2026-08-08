@@ -26,7 +26,7 @@ import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
-    fused_q_norm_rope_tp4_route,
+    fused_q_norm_rope_tp4_bulk_route,
     fused_rope_inplace,
     inverse_rope_fp8_wo_a_ue8m0,
     rmsnorm_mxfp8_quant,
@@ -660,7 +660,7 @@ class MQALayer(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
         q_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         q_route_workspace: Optional[
-            Tuple[Tuple[torch.Tensor, ...], int]
+            Tuple[Tuple[torch.Tensor, ...], int, torch.Tensor]
         ] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q_quant if q_quant is not None else q)
@@ -668,9 +668,10 @@ class MQALayer(MqaAttentionBase):
         if q_route_workspace is not None:
             if q_out is None:
                 raise RuntimeError("TP4 routed Q producer requires receive output")
-            q_output_peers, source_rank = q_route_workspace
-            fused_q_norm_rope_tp4_route(
+            q_output_peers, source_rank, q_local = q_route_workspace
+            fused_q_norm_rope_tp4_bulk_route(
                 q,
+                q_local,
                 q_output_peers,
                 source_rank,
                 self.eps,
@@ -925,7 +926,7 @@ class MQALayer(MqaAttentionBase):
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = None,
         huge_q_route_workspace: Optional[
-            Tuple[Tuple[torch.Tensor, ...], int]
+            Tuple[Tuple[torch.Tensor, ...], int, torch.Tensor]
         ] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
@@ -1232,6 +1233,7 @@ class MQALayer(MqaAttentionBase):
                     or e2e_descriptor.attention_q_peer1 is None
                     or e2e_descriptor.attention_q_peer2 is None
                     or e2e_descriptor.attention_q_peer3 is None
+                    or e2e_descriptor.attention_q_local is None
                     or e2e_descriptor.attention_packed_send is None
                     or e2e_descriptor.attention_packed_recv is None
                 ):
@@ -1303,6 +1305,7 @@ class MQALayer(MqaAttentionBase):
                         e2e_descriptor.attention_q_peer3,
                     ),
                     e2e_descriptor.attention_q_rank,
+                    e2e_descriptor.attention_q_local,
                 )
                 if tp4_token_shard_attention
                 else None
