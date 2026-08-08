@@ -1172,17 +1172,34 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
+        tp4_token_shard_attention = False
         if self.tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            tp4_token_shard_attention = bool(
+                huge_mode
+                and self.compress_ratio == 4
+                and e2e_descriptor.tp4_token_shard_attention
+            )
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
             # memset.
-            if huge_mode:
+            if tp4_token_shard_attention:
+                # The fused Q norm+RoPE producer writes the natural local16
+                # layout directly into the first quarter of Huge's existing
+                # padded-Q allocation.  FlashMLA consumes the source-major
+                # all-to-all receive layout, so no Q padding or relayout launch
+                # is needed on this C4 path.
+                q_out = e2e_descriptor.attention_q_local
+                if q_out is None or e2e_descriptor.attention_q_recv is None:
+                    raise RuntimeError(
+                        "TP4 token-sharded attention requires local-Q/recv workspaces"
+                    )
+            elif huge_mode:
                 q_padded = e2e_descriptor.attention_q_padded
                 if q_padded.shape[0] != x.shape[0]:
                     raise RuntimeError(
@@ -1193,8 +1210,9 @@ class MQALayer(MqaAttentionBase):
                 q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
             else:
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
-            tp_slice = slice(0, self.n_local_heads)
-            q_out = q_padded[:, tp_slice, :]
+            if not tp4_token_shard_attention:
+                tp_slice = slice(0, self.n_local_heads)
+                q_out = q_padded[:, tp_slice, :]
             if self._attn_sink_local is None:
                 # Build once on the first forward (post weight load); a per-call
                 # rebuild would replay a fill+copy per layer in the decode graph.
@@ -1256,6 +1274,10 @@ class MQALayer(MqaAttentionBase):
             is_unified_kv_triton,
         )
 
+        if tp4_token_shard_attention and is_unified_kv_triton():
+            raise RuntimeError(
+                "TP4 token-sharded C4 attention requires the FlashMLA DSV4 backend"
+            )
         if is_unified_kv_triton():
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
@@ -1299,8 +1321,19 @@ class MQALayer(MqaAttentionBase):
                     layer=self.attn_mqa,
                     forward_batch=forward_batch,
                     compress_ratio=self.compress_ratio,
-                    attn_sink=self._attn_sink_local,
+                    attn_sink=(
+                        self.attn_sink
+                        if tp4_token_shard_attention
+                        else self._attn_sink_local
+                    ),
                     save_kv_cache=save_kv_cache,
+                    tp4_token_shard_workspace=(
+                        (
+                            e2e_descriptor.attention_q_recv,
+                            e2e_descriptor.attention_q_local,
+                        )
+                        if tp4_token_shard_attention else None
+                    ),
                 )
             o = o[:, tp_slice, :]
         o_fp8 = o_s = None

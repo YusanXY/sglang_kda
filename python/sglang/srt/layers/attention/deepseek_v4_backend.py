@@ -34,6 +34,7 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.environ import envs
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.kda import get_kda_operator
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsv4.attn_metadata_kernels import (
@@ -83,6 +84,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
 
 _is_sm120 = is_sm120_supported()
 _is_cuda = is_cuda()
@@ -1801,6 +1803,9 @@ class DeepseekV4AttnBackend(
         compress_ratio: Literal[0, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
+        tp4_token_shard_workspace: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -1896,6 +1901,7 @@ class DeepseekV4AttnBackend(
                     token_to_kv_pool=token_to_kv_pool,
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
+                    tp4_token_shard_workspace=tp4_token_shard_workspace,
                 )
 
             kda_attention = get_kda_operator(
@@ -1978,6 +1984,9 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
+        tp4_token_shard_workspace: Optional[
+            Tuple[torch.Tensor, torch.Tensor]
+        ] = None,
     ) -> torch.Tensor:
         """Unified prefill via flash_mla_sparse_fwd. Replaces the
         flash_mla_with_kvcache call on the extend path. Per request,
@@ -2101,6 +2110,58 @@ class DeepseekV4AttnBackend(
                 out=swa_slice,
             )
         kv = workspace
+
+        if tp4_token_shard_workspace is not None:
+            if not self.dsv4_huge_mode or compress_ratio != 4:
+                raise RuntimeError(
+                    "TP4 token-sharded attention is valid only for Huge C4 layers"
+                )
+            if q_flat.ndim != 3 or tuple(q_flat.shape[1:]) != (16, 512):
+                raise RuntimeError(
+                    "TP4 token-sharded attention requires contiguous local16 Q; "
+                    f"got {tuple(q_flat.shape)}"
+                )
+            if not q_flat.is_contiguous():
+                raise RuntimeError("TP4 token-sharded local Q must be contiguous")
+            q_recv, output_local = tp4_token_shard_workspace
+            if q_recv.shape != q_flat.shape or output_local.shape != q_flat.shape:
+                raise RuntimeError(
+                    "TP4 token-sharded attention workspace shape mismatch: "
+                    f"q={tuple(q_flat.shape)}, recv={tuple(q_recv.shape)}, "
+                    f"output={tuple(output_local.shape)}"
+                )
+            if not q_recv.is_contiguous() or not output_local.is_contiguous():
+                raise RuntimeError("TP4 token-sharded workspaces must be contiguous")
+            num_tokens = q_flat.shape[0]
+            tp_group = get_tp_group()
+            if tp_group.world_size != 4 or num_tokens % 4 != 0:
+                raise RuntimeError(
+                    "TP4 token-sharded attention requires TP=4 and M divisible "
+                    f"by four; got TP={tp_group.world_size}, M={num_tokens}"
+                )
+            # Both collectives operate directly on the Q producer and FlashMLA
+            # epilogue layouts.  output_local intentionally aliases q_flat:
+            # stream order guarantees the first all-to-all has consumed Q
+            # before the second collective overwrites that storage.
+            tp_group.all_to_all_single(q_recv, q_flat)
+            shard_tokens = num_tokens // 4
+            shard_begin = tp_group.rank_in_group * shard_tokens
+            shard_end = shard_begin + shard_tokens
+            from sgl_kernel.flash_mla import (
+                flash_mla_sparse_fwd_tp4_sharded_output,
+            )
+
+            output_dest_major = flash_mla_sparse_fwd_tp4_sharded_output(
+                q_sources=q_recv.view(4, shard_tokens, 16, 512),
+                kv=kv,
+                indices=combined_indices[shard_begin:shard_end].unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                d_v=self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens[shard_begin:shard_end],
+            )
+            tp_group.all_to_all_single(output_local, output_dest_major)
+            return output_local
 
         kda_sparse_prefill = get_kda_operator(
             "deepseek_v4.sparse_prefill_attention"

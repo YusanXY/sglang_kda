@@ -358,3 +358,26 @@ def flash_mla_sparse_fwd_output(
     return torch.ops.sgl_kernel.sparse_prefill_fwd_output.default(
         q, kv, indices, sm_scale, d_v, attn_sink, topk_length
     )
+
+
+def flash_mla_sparse_fwd_tp4_sharded_output(
+    q_sources: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run token-sharded TP4 sparse prefill in NCCL-native layouts.
+
+    ``q_sources`` is ``[source_rank, token_shard, 16, 512]`` and the returned
+    tensor is ``[destination_rank, token_shard, 16, 512]``.  Both tensors are
+    contiguous and can be used directly as all-to-all receive/send buffers.
+    """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
+    return torch.ops.sgl_kernel.sparse_prefill_fwd_tp4_sharded_output.default(
+        q_sources, kv, indices, sm_scale, d_v, attn_sink, topk_length
+    )

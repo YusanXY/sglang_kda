@@ -1,0 +1,235 @@
+--- a/csrc/sm100/prefill/sparse/fwd/head64/phase1.h
++++ b/csrc/sm100/prefill/sparse/fwd/head64/phase1.h
+@@ -10,4 +10,8 @@
+ template<int D_QK>
+ void run_fwd_phase1_output_kernel(const SparseAttnFwdParams& params);
+ 
++template<int D_QK>
++void run_fwd_phase1_tp4_sharded_output_kernel(
++    const SparseAttnFwdParams& params);
++
+ }
+--- a/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
++++ b/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
+@@ -5,5 +5,7 @@
+ 
+ template void run_fwd_phase1_kernel<512>(const SparseAttnFwdParams& params);
+ template void run_fwd_phase1_output_kernel<512>(const SparseAttnFwdParams& params);
++template void run_fwd_phase1_tp4_sharded_output_kernel<512>(
++    const SparseAttnFwdParams& params);
+ 
+ }
+--- a/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
++++ b/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
+@@ -56,7 +56,12 @@
+ 
+ using FwdMode = SparseAttnFwdMode;
+ 
+-template<bool HAVE_ROPE, bool STORE_STATS, int OUTPUT_HEADS, typename TmaParams>
++template<
++    bool HAVE_ROPE,
++    bool STORE_STATS,
++    int OUTPUT_HEADS,
++    bool TP4_DEST_MAJOR,
++    typename TmaParams>
+ __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
+ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
+ #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
+@@ -201,7 +206,23 @@
+             if constexpr (STORE_STATS) {
+                 real_mi = max(real_mi, cur_pi_max);
+             }
+-            bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
++            bool should_scale_o;
++            if constexpr (TP4_DEST_MAJOR) {
++                // Each TP rank's production path exposes 16 valid local heads
++                // in the first half-warp.  Keep the online-softmax rescale vote
++                // inside that same 16-head numerical group even though the
++                // token-owner kernel packs four ranks into one 64-head MMA.
++                // Coupling adjacent source ranks here changes rescale timing
++                // and can move BF16 outputs by one ULP.
++                const unsigned int rescale_votes = __ballot_sync(
++                    0xffffffffu, cur_pi_max - mi > 6.0f);
++                const unsigned int local_head_mask =
++                    lane_idx < 16 ? 0x0000ffffu : 0xffff0000u;
++                should_scale_o = (rescale_votes & local_head_mask) != 0;
++            } else {
++                should_scale_o = __any_sync(
++                    0xffffffffu, cur_pi_max - mi > 6.0f);
++            }
+             // By this point:
+             // - cur_pi_max, real_mi, and mi is identical within each row (i.e. thread 0+64, 1+65, ...)
+             // - should_scale_o is identical among every warp, and is identical among threads that controls the same row (i.e. among threads 0~31+64~95; and is identical among threads 32~63+96~127)
+@@ -234,7 +255,18 @@
+             }
+ 
+             // Scale O
+-            if (k > 0 && should_scale_o) {
++            if constexpr (TP4_DEST_MAJOR) {
++                // Subgroups choose independent online-softmax maxima, but the
++                // TMEM rescale sequence must remain converged across the whole
++                // 128-thread consumer warpgroup. Rows that did not request a
++                // rescale carry scale_for_old=1, so executing the same TMEM
++                // operation preserves their accumulator exactly.
++                if (k > 0) {
++                    ku::tcgen05_after_thread_sync();
++                    rescale_O<D_V, 32, tmem_cols::O>(scale_for_old);
++                    ku::tcgen05_before_thread_sync();
++                }
++            } else if (k > 0 && should_scale_o) {
+                 // plan.bar_sv_done[(k-1)%NUM_BUFS].wait(((k-1)/NUM_BUFS)&1);   // NOTE We have waited for last SV gemm before
+                 ku::tcgen05_after_thread_sync();
+                 rescale_O<D_V, 32, tmem_cols::O>(scale_for_old);
+@@ -295,7 +327,38 @@
+ 
+         float2 output_scale_float2 = make_float2(output_scale, output_scale);
+ 
+-        if constexpr (OUTPUT_HEADS == B_H) {
++        if constexpr (TP4_DEST_MAJOR) {
++            static_assert(OUTPUT_HEADS == B_H);
++            constexpr int kLocalHeads = 16;
++            constexpr int kWorldSize = B_H / kLocalHeads;
++            static_assert(kWorldSize == 4);
++            const int output_head = idx_in_warpgroup % B_H;
++            CUTE_UNROLL
++            for (int c = 0; c < 2; ++c) {
++                CUTE_UNROLL
++                for (int k = 0; k < (D_V/4)/B_EPI; ++k) {
++                    if (have_valid_indices) {
++                        ku::tmem_ld_32dp32bNx<B_EPI>(tmem_cols::O + c*128 + k*B_EPI, o);
++                        cutlass::arch::fence_view_async_tmem_load();
++                    }
++                    bf16* output_base = params.out +
++                        (((static_cast<int64_t>(output_head / kLocalHeads) * params.s_q + s_q_idx) *
++                          kLocalHeads + output_head % kLocalHeads) * D_V) +
++                        c*(D_V/2) + (idx_in_warpgroup/64)*(D_V/4) + k*B_EPI;
++                    CUTE_UNROLL
++                    for (int i = 0; i < B_EPI/8; ++i) {
++                        nv_bfloat162 o_bf16[4];
++                        CUTE_UNROLL
++                        for (int j = 0; j < 4; ++j) {
++                            o[i*4+j] = ku::float2_mul(o[i*4+j], output_scale_float2);
++                            o_bf16[j] = __float22bfloat162_rn(o[i*4+j]);
++                        }
++                        *(uint128_t*)(output_base + i*8) = *(uint128_t*)(o_bf16);
++                    }
++                }
++            }
++            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
++        } else if constexpr (OUTPUT_HEADS == B_H) {
+             Tensor sO = make_tensor(make_smem_ptr(plan.u.o.data()), SmemLayoutO{});
+             Tensor tma_gO = flat_divide(
+                 tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx),
+@@ -698,7 +761,8 @@
+         shape_O, tma_O,
+         tensor_map_kv_nope
+     };
+-    auto kernel = &sparse_attn_fwd_kernel<D_QK == 576, STORE_STATS, OUTPUT_HEADS, decltype(tma_params)>;
++    auto kernel = &sparse_attn_fwd_kernel<
++        D_QK == 576, STORE_STATS, OUTPUT_HEADS, false, decltype(tma_params)>;
+ 
+     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+@@ -717,4 +781,102 @@
+     run_fwd_phase1_kernel_impl<D_QK, false, 16>(params);
+ }
+ 
++// TP4 C4-prefill specialization.  NCCL receives Q as
++// [source_rank, token_shard, local_head, dim].  Describe the source-rank and
++// local-head modes as one hierarchical 64-head TMA mode, avoiding a 1--2 GiB
++// relayout kernel.  The epilogue writes [destination_rank, token_shard,
++// local_head, dim], which is directly consumable by the return all-to-all.
++template<int D_QK>
++void run_fwd_phase1_tp4_sharded_output_kernel(
++    const SparseAttnFwdParams& params) {
++    KU_ASSERT(params.h_kv == 1);
++    KU_ASSERT(params.topk % B_TOPK == 0);
++    KU_ASSERT(params.h_q == B_H);
++    KU_ASSERT(params.d_qk == D_QK);
++    static_assert(D_QK == 512);
++    constexpr int kLocalHeads = 16;
++    constexpr int kWorldSize = 4;
++    static_assert(kLocalHeads * kWorldSize == B_H);
++
++    auto shape_Q_nope = make_shape(
++        make_shape(Int<kLocalHeads>{}, Int<kWorldSize>{}),
++        Int<D_V>{},
++        params.s_q);
++    auto stride_Q = make_stride(
++        make_stride(
++            Int<D_QK>{},
++            params.s_q * kLocalHeads * D_QK),
++        _1{},
++        Int<kLocalHeads * D_QK>{});
++    auto tma_Q_nope = cute::make_tma_copy(
++        SM90_TMA_LOAD{},
++        make_tensor(
++            make_gmem_ptr((bf16*)params.q),
++            make_layout(shape_Q_nope, stride_Q)),
++        SmemLayoutQNoPE{});
++
++    auto shape_Q_rope = make_shape(
++        make_shape(Int<kLocalHeads>{}, Int<kWorldSize>{}),
++        Int<D_Q-D_V>{},
++        params.s_q);
++    auto tma_Q_rope = cute::make_tma_copy(
++        SM90_TMA_LOAD{},
++        make_tensor(
++            make_gmem_ptr((bf16*)params.q + D_V),
++            make_layout(shape_Q_rope, stride_Q)),
++        SmemLayoutQRoPE{});
++
++    // The TP4 epilogue bypasses this descriptor, but keeping a valid output
++    // TMA object preserves the common kernel parameter type and launch path.
++    auto shape_O = make_shape(params.h_q, params.d_v, params.s_q);
++    auto tma_O = cute::make_tma_copy(
++        SM90_TMA_STORE{},
++        make_tensor(
++            make_gmem_ptr((bf16*)params.out),
++            make_layout(
++                shape_O,
++                make_stride(params.d_v, _1{}, params.h_q*params.d_v))),
++        SmemLayoutOTiles<1>{});
++
++    CUtensorMap tensor_map_kv_nope;
++    {
++        uint64_t size[2] = {D_V, (unsigned long)params.s_kv};
++        uint64_t stride[1] = {params.stride_kv_s_kv*sizeof(bf16)};
++        uint32_t box_size[2] = {64, 1};
++        uint32_t elem_stride[2] = {1, 1};
++        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
++            &tensor_map_kv_nope,
++            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
++            2,
++            params.kv,
++            size,
++            stride,
++            box_size,
++            elem_stride,
++            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
++            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
++            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
++            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
++        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
++    }
++
++    TmaParams<
++        decltype(shape_Q_nope), decltype(tma_Q_nope),
++        decltype(shape_Q_rope), decltype(tma_Q_rope),
++        decltype(shape_O), decltype(tma_O)>
++    tma_params = {
++        shape_Q_nope, tma_Q_nope,
++        shape_Q_rope, tma_Q_rope,
++        shape_O, tma_O,
++        tensor_map_kv_nope};
++    auto kernel = &sparse_attn_fwd_kernel<
++        false, false, B_H, true, decltype(tma_params)>;
++    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
++    KU_CUDA_CHECK(cudaFuncSetAttribute(
++        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    kernel<<<params.s_q, NUM_THREADS, smem_size, params.stream>>>(
++        params, tma_params);
++    KU_CHECK_KERNEL_LAUNCH();
++}
++
+ }

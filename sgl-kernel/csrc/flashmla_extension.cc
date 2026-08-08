@@ -159,6 +159,100 @@ static at::Tensor sgl_sparse_prefill_fwd_output(
   return out;
 }
 
+// Eager TP4 C4-prefill path.  q_sources is the direct NCCL all-to-all receive
+// layout [source_rank, token_shard, 16, 512].  FlashMLA reads that hierarchy as
+// 64 logical heads and writes [destination_rank, token_shard, 16, 512], ready
+// for the return all-to-all without pack/unpack kernels.
+static at::Tensor sgl_sparse_prefill_fwd_tp4_sharded_output(
+    const at::Tensor& q_sources,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length) {
+  using bf16 = cutlass::bfloat16_t;
+  constexpr int kWorldSize = 4;
+  constexpr int kLocalHeads = 16;
+  constexpr int kHeads = kWorldSize * kLocalHeads;
+  constexpr int kHeadDim = 512;
+
+  Arch arch;
+  TORCH_CHECK(
+      arch.is_sm100f(),
+      "sparse_prefill_fwd_tp4_sharded_output requires an SM100-family GPU");
+  KU_CHECK_NDIM(q_sources, 4);
+  KU_CHECK_NDIM(kv, 3);
+  KU_CHECK_NDIM(indices, 3);
+  KU_CHECK_NDIM(attn_sink, 1);
+  KU_CHECK_NDIM(topk_length, 1);
+
+  const int s_q = q_sources.size(1);
+  const int s_kv = kv.size(0);
+  const int h_kv = kv.size(1);
+  const int topk = indices.size(2);
+  TORCH_CHECK(
+      q_sources.size(0) == kWorldSize &&
+          q_sources.size(2) == kLocalHeads &&
+          q_sources.size(3) == kHeadDim,
+      "TP4 sharded Q must have shape [4, s_q, 16, 512]");
+  TORCH_CHECK(h_kv == 1, "TP4 sharded sparse prefill requires h_kv=1");
+  TORCH_CHECK(d_v == kHeadDim, "TP4 sharded sparse prefill requires d_v=512");
+
+  KU_CHECK_DEVICE(q_sources);
+  KU_CHECK_DEVICE(kv);
+  KU_CHECK_DEVICE(indices);
+  KU_CHECK_DEVICE(attn_sink);
+  KU_CHECK_DEVICE(topk_length);
+  KU_CHECK_DTYPE(q_sources, torch::kBFloat16);
+  KU_CHECK_DTYPE(kv, torch::kBFloat16);
+  KU_CHECK_DTYPE(indices, torch::kInt32);
+  KU_CHECK_DTYPE(attn_sink, torch::kFloat32);
+  KU_CHECK_DTYPE(topk_length, torch::kInt32);
+  KU_CHECK_SHAPE(kv, s_kv, h_kv, kHeadDim);
+  KU_CHECK_SHAPE(indices, s_q, h_kv, topk);
+  KU_CHECK_SHAPE(attn_sink, kHeads);
+  KU_CHECK_SHAPE(topk_length, s_q);
+  KU_CHECK_CONTIGUOUS(q_sources);
+  KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
+  KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
+
+  at::cuda::CUDAGuard device_guard{
+      static_cast<char>(q_sources.get_device())};
+  auto out = torch::empty(
+      {kWorldSize, s_q, kLocalHeads, kHeadDim}, q_sources.options());
+  SparseAttnFwdParams params = {
+      s_q,
+      s_kv,
+      kHeads,
+      h_kv,
+      kHeadDim,
+      kHeadDim,
+      topk,
+      static_cast<float>(sm_scale),
+      static_cast<float>(sm_scale) * LOG_2_E,
+      reinterpret_cast<bf16*>(q_sources.data_ptr()),
+      reinterpret_cast<bf16*>(kv.data_ptr()),
+      indices.data_ptr<int>(),
+      ku::get_optional_tensor_ptr<float>(attn_sink),
+      ku::get_optional_tensor_ptr<int>(topk_length),
+      kLocalHeads * kHeadDim,
+      kHeadDim,
+      int64_stride_to_int(kv.stride(0)),
+      int64_stride_to_int(kv.stride(1)),
+      int64_stride_to_int(indices.stride(0)),
+      int64_stride_to_int(indices.stride(1)),
+      reinterpret_cast<bf16*>(out.data_ptr()),
+      nullptr,
+      nullptr,
+      arch.num_sms,
+      at::cuda::getCurrentCUDAStream().stream(),
+  };
+  sm100::fwd::head64::run_fwd_phase1_tp4_sharded_output_kernel<512>(
+      params);
+  return out;
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashMLA
@@ -209,6 +303,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "sparse_prefill_fwd_output(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? "
       "attn_sink=None, Tensor? topk_length=None) -> Tensor");
   m.impl("sparse_prefill_fwd_output", torch::kCUDA, &sgl_sparse_prefill_fwd_output);
+
+  m.def(
+      "sparse_prefill_fwd_tp4_sharded_output(Tensor q_sources, Tensor kv, Tensor indices, float sm_scale, int d_v, "
+      "Tensor? attn_sink=None, Tensor? topk_length=None) -> Tensor");
+  m.impl(
+      "sparse_prefill_fwd_tp4_sharded_output",
+      torch::kCUDA,
+      &sgl_sparse_prefill_fwd_tp4_sharded_output);
 
   m.def(
       "fwd_kvcache_mla_fp8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

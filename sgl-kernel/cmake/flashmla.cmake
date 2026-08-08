@@ -127,6 +127,39 @@ if(FLASHMLA_ENABLE_SM100)
     else()
         message(STATUS "FlashMLA SM100 h64 output-only sparse prefill already patched")
     endif()
+
+    # DSV4 Huge eager-prefill specialization for the TP4 token-sharded C4
+    # attention path.  Q arrives in source-rank-major layout after NCCL
+    # all-to-all; the patched TMA descriptor consumes that layout directly and
+    # writes destination-rank-major output for the return all-to-all.  Keep
+    # this as a second checked patch so the independently useful output-only
+    # specialization remains reproducible and revertible on its own.
+    set(FLASHMLA_TP4_TOKEN_SHARD_MARKER
+        "void run_fwd_phase1_tp4_sharded_output_kernel(")
+    file(READ "${FLASHMLA_HEAD64_PHASE1}"
+        FLASHMLA_HEAD64_PHASE1_CONTENT_AFTER_OUTPUT_ONLY)
+    string(FIND "${FLASHMLA_HEAD64_PHASE1_CONTENT_AFTER_OUTPUT_ONLY}"
+        "${FLASHMLA_TP4_TOKEN_SHARD_MARKER}"
+        FLASHMLA_TP4_TOKEN_SHARD_PATCHED)
+    if(FLASHMLA_TP4_TOKEN_SHARD_PATCHED EQUAL -1)
+        find_program(FLASHMLA_PATCH_EXECUTABLE patch REQUIRED)
+        execute_process(
+            COMMAND "${FLASHMLA_PATCH_EXECUTABLE}" -p1 -i
+                "${CMAKE_CURRENT_LIST_DIR}/patches/flashmla-sm100-head64-tp4-token-shard-v5.patch"
+            WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+            RESULT_VARIABLE FLASHMLA_TP4_TOKEN_SHARD_PATCH_RESULT
+            OUTPUT_VARIABLE FLASHMLA_TP4_TOKEN_SHARD_PATCH_STDOUT
+            ERROR_VARIABLE FLASHMLA_TP4_TOKEN_SHARD_PATCH_STDERR)
+        if(NOT FLASHMLA_TP4_TOKEN_SHARD_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to patch pinned FlashMLA TP4 token-sharded kernel:\n"
+                "${FLASHMLA_TP4_TOKEN_SHARD_PATCH_STDOUT}\n"
+                "${FLASHMLA_TP4_TOKEN_SHARD_PATCH_STDERR}")
+        endif()
+        message(STATUS "Patched FlashMLA SM100 h64 TP4 token-sharded sparse prefill")
+    else()
+        message(STATUS "FlashMLA SM100 h64 TP4 token-sharded sparse prefill already patched")
+    endif()
 endif()
 
 

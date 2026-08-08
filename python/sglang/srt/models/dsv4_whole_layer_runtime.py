@@ -9,6 +9,7 @@ model loop ABI.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Literal, Optional, Sequence
 
 import msgspec
@@ -97,6 +98,9 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     extend_seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
     attention_q_padded: torch.Tensor
+    attention_q_local: Optional[torch.Tensor]
+    attention_q_recv: Optional[torch.Tensor]
+    tp4_token_shard_attention: bool
     q_lora_bf16: torch.Tensor
     q_lora_fp8: torch.Tensor
     q_lora_scale: torch.Tensor
@@ -153,6 +157,13 @@ class DSV4WholeLayerRuntime:
         # fixed M<=131072 capacity. Keep this selected once per model so the
         # high-load path cannot silently fall back to the Q1 DeepGEMM producer.
         self._use_clustered_mqa = True
+        # Experimental eager-only C4 path.  Read the gate once at model
+        # construction; layer execution never calls getenv or branches on
+        # mutable host state.  Unsupported shapes stay on the already-frozen
+        # Huge implementation while the req16/req128 buckets are evaluated.
+        self._use_tp4_token_shard_attention = (
+            os.environ.get("SGLANG_DSV4_HUGE_TP4_TOKEN_SHARD_ATTN", "0") == "1"
+        )
         self._generation = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
         self._active: Optional[DSV4ForwardDescriptor] = None
@@ -171,6 +182,9 @@ class DSV4WholeLayerRuntime:
         ] = None
         self._q_lora_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None
+        self._tp4_attention_workspace: Optional[
+            tuple[torch.device, torch.Tensor, torch.Tensor]
         ] = None
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
@@ -313,6 +327,10 @@ class DSV4WholeLayerRuntime:
                 "DSV4 huge runtime requires aggregate M in 1..131072, "
                 f"got {num_tokens}"
             )
+        if self._use_tp4_token_shard_attention and is_graph_capture:
+            raise RuntimeError(
+                "TP4 token-sharded attention is an eager-only experimental path"
+            )
         if is_graph_capture and (batch_size, num_tokens) not in (
             (1, 4096),
             (16, 65536),
@@ -333,6 +351,12 @@ class DSV4WholeLayerRuntime:
                 "DSV4 huge runtime requires sum(extend_seq_lens_cpu) == M; "
                 f"got {extend_lens!r} for M={num_tokens}"
             )
+        tp4_token_shard_attention = (
+            self._use_tp4_token_shard_attention
+            and num_tokens in (65536, 131072)
+            and batch_size in (16, 32)
+            and all(int(length) == 4096 for length in extend_lens)
+        )
         if input_ids.shape[0] != num_tokens:
             raise RuntimeError(
                 "DSV4 huge runtime requires one input id per live position: "
@@ -387,6 +411,12 @@ class DSV4WholeLayerRuntime:
             num_tokens,
             positions.device,
         )
+        if self._use_tp4_token_shard_attention:
+            attention_q_local, attention_q_recv = (
+                self._get_tp4_attention_workspace(num_tokens, positions.device)
+            )
+        else:
+            attention_q_local, attention_q_recv = None, None
         q_lora_bf16, q_lora_fp8, q_lora_scale = self._get_q_lora_workspace(
             num_tokens,
             positions.device,
@@ -423,6 +453,9 @@ class DSV4WholeLayerRuntime:
             extend_seq_lens=forward_batch.extend_seq_lens,
             out_cache_loc=forward_batch.out_cache_loc,
             attention_q_padded=attention_q_padded,
+            attention_q_local=attention_q_local,
+            attention_q_recv=attention_q_recv,
+            tp4_token_shard_attention=tp4_token_shard_attention,
             q_lora_bf16=q_lora_bf16,
             q_lora_fp8=q_lora_fp8,
             q_lora_scale=q_lora_scale,
@@ -511,6 +544,30 @@ class DSV4WholeLayerRuntime:
             ].view(2, 8, (num_tokens + 3) // 4 * 4),
             wo_a_gemm_output[:num_tokens],
         )
+
+    def _get_tp4_attention_workspace(
+        self,
+        num_tokens: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        workspace = self._tp4_attention_workspace
+        if workspace is None or workspace[0] != device:
+            # Keep token-sharded C4 traffic disjoint from attention_q_padded.
+            # C0/C128's output-only FlashMLA still observes padded heads in its
+            # warp-wide online-softmax control; writing NCCL receives into that
+            # storage changes their BF16 rounding even after valid heads are
+            # overwritten.  These fixed-capacity local16 buffers avoid that
+            # cross-layer state without any hot-path allocation.
+            q_local = torch.empty(
+                (_MAX_FORWARD_TOKENS, 16, 512),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            q_recv = torch.empty_like(q_local)
+            self._tp4_attention_workspace = (device, q_local, q_recv)
+        else:
+            _, q_local, q_recv = workspace
+        return q_local[:num_tokens], q_recv[:num_tokens]
 
     def _get_q_lora_workspace(
         self,
