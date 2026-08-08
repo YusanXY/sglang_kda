@@ -17,6 +17,7 @@ from .elementwise import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
+    fused_q_norm_rope_tp4_route,
     fused_rope_inplace,
     rmsnorm_mxfp8_quant,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "fused_store_cache",
     "fused_rope_inplace",
     "fused_q_norm_rope",
+    "fused_q_norm_rope_tp4_route",
     "rmsnorm_mxfp8_quant",
     "fused_q_indexer_rope_first_quant",
     "fused_q_indexer_rope_hadamard_fp4_quant",

@@ -72,17 +72,28 @@ load_rope_first_cos_sin(const float* __restrict__ cos_sin_cache, int32_t lane_id
 
 struct FusedQNormRopeParams {
   const void* __restrict__ q_input;     // (B, num_q_heads, kHeadDim) DType
-  void* __restrict__ q_output;          // (B, num_q_heads, kHeadDim) DType
+  void* __restrict__ q_output0;         // local or TP destination rank 0
+  void* __restrict__ q_output1;         // TP destination rank 1
+  void* __restrict__ q_output2;         // TP destination rank 2
+  void* __restrict__ q_output3;         // TP destination rank 3
   const float* __restrict__ freqs_cis;  // (max_pos, kRopeDim) fp32 (re/im interleaved)
   const void* __restrict__ positions;   // (B,) PosT
   int64_t q_input_stride_batch;
   int64_t q_output_stride_batch;
   uint32_t batch_size;
   uint32_t num_q_heads;
+  uint32_t source_rank;
+  uint32_t shard_tokens;
   float eps;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL>
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    typename PosT,
+    bool kUsePDL,
+    bool kTP4Route>
 Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams params) {
   using namespace device;
 
@@ -109,8 +120,29 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   const uint32_t head_id = work_id % params.num_q_heads;
   const auto input_ptr =
       static_cast<const DType*>(params.q_input) + batch_id * params.q_input_stride_batch + head_id * kHeadDim;
-  const auto output_ptr =
-      static_cast<DType*>(params.q_output) + batch_id * params.q_output_stride_batch + head_id * kHeadDim;
+  DType* output_base = static_cast<DType*>(params.q_output0);
+  uint32_t output_batch = batch_id;
+  if constexpr (kTP4Route) {
+    const uint32_t destination_rank = batch_id / params.shard_tokens;
+    output_batch = params.source_rank * params.shard_tokens +
+        batch_id - destination_rank * params.shard_tokens;
+    switch (destination_rank) {
+      case 0:
+        output_base = static_cast<DType*>(params.q_output0);
+        break;
+      case 1:
+        output_base = static_cast<DType*>(params.q_output1);
+        break;
+      case 2:
+        output_base = static_cast<DType*>(params.q_output2);
+        break;
+      default:
+        output_base = static_cast<DType*>(params.q_output3);
+        break;
+    }
+  }
+  const auto output_ptr = output_base +
+      output_batch * params.q_output_stride_batch + head_id * kHeadDim;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
 
   __shared__ Storage s_rope[kFusedQNumWarps][kRopeSize];
@@ -184,7 +216,12 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
 struct FusedQNormRopeKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL>;
+  static constexpr auto kernel =
+      fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, false>;
+
+  template <typename PosT>
+  static constexpr auto tp4_kernel =
+      fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, true>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -225,13 +262,18 @@ struct FusedQNormRopeKernel {
 
     const auto params = FusedQNormRopeParams{
         .q_input = q_input.data_ptr(),
-        .q_output = q_output.data_ptr(),
+        .q_output0 = q_output.data_ptr(),
+        .q_output1 = nullptr,
+        .q_output2 = nullptr,
+        .q_output3 = nullptr,
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
         .positions = positions.data_ptr(),
         .q_input_stride_batch = q_input.stride(0),
         .q_output_stride_batch = q_output.stride(0),
         .batch_size = batch_size,
         .num_q_heads = num_q_heads,
+        .source_rank = 0,
+        .shard_tokens = 0,
         .eps = eps,
     };
     const auto total_works = batch_size * num_q_heads;
@@ -240,6 +282,89 @@ struct FusedQNormRopeKernel {
     const auto k_int64 = kernel<int64_t>;
     const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
     LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap())  //
+        .enable_pdl(kUsePDL)(k, params);
+  }
+
+  static void tp4_route(
+      const tvm::ffi::TensorView q_input,
+      const tvm::ffi::TensorView peer0,
+      const tvm::ffi::TensorView peer1,
+      const tvm::ffi::TensorView peer2,
+      const tvm::ffi::TensorView peer3,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      int64_t source_rank,
+      float eps) {
+    using namespace host;
+
+    auto B = SymbolicSize{"batch_size"};
+    auto H = SymbolicSize{"num_q_heads"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({B, H, kHeadDim})
+        .with_strides({-1, kHeadDim, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(q_input);
+    constexpr int64_t kMaxForwardTokens = 131072;
+    TensorMatcher({kMaxForwardTokens, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(peer0);
+    TensorMatcher({kMaxForwardTokens, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(peer1);
+    TensorMatcher({kMaxForwardTokens, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(peer2);
+    TensorMatcher({kMaxForwardTokens, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(peer3);
+    TensorMatcher({-1, kRopeDim})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(freqs_cis);
+    auto pos_dtype = SymbolicDType{};
+    TensorMatcher({B})
+        .with_dtype<int32_t, int64_t>(pos_dtype)
+        .with_device(device_)
+        .verify(positions);
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto num_q_heads = static_cast<uint32_t>(H.unwrap());
+    RuntimeCheck(
+        source_rank >= 0 && source_rank < 4,
+        "TP4 routed Q producer requires source_rank in [0, 4)");
+    RuntimeCheck(
+        batch_size == 65536 || batch_size == 131072,
+        "TP4 routed Q producer only supports exact Req16/Req128 aggregate M");
+    if (batch_size == 0) return;
+    const uint32_t shard_tokens = batch_size / 4;
+    const auto params = FusedQNormRopeParams{
+        .q_input = q_input.data_ptr(),
+        .q_output0 = peer0.data_ptr(),
+        .q_output1 = peer1.data_ptr(),
+        .q_output2 = peer2.data_ptr(),
+        .q_output3 = peer3.data_ptr(),
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .positions = positions.data_ptr(),
+        .q_input_stride_batch = q_input.stride(0),
+        .q_output_stride_batch = num_q_heads * kHeadDim,
+        .batch_size = batch_size,
+        .num_q_heads = num_q_heads,
+        .source_rank = static_cast<uint32_t>(source_rank),
+        .shard_tokens = shard_tokens,
+        .eps = eps,
+    };
+    const auto total_works = batch_size * num_q_heads;
+    const auto num_blocks = div_ceil(total_works, kFusedQNumWarps);
+    const auto k_int32 = tp4_kernel<int32_t>;
+    const auto k_int64 = tp4_kernel<int64_t>;
+    const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
+    LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap())
         .enable_pdl(kUsePDL)(k, params);
   }
 };

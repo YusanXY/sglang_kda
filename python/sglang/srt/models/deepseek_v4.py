@@ -26,6 +26,7 @@ import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
+    fused_q_norm_rope_tp4_route,
     fused_rope_inplace,
     inverse_rope_fp8_wo_a_ue8m0,
     rmsnorm_mxfp8_quant,
@@ -658,9 +659,25 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
         q_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        q_route_workspace: Optional[
+            Tuple[Tuple[torch.Tensor, ...], int]
+        ] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q_quant if q_quant is not None else q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if q_route_workspace is not None:
+            if q_out is None:
+                raise RuntimeError("TP4 routed Q producer requires receive output")
+            q_output_peers, source_rank = q_route_workspace
+            fused_q_norm_rope_tp4_route(
+                q,
+                q_output_peers,
+                source_rank,
+                self.eps,
+                self.freqs_cis,
+                positions,
+            )
+            return q_out
         if q_out is None:
             q_out = torch.empty_like(q)
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
@@ -907,6 +924,9 @@ class MQALayer(MqaAttentionBase):
         huge_q_lora_workspace: Optional[
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ] = None,
+        huge_q_route_workspace: Optional[
+            Tuple[Tuple[torch.Tensor, ...], int]
+        ] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         q_lora_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -1048,10 +1068,16 @@ class MQALayer(MqaAttentionBase):
                     positions,
                     q_out,
                     q_quant=q_lora_quant,
+                    q_route_workspace=huge_q_route_workspace,
                 )
             else:
                 q_lora = self.q_norm(q_lora)
-                q = self._compute_q_b(q_lora, positions, q_out)
+                q = self._compute_q_b(
+                    q_lora,
+                    positions,
+                    q_out,
+                    q_route_workspace=huge_q_route_workspace,
+                )
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -1194,10 +1220,18 @@ class MQALayer(MqaAttentionBase):
                 # padded-Q allocation.  FlashMLA consumes the source-major
                 # all-to-all receive layout, so no Q padding or relayout launch
                 # is needed on this C4 path.
-                q_out = e2e_descriptor.attention_q_local
+                if not e2e_descriptor.attention_q_direct_route:
+                    raise RuntimeError(
+                        "Huge C4 requires fused symmetric Q routing"
+                    )
+                q_out = e2e_descriptor.attention_q_recv
                 if (
                     q_out is None
-                    or e2e_descriptor.attention_q_recv is None
+                    or e2e_descriptor.attention_q_handle is None
+                    or e2e_descriptor.attention_q_peer0 is None
+                    or e2e_descriptor.attention_q_peer1 is None
+                    or e2e_descriptor.attention_q_peer2 is None
+                    or e2e_descriptor.attention_q_peer3 is None
                     or e2e_descriptor.attention_packed_send is None
                     or e2e_descriptor.attention_packed_recv is None
                 ):
@@ -1260,6 +1294,19 @@ class MQALayer(MqaAttentionBase):
                 if huge_mode
                 else None
             )
+            huge_q_route_workspace = (
+                (
+                    (
+                        e2e_descriptor.attention_q_peer0,
+                        e2e_descriptor.attention_q_peer1,
+                        e2e_descriptor.attention_q_peer2,
+                        e2e_descriptor.attention_q_peer3,
+                    ),
+                    e2e_descriptor.attention_q_rank,
+                )
+                if tp4_token_shard_attention
+                else None
+            )
             q, kv = self._forward_prepare(
                 x,
                 positions,
@@ -1268,6 +1315,7 @@ class MQALayer(MqaAttentionBase):
                 q_out,
                 x_quant=x_quant,
                 huge_q_lora_workspace=huge_q_lora_workspace,
+                huge_q_route_workspace=huge_q_route_workspace,
             )
 
         # The cache write is always fused / already done by _forward_prepare* --
@@ -1341,6 +1389,8 @@ class MQALayer(MqaAttentionBase):
                             e2e_descriptor.wo_a_output_s_storage,
                             self.freqs_cis,
                             positions,
+                            e2e_descriptor.attention_q_handle,
+                            e2e_descriptor.attention_q_direct_route,
                         )
                         if tp4_token_shard_attention else None
                     ),

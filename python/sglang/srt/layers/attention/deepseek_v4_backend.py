@@ -2147,6 +2147,8 @@ class DeepseekV4AttnBackend(
                 _output_s_storage,
                 _freqs_cis,
                 _positions,
+                q_symmetric_handle,
+                q_direct_route,
             ) = tp4_token_shard_workspace
             if q_recv.shape != q_flat.shape:
                 raise RuntimeError(
@@ -2161,10 +2163,21 @@ class DeepseekV4AttnBackend(
                 raise RuntimeError(
                     "TP4 token-sharded attention requires TP=4 and M divisible "
                     f"by four; got TP={tp_group.world_size}, M={num_tokens}"
+            )
+            if q_direct_route:
+                if q_symmetric_handle is None:
+                    raise RuntimeError(
+                        "TP4 fused Q routing requires its symmetric handle"
+                    )
+                # The norm/RoPE producer already routed each contiguous token
+                # quarter into the destination's source-major Q tensor. This
+                # GPU barrier replaces NCCL SendRecv and orders remote writes
+                # before the local FlashMLA consumer.
+                q_symmetric_handle.barrier(channel=layer_id & 1)
+            else:
+                raise RuntimeError(
+                    "Huge C4 token sharding requires fused symmetric Q routing"
                 )
-            # The first collective operates directly on the Q producer and
-            # gives this rank all 64 heads for its contiguous token quarter.
-            tp_group.all_to_all_single(q_recv, q_flat)
             shard_tokens = num_tokens // 4
             shard_begin = tp_group.rank_in_group * shard_tokens
             shard_end = shard_begin + shard_tokens

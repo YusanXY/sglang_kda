@@ -100,6 +100,13 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_q_padded: torch.Tensor
     attention_q_local: Optional[torch.Tensor]
     attention_q_recv: Optional[torch.Tensor]
+    attention_q_handle: Any
+    attention_q_peer0: Optional[torch.Tensor]
+    attention_q_peer1: Optional[torch.Tensor]
+    attention_q_peer2: Optional[torch.Tensor]
+    attention_q_peer3: Optional[torch.Tensor]
+    attention_q_rank: int
+    attention_q_direct_route: bool
     attention_packed_send: Optional[torch.Tensor]
     attention_packed_recv: Optional[torch.Tensor]
     attention_packed_recv_q: Optional[torch.Tensor]
@@ -261,6 +268,7 @@ class DSV4WholeLayerRuntime:
             ]
         ] = None
         self._tp4_symmetric_workspace: Optional[tuple] = None
+        self._tp4_symmetric_q_workspace: Optional[tuple] = None
         self._tp4_local_wob_output_workspace: Optional[tuple] = None
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
@@ -331,6 +339,8 @@ class DSV4WholeLayerRuntime:
                 layers, start_layer=start_layer, end_layer=end_layer
             )
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
+        if self._use_tp4_token_shard_attention:
+            self._bind_tp4_symmetric_q_workspace(workspace_device)
         if self._use_tp4_symmetric_wob:
             self._bind_tp4_symmetric_workspace(workspace_device)
         if self._use_tp4_local_wob_direct_gather:
@@ -570,6 +580,39 @@ class DSV4WholeLayerRuntime:
             tp_group.rank_in_group,
         )
 
+    def _bind_tp4_symmetric_q_workspace(self, device: torch.device) -> None:
+        """Bind the peer-visible C4 Q receive tensor used by the fused producer."""
+        from torch.distributed import _symmetric_memory as symm_mem
+
+        from sglang.srt.distributed import get_tp_group
+
+        cached = self._tp4_symmetric_q_workspace
+        if cached is not None and cached[0] == device:
+            return
+        tp_group = get_tp_group()
+        if tp_group.world_size != 4:
+            raise RuntimeError(
+                "TP4 direct Q routing requires TP=4, got "
+                f"{tp_group.world_size}"
+            )
+        local_q_recv = symm_mem.empty(
+            (_MAX_FORWARD_TOKENS, 16, 512),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        handle = symm_mem.rendezvous(local_q_recv, tp_group.device_group)
+        peers = tuple(
+            handle.get_buffer(rank, local_q_recv.shape, local_q_recv.dtype)
+            for rank in range(4)
+        )
+        self._tp4_symmetric_q_workspace = (
+            device,
+            handle,
+            local_q_recv,
+            peers,
+            tp_group.rank_in_group,
+        )
+
     def _bind_tp4_local_wob_output_workspace(
         self, device: torch.device
     ) -> None:
@@ -739,6 +782,24 @@ class DSV4WholeLayerRuntime:
             ) = (
                 self._get_tp4_attention_workspace(num_tokens, positions.device)
             )
+            symmetric_q = self._tp4_symmetric_q_workspace
+            if symmetric_q is None or symmetric_q[0] != positions.device:
+                raise RuntimeError(
+                    "TP4 symmetric Q workspace was not bound on this device"
+                )
+            (
+                _,
+                attention_q_handle,
+                attention_q_storage,
+                attention_q_peers,
+                attention_q_rank,
+            ) = symmetric_q
+            del attention_q_storage
+            attention_q_peer0 = attention_q_peers[0]
+            attention_q_peer1 = attention_q_peers[1]
+            attention_q_peer2 = attention_q_peers[2]
+            attention_q_peer3 = attention_q_peers[3]
+            attention_q_direct_route = tp4_token_shard_attention
             if (
                 self._use_tp4_local_wob_direct_gather
                 and tp4_token_shard_attention
@@ -819,6 +880,13 @@ class DSV4WholeLayerRuntime:
                 attention_symm_direct_push = False
         else:
             attention_q_local, attention_q_recv = None, None
+            attention_q_handle = None
+            attention_q_peer0 = None
+            attention_q_peer1 = None
+            attention_q_peer2 = None
+            attention_q_peer3 = None
+            attention_q_rank = -1
+            attention_q_direct_route = False
             attention_packed_send, attention_packed_recv = None, None
             attention_packed_recv_q = None
             attention_projected_local = None
@@ -882,6 +950,13 @@ class DSV4WholeLayerRuntime:
             attention_q_padded=attention_q_padded,
             attention_q_local=attention_q_local,
             attention_q_recv=attention_q_recv,
+            attention_q_handle=attention_q_handle,
+            attention_q_peer0=attention_q_peer0,
+            attention_q_peer1=attention_q_peer1,
+            attention_q_peer2=attention_q_peer2,
+            attention_q_peer3=attention_q_peer3,
+            attention_q_rank=attention_q_rank,
+            attention_q_direct_route=attention_q_direct_route,
             attention_packed_send=attention_packed_send,
             attention_packed_recv=attention_packed_recv,
             attention_packed_recv_q=attention_packed_recv_q,
@@ -1037,7 +1112,12 @@ class DSV4WholeLayerRuntime:
                 dtype=torch.bfloat16,
                 device=device,
             )
-            q_recv = torch.empty_like(q_local)
+            symmetric_q = self._tp4_symmetric_q_workspace
+            if symmetric_q is None or symmetric_q[0] != device:
+                raise RuntimeError(
+                    "TP4 symmetric Q workspace was not bound on this device"
+                )
+            q_recv = symmetric_q[2]
             # After the first Q all-to-all and FlashMLA complete, both BF16
             # buffers are dead for the current layer. Reinterpret their first
             # 2064 bytes/token as post-WO_A FP8+scale send/receive rows. Each
