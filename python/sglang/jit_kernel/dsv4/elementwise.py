@@ -231,6 +231,7 @@ def fused_q_norm_rope_tp4_bulk_route(
     module.tp4_bulk_route_forward(
         q_input,
         q_local,
+        q_output_peers[source_rank],
         q_output_peers[0],
         q_output_peers[1],
         q_output_peers[2],

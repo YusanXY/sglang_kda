@@ -93,7 +93,8 @@ template <
     int64_t kRopeDim,
     typename PosT,
     bool kUsePDL,
-    bool kTP4Route>
+    bool kTP4Route,
+    bool kTP4Stage>
 Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams params) {
   using namespace device;
 
@@ -139,6 +140,15 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
       default:
         output_base = static_cast<DType*>(params.q_output3);
         break;
+    }
+  } else if constexpr (kTP4Stage) {
+    const uint32_t destination_rank = batch_id / params.shard_tokens;
+    if (destination_rank == params.source_rank) {
+      // This rank's local token quarter is already at its final source-major
+      // slot; only the other three quarters need the following peer router.
+      output_base = static_cast<DType*>(params.q_output1);
+      output_batch = params.source_rank * params.shard_tokens +
+          batch_id - destination_rank * params.shard_tokens;
     }
   }
   const auto output_ptr = output_base +
@@ -218,7 +228,7 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
 // and moves aligned 16-byte vectors instead of issuing warp-granular peer
 // stores from the norm/RoPE producer.
 template <typename DType, bool kUsePDL>
-__global__ __launch_bounds__(256) void tp4_bulk_route_q_kernel(
+__global__ __launch_bounds__(256) void tp4_remote_bulk_route_q_kernel(
     const DType* __restrict__ input,
     DType* __restrict__ peer0,
     DType* __restrict__ peer1,
@@ -230,7 +240,9 @@ __global__ __launch_bounds__(256) void tp4_bulk_route_q_kernel(
   device::PDLWaitPrimary<kUsePDL>();
   using Copy = int4;
   constexpr int64_t kElementsPerCopy = sizeof(Copy) / sizeof(DType);
-  const int destination_rank = static_cast<int>(blockIdx.y);
+  const int remote_slot = static_cast<int>(blockIdx.y);
+  const int destination_rank =
+      remote_slot >= source_rank ? remote_slot + 1 : remote_slot;
   const int64_t shard_copies = shard_elements / kElementsPerCopy;
   const Copy* source = reinterpret_cast<const Copy*>(input) +
       destination_rank * shard_copies;
@@ -260,11 +272,18 @@ template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
 struct FusedQNormRopeKernel {
   template <typename PosT>
   static constexpr auto kernel =
-      fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, false>;
+      fused_q_norm_rope<
+          DType, kHeadDim, kRopeDim, PosT, kUsePDL, false, false>;
 
   template <typename PosT>
   static constexpr auto tp4_kernel =
-      fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, true>;
+      fused_q_norm_rope<
+          DType, kHeadDim, kRopeDim, PosT, kUsePDL, true, false>;
+
+  template <typename PosT>
+  static constexpr auto tp4_stage_kernel =
+      fused_q_norm_rope<
+          DType, kHeadDim, kRopeDim, PosT, kUsePDL, false, true>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -459,9 +478,10 @@ struct FusedQNormRopeKernel {
     // Preserve the CTA budget that saturated direct-output peer writes in
     // v17, split evenly over the four independent destinations.
     const int total_blocks = batch_size == 65536 ? 8192 : 16384;
-    LaunchKernel(dim3(total_blocks / 4, 4), dim3(256), device_.unwrap())
+    const int blocks_per_destination = (total_blocks + 2) / 3;
+    LaunchKernel(dim3(blocks_per_destination, 3), dim3(256), device_.unwrap())
         .enable_pdl(kUsePDL)(
-            tp4_bulk_route_q_kernel<DType, kUsePDL>,
+            tp4_remote_bulk_route_q_kernel<DType, kUsePDL>,
             static_cast<const DType*>(q_local.data_ptr()),
             static_cast<DType*>(peer0.data_ptr()),
             static_cast<DType*>(peer1.data_ptr()),
@@ -471,9 +491,80 @@ struct FusedQNormRopeKernel {
             source_rank);
   }
 
+  static void tp4_stage(
+      const tvm::ffi::TensorView q_input,
+      const tvm::ffi::TensorView q_local,
+      const tvm::ffi::TensorView q_recv,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView positions,
+      int64_t source_rank,
+      float eps) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto H = SymbolicSize{"num_q_heads"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+    TensorMatcher({B, H, kHeadDim})
+        .with_strides({-1, kHeadDim, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(q_input);
+    TensorMatcher({B, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(q_local);
+    constexpr int64_t kMaxForwardTokens = 131072;
+    TensorMatcher({kMaxForwardTokens, H, kHeadDim})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(q_recv);
+    TensorMatcher({-1, kRopeDim})
+        .with_dtype<float>()
+        .with_device(device_)
+        .verify(freqs_cis);
+    auto pos_dtype = SymbolicDType{};
+    TensorMatcher({B})
+        .with_dtype<int32_t, int64_t>(pos_dtype)
+        .with_device(device_)
+        .verify(positions);
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto num_q_heads = static_cast<uint32_t>(H.unwrap());
+    RuntimeCheck(
+        batch_size == 65536 || batch_size == 131072,
+        "TP4 staged Q producer only supports exact Req16/Req128 aggregate M");
+    RuntimeCheck(
+        source_rank >= 0 && source_rank < 4,
+        "TP4 staged Q producer requires source_rank in [0, 4)");
+    const uint32_t shard_tokens = batch_size / 4;
+    const auto params = FusedQNormRopeParams{
+        .q_input = q_input.data_ptr(),
+        .q_output0 = q_local.data_ptr(),
+        .q_output1 = q_recv.data_ptr(),
+        .q_output2 = nullptr,
+        .q_output3 = nullptr,
+        .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
+        .positions = positions.data_ptr(),
+        .q_input_stride_batch = q_input.stride(0),
+        .q_output_stride_batch = num_q_heads * kHeadDim,
+        .batch_size = batch_size,
+        .num_q_heads = num_q_heads,
+        .source_rank = static_cast<uint32_t>(source_rank),
+        .shard_tokens = shard_tokens,
+        .eps = eps,
+    };
+    const auto total_works = batch_size * num_q_heads;
+    const auto num_blocks = div_ceil(total_works, kFusedQNumWarps);
+    const auto k_int32 = tp4_stage_kernel<int32_t>;
+    const auto k_int64 = tp4_stage_kernel<int64_t>;
+    const auto k = pos_dtype.is_type<int32_t>() ? k_int32 : k_int64;
+    LaunchKernel(num_blocks, kFusedQBlockSize, device_.unwrap())
+        .enable_pdl(kUsePDL)(k, params);
+  }
+
   static void tp4_bulk_route_forward(
       const tvm::ffi::TensorView q_input,
       const tvm::ffi::TensorView q_local,
+      const tvm::ffi::TensorView q_recv,
       const tvm::ffi::TensorView peer0,
       const tvm::ffi::TensorView peer1,
       const tvm::ffi::TensorView peer2,
@@ -484,7 +575,8 @@ struct FusedQNormRopeKernel {
       float eps) {
     // One FFI/operator boundary launches both GPU kernels on the current
     // stream; no Python-visible intermediate or host synchronization exists.
-    forward(q_input, q_local, freqs_cis, positions, eps);
+    tp4_stage(
+        q_input, q_local, q_recv, freqs_cis, positions, source_rank, eps);
     tp4_bulk_route(q_local, peer0, peer1, peer2, peer3, source_rank);
   }
 };
