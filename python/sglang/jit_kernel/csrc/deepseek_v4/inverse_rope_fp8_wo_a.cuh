@@ -634,14 +634,24 @@ __global__ void tp4_unpack_wo_b_scale_kernel(
     int64_t num_tokens,
     int64_t aligned_num_tokens) {
   device::PDLWaitPrimary<kUsePDL>();
-  const int64_t token = blockIdx.x;
+  const int64_t token =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   constexpr int kPackedScalesPerToken =
       kTP4PackedWoBScaleBytes / sizeof(uint32_t);
-  if (token < num_tokens && threadIdx.x < kPackedScalesPerToken) {
+  static_assert(kPackedScalesPerToken == 4);
+  if (token < num_tokens) {
     const uint8_t* row = packed_input + token * kTP4PackedWoBRowBytes;
-    output_s[static_cast<int64_t>(threadIdx.x) * aligned_num_tokens + token] =
-        reinterpret_cast<const uint32_t*>(
-            row + kTP4PackedWoBQBytes)[threadIdx.x];
+    // One thread owns a token.  The row tail is 16-byte aligned, so load all
+    // four packed scale words at once; each of the four stores is then fully
+    // coalesced across consecutive token-owning threads.  The previous
+    // one-CTA-per-token mapping launched num_tokens CTAs with only four active
+    // lanes and emitted four unrelated global-store transactions per CTA.
+    const uint4 scales = *reinterpret_cast<const uint4*>(
+        row + kTP4PackedWoBQBytes);
+    output_s[0 * aligned_num_tokens + token] = scales.x;
+    output_s[1 * aligned_num_tokens + token] = scales.y;
+    output_s[2 * aligned_num_tokens + token] = scales.z;
+    output_s[3 * aligned_num_tokens + token] = scales.w;
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -701,7 +711,11 @@ struct TP4PackedWoBInputUE8M0Kernel {
         aligned_num_tokens >= num_tokens && aligned_num_tokens % 4 == 0,
         "TP4 WO_B scale storage must use align(T, 4)");
     if (num_tokens == 0) return;
-    LaunchKernel(dim3(num_tokens), dim3(32), device.unwrap())
+    constexpr int kThreads = 256;
+    LaunchKernel(
+        dim3((num_tokens + kThreads - 1) / kThreads),
+        dim3(kThreads),
+        device.unwrap())
         .enable_pdl(kUsePDL)(
             tp4_unpack_wo_b_scale_kernel<kUsePDL>,
             static_cast<const uint8_t*>(packed_input.data_ptr()),
