@@ -463,10 +463,169 @@ def inverse_rope_fp8_wo_a_ue8m0(
     return output_q, output_s_storage.permute(2, 0, 1)[:num_tokens]
 
 
+_TP4_PACKED_OUTPUT_ROW_BYTES = 2 * 4096 + 2 * (4096 // _QUANT_GROUP_SIZE)
+
+
+@cache_once
+def _jit_tp4_packed_output_module(
+    input_dtype: torch.dtype,
+    head_dim: int,
+    rope_dim: int,
+    use_pdl: bool,
+) -> Module:
+    args = make_cpp_args(input_dtype, head_dim, rope_dim, use_pdl)
+    return load_jit(
+        make_name("tp4_packed_attention_output_ue8m0"),
+        *args,
+        cuda_files=["deepseek_v4/inverse_rope_fp8_wo_a.cuh"],
+        cuda_wrappers=[
+            ("pack", f"TP4PackedOutputUE8M0Kernel<{args}>::pack"),
+            ("unpack", f"TP4PackedOutputUE8M0Kernel<{args}>::unpack"),
+        ],
+        extra_cuda_cflags=["--use_fast_math"],
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_pack_attention_output_ue8m0",
+    mutates_args=["packed_output"],
+)
+def _tp4_pack_attention_output_custom_op(
+    input: torch.Tensor,
+    freqs_real: torch.Tensor,
+    shard_positions: torch.Tensor,
+    packed_output: torch.Tensor,
+) -> None:
+    module = _jit_tp4_packed_output_module(
+        input.dtype,
+        _HEAD_DIM,
+        _ROPE_DIM,
+        is_arch_support_pdl(),
+    )
+    module.pack(input, freqs_real, shard_positions, packed_output)
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_unpack_attention_output_ue8m0",
+    mutates_args=["output_q", "output_s"],
+)
+def _tp4_unpack_attention_output_custom_op(
+    packed_input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    module = _jit_tp4_packed_output_module(
+        torch.bfloat16,
+        _HEAD_DIM,
+        _ROPE_DIM,
+        is_arch_support_pdl(),
+    )
+    module.unpack(packed_input, output_q, output_s)
+
+
+@debug_kernel_api
+def tp4_pack_attention_output_ue8m0(
+    input: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    shard_positions: torch.Tensor,
+    packed_output: torch.Tensor,
+) -> torch.Tensor:
+    """Inverse-RoPE, quantize, and pack one token-sharded C4 output.
+
+    ``input`` is destination-major ``[4 * shard_T, 2, 4096]`` BF16.  Each
+    packed row contains 8192 FP8 values followed by 64 UE8M0 bytes so a single
+    uint8 all-to-all replaces the old BF16 output collective.
+    """
+
+    if input.device.type != "cuda" or torch.version.hip is not None:
+        raise RuntimeError("TP4 packed attention output requires NVIDIA CUDA")
+    if input.dtype != torch.bfloat16 or input.shape[1:] != (2, 4096):
+        raise RuntimeError(
+            "TP4 packed attention input must be BF16 [4*shard_T, 2, 4096]"
+        )
+    if not input.is_contiguous() or input.shape[0] % 4:
+        raise RuntimeError("TP4 packed attention input must be contiguous and T%4=0")
+    shard_tokens = input.shape[0] // 4
+    if (
+        shard_positions.ndim != 1
+        or shard_positions.shape[0] != shard_tokens
+        or shard_positions.dtype not in (torch.int32, torch.int64)
+        or shard_positions.device != input.device
+    ):
+        raise RuntimeError("TP4 shard positions must be CUDA int32/int64 [T/4]")
+    if freqs_cis.device != input.device or freqs_cis.dtype != torch.complex64:
+        raise RuntimeError("TP4 packed output requires a CUDA complex64 RoPE table")
+    if (
+        packed_output.shape != (input.shape[0], _TP4_PACKED_OUTPUT_ROW_BYTES)
+        or packed_output.dtype != torch.uint8
+        or packed_output.device != input.device
+        or not packed_output.is_contiguous()
+    ):
+        raise RuntimeError(
+            "packed_output must be contiguous CUDA uint8 "
+            f"[{input.shape[0]}, {_TP4_PACKED_OUTPUT_ROW_BYTES}]"
+        )
+    if input.numel():
+        _tp4_pack_attention_output_custom_op(
+            input,
+            torch.view_as_real(freqs_cis).flatten(-2),
+            shard_positions,
+            packed_output,
+        )
+    return packed_output
+
+
+@debug_kernel_api
+def tp4_unpack_attention_output_ue8m0(
+    packed_input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s_storage: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unpack a received TP4 FP8 row into DeepGEMM WO_A operands."""
+
+    if (
+        packed_input.ndim != 2
+        or packed_input.shape[1] != _TP4_PACKED_OUTPUT_ROW_BYTES
+        or packed_input.dtype != torch.uint8
+        or packed_input.device.type != "cuda"
+        or not packed_input.is_contiguous()
+    ):
+        raise RuntimeError(
+            "packed_input must be contiguous CUDA uint8 [T, 8256]"
+        )
+    num_tokens = packed_input.shape[0]
+    if (
+        output_q.shape != (num_tokens, 2, 4096)
+        or output_q.dtype != torch.float8_e4m3fn
+        or output_q.device != packed_input.device
+        or not output_q.is_contiguous()
+    ):
+        raise RuntimeError("TP4 unpack output_q must be contiguous FP8 [T,2,4096]")
+    aligned_tokens = (num_tokens + 3) // 4 * 4
+    if (
+        output_s_storage.shape != (2, 8, aligned_tokens)
+        or output_s_storage.dtype != torch.int32
+        or output_s_storage.device != packed_input.device
+        or not output_s_storage.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 unpack scale storage must be contiguous int32 [2,8,align(T,4)]"
+        )
+    if packed_input.numel():
+        _tp4_unpack_attention_output_custom_op(
+            packed_input,
+            output_q,
+            output_s_storage,
+        )
+    return output_q, output_s_storage.permute(2, 0, 1)[:num_tokens]
+
+
 __all__ = [
     "inverse_rope_fp8_wo_a_ue8m0",
     "load_mhc_post_vec8_extension",
     "load_mhc_pre_norm_mxfp8_quant_extension",
     "mhc_post_vec8",
     "mhc_pre_norm_mxfp8_quant",
+    "tp4_pack_attention_output_ue8m0",
+    "tp4_unpack_attention_output_ue8m0",
 ]

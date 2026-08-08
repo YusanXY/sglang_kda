@@ -1195,9 +1195,14 @@ class MQALayer(MqaAttentionBase):
                 # all-to-all receive layout, so no Q padding or relayout launch
                 # is needed on this C4 path.
                 q_out = e2e_descriptor.attention_q_local
-                if q_out is None or e2e_descriptor.attention_q_recv is None:
+                if (
+                    q_out is None
+                    or e2e_descriptor.attention_q_recv is None
+                    or e2e_descriptor.attention_packed_send is None
+                    or e2e_descriptor.attention_packed_recv is None
+                ):
                     raise RuntimeError(
-                        "TP4 token-sharded attention requires local-Q/recv workspaces"
+                        "TP4 token-sharded FP8 output requires Q and packed workspaces"
                     )
             elif huge_mode:
                 q_padded = e2e_descriptor.attention_q_padded
@@ -1330,12 +1335,18 @@ class MQALayer(MqaAttentionBase):
                     tp4_token_shard_workspace=(
                         (
                             e2e_descriptor.attention_q_recv,
-                            e2e_descriptor.attention_q_local,
+                            e2e_descriptor.attention_packed_send,
+                            e2e_descriptor.attention_packed_recv,
+                            e2e_descriptor.wo_a_output_q,
+                            e2e_descriptor.wo_a_output_s_storage,
+                            self.freqs_cis,
+                            positions,
                         )
                         if tp4_token_shard_attention else None
                     ),
                 )
-            o = o[:, tp_slice, :]
+            if not tp4_token_shard_attention:
+                o = o[:, tp_slice, :]
         o_fp8 = o_s = None
         if huge_mode:
             if _is_npu or not _FP8_WO_A_GEMM:
@@ -1348,17 +1359,25 @@ class MQALayer(MqaAttentionBase):
                 raise RuntimeError(
                     "DSV4 huge output fusion requires Blackwell UE8M0 scales"
                 )
-            # First Stage-2 GPU fusion: remove the inverse-RoPE BF16 write/read
-            # and the following WO_A activation-quant launch.  The kernel keeps
-            # the historical BF16 rounding boundary before FP8 conversion.
-            o = o.view(o.shape[0], self.n_local_groups, -1)
-            o_fp8, o_s = inverse_rope_fp8_wo_a_ue8m0(
-                o,
-                self.freqs_cis,
-                positions,
-                e2e_descriptor.wo_a_output_q,
-                e2e_descriptor.wo_a_output_s_storage,
-            )
+            if tp4_token_shard_attention:
+                # The backend already inverse-rotated and quantized on the
+                # token-shard owner, moved one packed FP8+scale row through
+                # NCCL, and unpacked directly into DeepGEMM's two operands.
+                o_fp8 = e2e_descriptor.wo_a_output_q
+                o_s = e2e_descriptor.wo_a_output_s_storage.permute(2, 0, 1)[
+                    : o_fp8.shape[0]
+                ]
+            else:
+                # First Stage-2 GPU fusion: remove the inverse-RoPE BF16
+                # write/read and the following WO_A activation-quant launch.
+                o = o.view(o.shape[0], self.n_local_groups, -1)
+                o_fp8, o_s = inverse_rope_fp8_wo_a_ue8m0(
+                    o,
+                    self.freqs_cis,
+                    positions,
+                    e2e_descriptor.wo_a_output_q,
+                    e2e_descriptor.wo_a_output_s_storage,
+                )
         else:
             # Native backend is intentionally unchanged and never enters the
             # fused JIT primitive.
@@ -1385,7 +1404,10 @@ class MQALayer(MqaAttentionBase):
 
             from sglang.srt.layers import deep_gemm_wrapper
 
-            T, G, D = o.shape
+            if o_fp8 is not None:
+                T, G, D = o_fp8.shape
+            else:
+                T, G, D = o.shape
             R = self.o_lora_rank
             if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
                 # sm100 (Blackwell): ue8m0 scales via the dedicated JIT kernel.

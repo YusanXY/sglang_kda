@@ -293,4 +293,289 @@ struct InverseRopeFP8WoAQuantUE8M0Kernel {
   }
 };
 
+// TP4 C4 attention output communication layout.  One destination owns 16
+// heads (8192 FP8 values) and 64 UE8M0 scale bytes per token.  Keeping both in
+// one row lets NCCL move the quantized activation and its scales with one
+// all-to-all instead of a BF16 all-to-all plus a second scale collective.
+constexpr int64_t kTP4PackedQBytes = 2 * 4096;
+constexpr int64_t kTP4PackedScaleBytes = 2 * (4096 / kQuantGroup);
+constexpr int64_t kTP4PackedRowBytes =
+    kTP4PackedQBytes + kTP4PackedScaleBytes;
+
+template <typename T, int kHeadDim, int kRopeDim, bool kUsePDL, typename PosT>
+__global__ void tp4_pack_inverse_rope_fp8_wo_a_kernel(
+    const T* __restrict__ input,
+    const float* __restrict__ freqs_real,
+    const PosT* __restrict__ shard_positions,
+    uint8_t* __restrict__ packed_output,
+    int64_t total_scale_groups,
+    int64_t num_tokens,
+    int64_t shard_tokens,
+    int hidden_groups,
+    int outer_groups,
+    int64_t input_stride_t) {
+  static_assert(kHeadDim == 512);
+  static_assert(kRopeDim == 64);
+
+  device::PDLWaitPrimary<kUsePDL>();
+
+  const int64_t local_group = threadIdx.x / kThreadsPerGroup;
+  const int lane = threadIdx.x % kThreadsPerGroup;
+  constexpr int kGroupsPerHead = kHeadDim / kQuantGroup;
+  constexpr int kSubgroupsPerWarp = 32 / kThreadsPerGroup;
+  constexpr int kHeadsPerBlock = kGroupsPerBlock / kGroupsPerHead;
+  const int blocks_per_token_outer = hidden_groups / kGroupsPerBlock;
+  const int block_in_token_outer = blockIdx.x % blocks_per_token_outer;
+  const int64_t token_outer = blockIdx.x / blocks_per_token_outer;
+  const int group_phase = local_group / kSubgroupsPerWarp;
+  const int head_in_block = local_group % kSubgroupsPerWarp;
+  const int hidden_group =
+      (block_in_token_outer * kHeadsPerBlock + head_in_block) *
+          kGroupsPerHead +
+      group_phase;
+  const int64_t scale_group = token_outer * hidden_groups + hidden_group;
+  if (scale_group < total_scale_groups) {
+    const int outer = token_outer % outer_groups;
+    const int64_t token = token_outer / outer_groups;
+
+    constexpr int kVec = kInputVecBytes / sizeof(T);
+    const int64_t group_in_outer =
+        static_cast<int64_t>(hidden_group) * kQuantGroup;
+    const int64_t input_offset =
+        token * input_stride_t +
+        static_cast<int64_t>(outer) * hidden_groups * kQuantGroup +
+        group_in_outer;
+
+    int4 raw[kInputInt4Count];
+    T* values_t = reinterpret_cast<T*>(raw);
+#pragma unroll
+    for (uint32_t i = 0; i < kInputInt4Count; ++i) {
+      raw[i] = reinterpret_cast<const int4*>(
+          input + input_offset + lane * kVec)[i];
+    }
+
+    float values[kVec];
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+      values[i] = static_cast<float>(values_t[i]);
+    }
+
+    const int group_head_offset =
+        static_cast<int>(group_in_outer % kHeadDim);
+    const int lane_head_offset = group_head_offset + lane * kVec;
+    const int rope_begin = kHeadDim - kRopeDim;
+    if (lane_head_offset >= rope_begin) {
+      const int64_t shard_token = token % shard_tokens;
+      const int32_t position =
+          static_cast<int32_t>(shard_positions[shard_token]);
+      const auto* freq_pairs = reinterpret_cast<const fp32x2_t*>(
+          freqs_real + static_cast<int64_t>(position) * kRopeDim);
+#pragma unroll
+      for (int i = 0; i < kVec; i += 2) {
+        const int rope_element = lane_head_offset + i - rope_begin;
+        const auto [freq_real, freq_imag] = freq_pairs[rope_element / 2];
+        const float x_real = values[i];
+        const float x_imag = values[i + 1];
+        values[i] = static_cast<float>(
+            device::cast<T>(x_real * freq_real + x_imag * freq_imag));
+        values[i + 1] = static_cast<float>(
+            device::cast<T>(x_imag * freq_real - x_real * freq_imag));
+      }
+    }
+
+    float local_absmax = kLocalAbsmaxFloor;
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+      local_absmax = fmaxf(local_absmax, fabsf(values[i]));
+    }
+    const float absmax =
+        subgroup_reduce_max<kThreadsPerGroup>(local_absmax);
+    constexpr float kFP8MaxInv = 1.0f / kFP8E4M3Max;
+    const int32_t scale_ue8m0 = cast_to_ue8m0(absmax * kFP8MaxInv);
+    const float quant_mul = inv_scale_ue8m0(scale_ue8m0);
+    int4 packed;
+    auto* packed_pairs = reinterpret_cast<fp8x2_e4m3_t*>(&packed);
+#pragma unroll
+    for (int i = 0; i < kVec; i += 2) {
+      packed_pairs[i / 2] =
+          pack_fp8(values[i] * quant_mul, values[i + 1] * quant_mul);
+    }
+
+    const int64_t row = token * kTP4PackedRowBytes;
+    const int64_t q_offset =
+        row + static_cast<int64_t>(outer) * 4096 + group_in_outer;
+    *reinterpret_cast<int4*>(
+        packed_output + q_offset + lane * kVec) = packed;
+    if (lane == 0) {
+      packed_output[
+          row + kTP4PackedQBytes + outer * (4096 / kQuantGroup) +
+          hidden_group] = static_cast<uint8_t>(scale_ue8m0);
+    }
+  }
+
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+template <bool kUsePDL>
+__global__ void tp4_unpack_fp8_wo_a_kernel(
+    const uint8_t* __restrict__ packed_input,
+    fp8_e4m3_t* __restrict__ output_q,
+    uint32_t* __restrict__ output_s,
+    int64_t num_tokens,
+    int64_t aligned_num_tokens) {
+  device::PDLWaitPrimary<kUsePDL>();
+  const int64_t token = blockIdx.x;
+  if (token < num_tokens) {
+    const uint8_t* row = packed_input + token * kTP4PackedRowBytes;
+    uint8_t* q = reinterpret_cast<uint8_t*>(output_q) +
+        token * kTP4PackedQBytes;
+    constexpr int kCopyBytes = 32;
+    const int64_t byte_offset = threadIdx.x * kCopyBytes;
+    *reinterpret_cast<int4*>(q + byte_offset) =
+        *reinterpret_cast<const int4*>(row + byte_offset);
+    *reinterpret_cast<int4*>(q + byte_offset + sizeof(int4)) =
+        *reinterpret_cast<const int4*>(
+            row + byte_offset + sizeof(int4));
+
+    if (threadIdx.x < kTP4PackedScaleBytes) {
+      const int scale = threadIdx.x;
+      const int outer = scale / (4096 / kQuantGroup);
+      const int hidden_group = scale % (4096 / kQuantGroup);
+      const int packed_hidden_group = hidden_group / 4;
+      const int packed_byte = hidden_group % 4;
+      reinterpret_cast<uint8_t*>(output_s)[
+          ((static_cast<int64_t>(outer) * 8 + packed_hidden_group) *
+               aligned_num_tokens +
+           token) *
+              sizeof(uint32_t) +
+          packed_byte] = row[kTP4PackedQBytes + scale];
+    }
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+template <typename T, int kHeadDim, int kRopeDim, bool kUsePDL>
+struct TP4PackedOutputUE8M0Kernel {
+  template <typename PosT>
+  static constexpr auto pack_kernel =
+      tp4_pack_inverse_rope_fp8_wo_a_kernel<
+          T, kHeadDim, kRopeDim, kUsePDL, PosT>;
+
+  static void pack(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView freqs_real,
+      tvm::ffi::TensorView shard_positions,
+      tvm::ffi::TensorView packed_output) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto TSize = SymbolicSize{"num_tokens"};
+    TensorMatcher({TSize, 2, 4096})
+        .with_strides({8192, 4096, 1})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(input);
+    TensorMatcher({-1, kRopeDim})
+        .with_strides({kRopeDim, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(freqs_real);
+    auto SSize = SymbolicSize{"shard_tokens"};
+    auto pos_dtype = SymbolicDType{};
+    TensorMatcher({SSize})
+        .with_dtype<int32_t, int64_t>(pos_dtype)
+        .with_device(device)
+        .verify(shard_positions);
+    TensorMatcher({TSize, kTP4PackedRowBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(packed_output);
+
+    const int64_t num_tokens = TSize.unwrap();
+    const int64_t shard_tokens = SSize.unwrap();
+    RuntimeCheck(
+        num_tokens == 4 * shard_tokens,
+        "TP4 packed output requires exactly four destination shards");
+    RuntimeCheck(
+        reinterpret_cast<uintptr_t>(packed_output.data_ptr()) %
+                sizeof(int4) ==
+            0,
+        "TP4 packed output must be 16-byte aligned");
+    const int hidden_groups = 4096 / static_cast<int>(kQuantGroup);
+    const int outer_groups = 2;
+    const int64_t total_scale_groups =
+        num_tokens * outer_groups * hidden_groups;
+    if (total_scale_groups == 0) return;
+    const dim3 grid(
+        (total_scale_groups + kGroupsPerBlock - 1) / kGroupsPerBlock);
+    const dim3 block(kGroupsPerBlock * kThreadsPerGroup);
+    if (pos_dtype.is_type<int32_t>()) {
+      LaunchKernel(grid, block, device.unwrap())
+          .enable_pdl(kUsePDL)(
+              pack_kernel<int32_t>,
+              static_cast<const T*>(input.data_ptr()),
+              static_cast<const float*>(freqs_real.data_ptr()),
+              static_cast<const int32_t*>(shard_positions.data_ptr()),
+              static_cast<uint8_t*>(packed_output.data_ptr()),
+              total_scale_groups,
+              num_tokens,
+              shard_tokens,
+              hidden_groups,
+              outer_groups,
+              input.stride(0));
+    } else {
+      LaunchKernel(grid, block, device.unwrap())
+          .enable_pdl(kUsePDL)(
+              pack_kernel<int64_t>,
+              static_cast<const T*>(input.data_ptr()),
+              static_cast<const float*>(freqs_real.data_ptr()),
+              static_cast<const int64_t*>(shard_positions.data_ptr()),
+              static_cast<uint8_t*>(packed_output.data_ptr()),
+              total_scale_groups,
+              num_tokens,
+              shard_tokens,
+              hidden_groups,
+              outer_groups,
+              input.stride(0));
+    }
+  }
+
+  static void unpack(
+      tvm::ffi::TensorView packed_input,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto TSize = SymbolicSize{"num_tokens"};
+    auto ASize = SymbolicSize{"aligned_num_tokens"};
+    TensorMatcher({TSize, kTP4PackedRowBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(packed_input);
+    TensorMatcher({TSize, 2, 4096})
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .verify(output_q);
+    TensorMatcher({2, 8, ASize})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(output_s);
+    const int64_t num_tokens = TSize.unwrap();
+    const int64_t aligned_num_tokens = ASize.unwrap();
+    RuntimeCheck(
+        aligned_num_tokens >= num_tokens && aligned_num_tokens % 4 == 0,
+        "TP4 unpack scale storage must use align(T, 4)");
+    if (num_tokens == 0) return;
+    LaunchKernel(dim3(num_tokens), dim3(256), device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_unpack_fp8_wo_a_kernel<kUsePDL>,
+            static_cast<const uint8_t*>(packed_input.data_ptr()),
+            static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
+            static_cast<uint32_t*>(output_s.data_ptr()),
+            num_tokens,
+            aligned_num_tokens);
+  }
+};
+
 }  // namespace

@@ -100,6 +100,8 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_q_padded: torch.Tensor
     attention_q_local: Optional[torch.Tensor]
     attention_q_recv: Optional[torch.Tensor]
+    attention_packed_send: Optional[torch.Tensor]
+    attention_packed_recv: Optional[torch.Tensor]
     tp4_token_shard_attention: bool
     q_lora_bf16: torch.Tensor
     q_lora_fp8: torch.Tensor
@@ -184,7 +186,13 @@ class DSV4WholeLayerRuntime:
             tuple[torch.device, torch.Tensor, torch.Tensor, torch.Tensor]
         ] = None
         self._tp4_attention_workspace: Optional[
-            tuple[torch.device, torch.Tensor, torch.Tensor]
+            tuple[
+                torch.device,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
         ] = None
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
@@ -412,11 +420,17 @@ class DSV4WholeLayerRuntime:
             positions.device,
         )
         if self._use_tp4_token_shard_attention:
-            attention_q_local, attention_q_recv = (
+            (
+                attention_q_local,
+                attention_q_recv,
+                attention_packed_send,
+                attention_packed_recv,
+            ) = (
                 self._get_tp4_attention_workspace(num_tokens, positions.device)
             )
         else:
             attention_q_local, attention_q_recv = None, None
+            attention_packed_send, attention_packed_recv = None, None
         q_lora_bf16, q_lora_fp8, q_lora_scale = self._get_q_lora_workspace(
             num_tokens,
             positions.device,
@@ -455,6 +469,8 @@ class DSV4WholeLayerRuntime:
             attention_q_padded=attention_q_padded,
             attention_q_local=attention_q_local,
             attention_q_recv=attention_q_recv,
+            attention_packed_send=attention_packed_send,
+            attention_packed_recv=attention_packed_recv,
             tp4_token_shard_attention=tp4_token_shard_attention,
             q_lora_bf16=q_lora_bf16,
             q_lora_fp8=q_lora_fp8,
@@ -549,7 +565,7 @@ class DSV4WholeLayerRuntime:
         self,
         num_tokens: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         workspace = self._tp4_attention_workspace
         if workspace is None or workspace[0] != device:
             # Keep token-sharded C4 traffic disjoint from attention_q_padded.
@@ -564,10 +580,33 @@ class DSV4WholeLayerRuntime:
                 device=device,
             )
             q_recv = torch.empty_like(q_local)
-            self._tp4_attention_workspace = (device, q_local, q_recv)
+            # After the first Q all-to-all and FlashMLA complete, both BF16
+            # buffers are dead for the current layer.  Reinterpret their first
+            # 8256 bytes/token as the packed FP8+scale send/receive rows.  The
+            # aliases are built once here; the 21 C4 layers perform no view or
+            # allocation work on the hot path.
+            packed_row_bytes = 8256
+            packed_send = q_local.view(torch.uint8).reshape(-1)[
+                : _MAX_FORWARD_TOKENS * packed_row_bytes
+            ].view(_MAX_FORWARD_TOKENS, packed_row_bytes)
+            packed_recv = q_recv.view(torch.uint8).reshape(-1)[
+                : _MAX_FORWARD_TOKENS * packed_row_bytes
+            ].view(_MAX_FORWARD_TOKENS, packed_row_bytes)
+            self._tp4_attention_workspace = (
+                device,
+                q_local,
+                q_recv,
+                packed_send,
+                packed_recv,
+            )
         else:
-            _, q_local, q_recv = workspace
-        return q_local[:num_tokens], q_recv[:num_tokens]
+            _, q_local, q_recv, packed_send, packed_recv = workspace
+        return (
+            q_local[:num_tokens],
+            q_recv[:num_tokens],
+            packed_send[:num_tokens],
+            packed_recv[:num_tokens],
+        )
 
     def _get_q_lora_workspace(
         self,

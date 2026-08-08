@@ -1804,7 +1804,15 @@ class DeepseekV4AttnBackend(
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
         tp4_token_shard_workspace: Optional[
-            Tuple[torch.Tensor, torch.Tensor]
+            Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
         ] = None,
         **_,
     ) -> torch.Tensor:
@@ -1985,7 +1993,15 @@ class DeepseekV4AttnBackend(
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
         tp4_token_shard_workspace: Optional[
-            Tuple[torch.Tensor, torch.Tensor]
+            Tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
         ] = None,
     ) -> torch.Tensor:
         """Unified prefill via flash_mla_sparse_fwd. Replaces the
@@ -2123,15 +2139,43 @@ class DeepseekV4AttnBackend(
                 )
             if not q_flat.is_contiguous():
                 raise RuntimeError("TP4 token-sharded local Q must be contiguous")
-            q_recv, output_local = tp4_token_shard_workspace
-            if q_recv.shape != q_flat.shape or output_local.shape != q_flat.shape:
+            (
+                q_recv,
+                packed_send,
+                packed_recv,
+                output_q,
+                output_s_storage,
+                freqs_cis,
+                positions,
+            ) = tp4_token_shard_workspace
+            if q_recv.shape != q_flat.shape:
                 raise RuntimeError(
                     "TP4 token-sharded attention workspace shape mismatch: "
-                    f"q={tuple(q_flat.shape)}, recv={tuple(q_recv.shape)}, "
-                    f"output={tuple(output_local.shape)}"
+                    f"q={tuple(q_flat.shape)}, recv={tuple(q_recv.shape)}"
                 )
-            if not q_recv.is_contiguous() or not output_local.is_contiguous():
+            expected_packed = (q_flat.shape[0], 8256)
+            if (
+                packed_send.shape != expected_packed
+                or packed_recv.shape != expected_packed
+                or packed_send.dtype != torch.uint8
+                or packed_recv.dtype != torch.uint8
+            ):
+                raise RuntimeError(
+                    "TP4 packed FP8 workspaces must be uint8 "
+                    f"{expected_packed}; got send={tuple(packed_send.shape)}, "
+                    f"recv={tuple(packed_recv.shape)}"
+                )
+            if (
+                not q_recv.is_contiguous()
+                or not packed_send.is_contiguous()
+                or not packed_recv.is_contiguous()
+            ):
                 raise RuntimeError("TP4 token-sharded workspaces must be contiguous")
+            if (
+                output_q.shape != (q_flat.shape[0], 2, 4096)
+                or output_q.dtype != torch.float8_e4m3fn
+            ):
+                raise RuntimeError("TP4 FP8 output must be [M,2,4096]")
             num_tokens = q_flat.shape[0]
             tp_group = get_tp_group()
             if tp_group.world_size != 4 or num_tokens % 4 != 0:
@@ -2139,10 +2183,9 @@ class DeepseekV4AttnBackend(
                     "TP4 token-sharded attention requires TP=4 and M divisible "
                     f"by four; got TP={tp_group.world_size}, M={num_tokens}"
                 )
-            # Both collectives operate directly on the Q producer and FlashMLA
-            # epilogue layouts.  output_local intentionally aliases q_flat:
-            # stream order guarantees the first all-to-all has consumed Q
-            # before the second collective overwrites that storage.
+            # The first collective operates directly on the Q producer.  Once
+            # FlashMLA has consumed q_recv, both BF16 Q buffers are dead and
+            # their storage becomes the packed FP8 send/receive arena.
             tp_group.all_to_all_single(q_recv, q_flat)
             shard_tokens = num_tokens // 4
             shard_begin = tp_group.rank_in_group * shard_tokens
@@ -2160,8 +2203,27 @@ class DeepseekV4AttnBackend(
                 attn_sink=attn_sink,
                 topk_length=combined_lens[shard_begin:shard_end],
             )
-            tp_group.all_to_all_single(output_local, output_dest_major)
-            return output_local
+            from sglang.jit_kernel.dsv4.e2e import (
+                tp4_pack_attention_output_ue8m0,
+                tp4_unpack_attention_output_ue8m0,
+            )
+
+            tp4_pack_attention_output_ue8m0(
+                output_dest_major.view(num_tokens, 2, 4096),
+                freqs_cis,
+                positions[shard_begin:shard_end],
+                packed_send,
+            )
+            tp_group.all_to_all_single(packed_recv, packed_send)
+            tp4_unpack_attention_output_ue8m0(
+                packed_recv,
+                output_q,
+                output_s_storage,
+            )
+            # The caller consumes output_q/output_s_storage directly.  Return
+            # q_flat only to preserve the AttentionBackend Tensor ABI without
+            # allocating a dead BF16 output.
+            return q_flat
 
         kda_sparse_prefill = get_kda_operator(
             "deepseek_v4.sparse_prefill_attention"
