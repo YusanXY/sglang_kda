@@ -104,6 +104,13 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_packed_recv: Optional[torch.Tensor]
     attention_packed_recv_q: Optional[torch.Tensor]
     attention_projected_gather: Optional[torch.Tensor]
+    attention_symm_handle: Any
+    attention_symm_peer0: Optional[torch.Tensor]
+    attention_symm_peer1: Optional[torch.Tensor]
+    attention_symm_peer2: Optional[torch.Tensor]
+    attention_symm_peer3: Optional[torch.Tensor]
+    attention_symm_recv_q: Optional[torch.Tensor]
+    attention_symm_rank: int
     tp4_token_shard_attention: bool
     q_lora_bf16: torch.Tensor
     q_lora_fp8: torch.Tensor
@@ -168,6 +175,13 @@ class DSV4WholeLayerRuntime:
         self._use_tp4_token_shard_attention = (
             os.environ.get("SGLANG_DSV4_HUGE_TP4_TOKEN_SHARD_ATTN", "0") == "1"
         )
+        self._use_tp4_symmetric_wob = (
+            os.environ.get("SGLANG_DSV4_HUGE_TP4_SYMM_WOB_A2A", "0") == "1"
+        )
+        if self._use_tp4_symmetric_wob and not self._use_tp4_token_shard_attention:
+            raise RuntimeError(
+                "TP4 symmetric WO_B A2A requires TP4 token-sharded attention"
+            )
         self._generation = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
         self._active: Optional[DSV4ForwardDescriptor] = None
@@ -198,6 +212,7 @@ class DSV4WholeLayerRuntime:
                 torch.Tensor,
             ]
         ] = None
+        self._tp4_symmetric_workspace: Optional[tuple] = None
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
         ] = None
@@ -264,6 +279,8 @@ class DSV4WholeLayerRuntime:
                 layers, start_layer=start_layer, end_layer=end_layer
             )
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
+        if self._use_tp4_symmetric_wob:
+            self._bind_tp4_symmetric_workspace(workspace_device)
         if self._use_clustered_mqa and (
             self._clustered_logits_workspace is None
             or self._clustered_logits_workspace.device != workspace_device
@@ -403,6 +420,42 @@ class DSV4WholeLayerRuntime:
                         f"layer {layer_id}: failed to construct full C4 WO_A layout"
                     )
 
+    def _bind_tp4_symmetric_workspace(self, device: torch.device) -> None:
+        """Collectively bind one fixed peer-visible post-WO_A send buffer."""
+        from torch.distributed import _symmetric_memory as symm_mem
+
+        from sglang.srt.distributed import get_tp_group
+
+        cached = self._tp4_symmetric_workspace
+        if cached is not None and cached[0] == device:
+            return
+        tp_group = get_tp_group()
+        if tp_group.world_size != 4:
+            raise RuntimeError(
+                "TP4 symmetric WO_B A2A requires TP=4, got "
+                f"{tp_group.world_size}"
+            )
+        packed_row_bytes = 2064
+        local_storage = symm_mem.empty(
+            (_MAX_FORWARD_TOKENS, packed_row_bytes),
+            dtype=torch.uint8,
+            device=device,
+        )
+        handle = symm_mem.rendezvous(local_storage, tp_group.device_group)
+        peers = tuple(
+            handle.get_buffer(
+                source_rank, local_storage.shape, local_storage.dtype
+            )
+            for source_rank in range(4)
+        )
+        self._tp4_symmetric_workspace = (
+            device,
+            handle,
+            local_storage,
+            peers,
+            tp_group.rank_in_group,
+        )
+
     def begin_forward(
         self,
         *,
@@ -529,11 +582,50 @@ class DSV4WholeLayerRuntime:
             ) = (
                 self._get_tp4_attention_workspace(num_tokens, positions.device)
             )
+            if self._use_tp4_symmetric_wob:
+                symmetric = self._tp4_symmetric_workspace
+                if symmetric is None or symmetric[0] != positions.device:
+                    raise RuntimeError(
+                        "TP4 symmetric WO_B workspace was not bound on this device"
+                    )
+                (
+                    _,
+                    attention_symm_handle,
+                    attention_symm_local,
+                    attention_symm_peers,
+                    attention_symm_rank,
+                ) = symmetric
+                attention_packed_send = attention_symm_local[:num_tokens]
+                attention_symm_peer0 = attention_symm_peers[0][:num_tokens]
+                attention_symm_peer1 = attention_symm_peers[1][:num_tokens]
+                attention_symm_peer2 = attention_symm_peers[2][:num_tokens]
+                attention_symm_peer3 = attention_symm_peers[3][:num_tokens]
+                attention_symm_recv_q = (
+                    attention_q_recv.view(torch.uint8)
+                    .reshape(-1)[: num_tokens * 2048]
+                    .view(torch.float8_e4m3fn)
+                    .view(num_tokens, 2048)
+                )
+            else:
+                attention_symm_handle = None
+                attention_symm_peer0 = None
+                attention_symm_peer1 = None
+                attention_symm_peer2 = None
+                attention_symm_peer3 = None
+                attention_symm_recv_q = None
+                attention_symm_rank = -1
         else:
             attention_q_local, attention_q_recv = None, None
             attention_packed_send, attention_packed_recv = None, None
             attention_packed_recv_q = None
             attention_projected_gather = None
+            attention_symm_handle = None
+            attention_symm_peer0 = None
+            attention_symm_peer1 = None
+            attention_symm_peer2 = None
+            attention_symm_peer3 = None
+            attention_symm_recv_q = None
+            attention_symm_rank = -1
         q_lora_bf16, q_lora_fp8, q_lora_scale = self._get_q_lora_workspace(
             num_tokens,
             positions.device,
@@ -576,6 +668,13 @@ class DSV4WholeLayerRuntime:
             attention_packed_recv=attention_packed_recv,
             attention_packed_recv_q=attention_packed_recv_q,
             attention_projected_gather=attention_projected_gather,
+            attention_symm_handle=attention_symm_handle,
+            attention_symm_peer0=attention_symm_peer0,
+            attention_symm_peer1=attention_symm_peer1,
+            attention_symm_peer2=attention_symm_peer2,
+            attention_symm_peer3=attention_symm_peer3,
+            attention_symm_recv_q=attention_symm_recv_q,
+            attention_symm_rank=attention_symm_rank,
             tp4_token_shard_attention=tp4_token_shard_attention,
             q_lora_bf16=q_lora_bf16,
             q_lora_fp8=q_lora_fp8,

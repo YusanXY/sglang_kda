@@ -491,6 +491,10 @@ def _jit_tp4_packed_output_module(
                 "unpack_wob_scale",
                 f"TP4PackedWoBInputUE8M0Kernel<{args}>::unpack_scale",
             ),
+            (
+                "peer_pull_wob",
+                f"TP4PackedWoBInputUE8M0Kernel<{args}>::peer_pull",
+            ),
         ],
         extra_cuda_cflags=["--use_fast_math"],
     )
@@ -661,6 +665,36 @@ def _tp4_unpack_wo_b_scale_custom_op(
     module.unpack_wob_scale(packed_input, output_s)
 
 
+@register_custom_op(
+    op_name="dsv4_tp4_peer_pull_wo_b_input_ue8m0",
+    mutates_args=["output_q", "output_s"],
+)
+def _tp4_peer_pull_wo_b_input_custom_op(
+    peer0: torch.Tensor,
+    peer1: torch.Tensor,
+    peer2: torch.Tensor,
+    peer3: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+    destination_rank: int,
+) -> None:
+    module = _jit_tp4_packed_output_module(
+        torch.bfloat16,
+        _HEAD_DIM,
+        _ROPE_DIM,
+        is_arch_support_pdl(),
+    )
+    module.peer_pull_wob(
+        peer0,
+        peer1,
+        peer2,
+        peer3,
+        output_q,
+        output_s,
+        destination_rank,
+    )
+
+
 @debug_kernel_api
 def tp4_pack_wo_b_input_ue8m0(
     input: torch.Tensor,
@@ -726,6 +760,70 @@ def tp4_unpack_wo_b_scale_ue8m0(
     return output_s_storage.transpose(0, 1)[:num_tokens]
 
 
+@debug_kernel_api
+def tp4_peer_pull_wo_b_input_ue8m0(
+    peers: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    output_q: torch.Tensor,
+    output_s_storage: torch.Tensor,
+    destination_rank: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pull four symmetric peer slices and form DeepGEMM's WO_B input.
+
+    Peer rows are destination-major.  The fused kernel selects this TP rank's
+    slice from every source, restores source-major token order, copies FP8
+    codes, and transposes packed UE8M0 words in one GPU launch.
+    """
+    if len(peers) != 4:
+        raise RuntimeError("TP4 symmetric WO_B pull requires exactly four peers")
+    num_tokens = output_q.shape[0]
+    expected_peer_shape = (num_tokens, _TP4_PACKED_WOB_ROW_BYTES)
+    device = output_q.device
+    for peer in peers:
+        if (
+            peer.shape != expected_peer_shape
+            or peer.dtype != torch.uint8
+            or peer.device != device
+            or not peer.is_contiguous()
+        ):
+            raise RuntimeError(
+                "every TP4 peer must be contiguous CUDA uint8 "
+                f"{expected_peer_shape} on {device}"
+            )
+    if (
+        output_q.shape != (num_tokens, 2048)
+        or output_q.dtype != torch.float8_e4m3fn
+        or output_q.device.type != "cuda"
+        or not output_q.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 symmetric WO_B output_q must be contiguous CUDA FP8 [T,2048]"
+        )
+    if (
+        output_s_storage.shape != (4, num_tokens)
+        or output_s_storage.dtype != torch.int32
+        or output_s_storage.device != device
+        or not output_s_storage.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 symmetric WO_B output_s must be contiguous int32 [4,T]"
+        )
+    if num_tokens % 4:
+        raise RuntimeError("TP4 symmetric WO_B pull requires T divisible by four")
+    if destination_rank not in range(4):
+        raise RuntimeError("TP4 symmetric WO_B destination rank must be in [0,4)")
+    if num_tokens:
+        _tp4_peer_pull_wo_b_input_custom_op(
+            peers[0],
+            peers[1],
+            peers[2],
+            peers[3],
+            output_q,
+            output_s_storage,
+            destination_rank,
+        )
+    return output_q, output_s_storage.transpose(0, 1)
+
+
 __all__ = [
     "inverse_rope_fp8_wo_a_ue8m0",
     "load_mhc_post_vec8_extension",
@@ -734,6 +832,7 @@ __all__ = [
     "mhc_pre_norm_mxfp8_quant",
     "tp4_pack_attention_output_ue8m0",
     "tp4_pack_wo_b_input_ue8m0",
+    "tp4_peer_pull_wo_b_input_ue8m0",
     "tp4_unpack_attention_scale_ue8m0",
     "tp4_unpack_wo_b_scale_ue8m0",
 ]

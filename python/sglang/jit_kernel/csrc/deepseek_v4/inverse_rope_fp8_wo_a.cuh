@@ -656,6 +656,49 @@ __global__ void tp4_unpack_wo_b_scale_kernel(
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// Pull the destination slice directly from all four symmetric peer buffers.
+// This replaces NCCL all-to-all plus the standalone scale transpose.  The
+// source-major output order exactly matches all_to_all_single: each source
+// contributes shard_tokens rows and the local rank selects its destination
+// slice from that source's destination-major send buffer.
+template <bool kUsePDL>
+__global__ void tp4_peer_pull_wo_b_input_kernel(
+    const uint8_t* __restrict__ peer0,
+    const uint8_t* __restrict__ peer1,
+    const uint8_t* __restrict__ peer2,
+    const uint8_t* __restrict__ peer3,
+    fp8_e4m3_t* __restrict__ output_q,
+    uint32_t* __restrict__ output_s,
+    int64_t num_tokens,
+    int64_t aligned_num_tokens,
+    int destination_rank) {
+  device::PDLWaitPrimary<kUsePDL>();
+  const int64_t output_token = blockIdx.x;
+  const int64_t shard_tokens = num_tokens / 4;
+  const int source_rank = static_cast<int>(output_token / shard_tokens);
+  const int64_t source_token =
+      output_token - static_cast<int64_t>(source_rank) * shard_tokens;
+  const uint8_t* peers[4] = {peer0, peer1, peer2, peer3};
+  const int64_t remote_row =
+      static_cast<int64_t>(destination_rank) * shard_tokens + source_token;
+  const uint8_t* source = peers[source_rank] +
+      remote_row * kTP4PackedWoBRowBytes;
+
+  // 128 lanes copy one aligned uint4 each, covering the complete 2048-byte
+  // FP8 row with coalesced NVLink reads and local HBM writes.
+  reinterpret_cast<uint4*>(output_q + output_token * kTP4PackedWoBQBytes)
+      [threadIdx.x] = reinterpret_cast<const uint4*>(source)[threadIdx.x];
+  if (threadIdx.x == 0) {
+    const uint4 scales = *reinterpret_cast<const uint4*>(
+        source + kTP4PackedWoBQBytes);
+    output_s[0 * aligned_num_tokens + output_token] = scales.x;
+    output_s[1 * aligned_num_tokens + output_token] = scales.y;
+    output_s[2 * aligned_num_tokens + output_token] = scales.z;
+    output_s[3 * aligned_num_tokens + output_token] = scales.w;
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template <typename T, int kHeadDim, int kRopeDim, bool kUsePDL>
 struct TP4PackedWoBInputUE8M0Kernel {
   static void pack(
@@ -722,6 +765,66 @@ struct TP4PackedWoBInputUE8M0Kernel {
             static_cast<uint32_t*>(output_s.data_ptr()),
             num_tokens,
             aligned_num_tokens);
+  }
+
+  static void peer_pull(
+      tvm::ffi::TensorView peer0,
+      tvm::ffi::TensorView peer1,
+      tvm::ffi::TensorView peer2,
+      tvm::ffi::TensorView peer3,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s,
+      int64_t destination_rank) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto TSize = SymbolicSize{"num_tokens"};
+    auto ASize = SymbolicSize{"aligned_num_tokens"};
+    TensorMatcher({TSize, kTP4PackedWoBRowBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(peer0);
+    TensorMatcher({TSize, kTP4PackedWoBRowBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(peer1);
+    TensorMatcher({TSize, kTP4PackedWoBRowBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(peer2);
+    TensorMatcher({TSize, kTP4PackedWoBRowBytes})
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(peer3);
+    TensorMatcher({TSize, kTP4PackedWoBQBytes})
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .verify(output_q);
+    TensorMatcher({4, ASize})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(output_s);
+    const int64_t num_tokens = TSize.unwrap();
+    const int64_t aligned_num_tokens = ASize.unwrap();
+    RuntimeCheck(
+        num_tokens % 4 == 0 && aligned_num_tokens == num_tokens,
+        "TP4 symmetric WO_B pull requires T%4=0 and no scale padding");
+    RuntimeCheck(
+        destination_rank >= 0 && destination_rank < 4,
+        "TP4 symmetric WO_B pull requires destination rank in [0,4)");
+    if (num_tokens == 0) return;
+    LaunchKernel(dim3(num_tokens), dim3(128), device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_peer_pull_wo_b_input_kernel<kUsePDL>,
+            static_cast<const uint8_t*>(peer0.data_ptr()),
+            static_cast<const uint8_t*>(peer1.data_ptr()),
+            static_cast<const uint8_t*>(peer2.data_ptr()),
+            static_cast<const uint8_t*>(peer3.data_ptr()),
+            static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
+            static_cast<uint32_t*>(output_s.data_ptr()),
+            num_tokens,
+            aligned_num_tokens,
+            static_cast<int>(destination_rank));
   }
 };
 
