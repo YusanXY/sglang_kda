@@ -465,6 +465,73 @@ def inverse_rope_fp8_wo_a_ue8m0(
     return output_q, output_s_storage.permute(2, 0, 1)[:num_tokens]
 
 
+@cache_once
+def _jit_tp4_nccl_ring_bf16_reduce_module(use_pdl: bool) -> Module:
+    args = make_cpp_args(torch.bfloat16, use_pdl)
+    return load_jit(
+        make_name("tp4_nccl_ring_bf16_reduce_exact_v1"),
+        *args,
+        cuda_files=["deepseek_v4/tp4_nccl_bf16_reduce.cuh"],
+        cuda_wrappers=[
+            ("run", f"TP4NcclRingBF16ReduceKernel<{args}>::run"),
+        ],
+    )
+
+
+def load_tp4_nccl_ring_bf16_reduce_extension() -> None:
+    """Compile the exact TP4 reducer before the first live request."""
+    _jit_tp4_nccl_ring_bf16_reduce_module(is_arch_support_pdl())
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_nccl_ring_bf16_reduce",
+    mutates_args=["output"],
+)
+def _tp4_nccl_ring_bf16_reduce_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    module = _jit_tp4_nccl_ring_bf16_reduce_module(is_arch_support_pdl())
+    module.run(input0, input1, input2, input3, output)
+
+
+@debug_kernel_api
+def tp4_nccl_ring_bf16_reduce(
+    partials: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Reproduce the strict Req16/Req128 TP4 NCCL BF16 reduction locally."""
+    if len(partials) != 4:
+        raise RuntimeError("TP4 BF16 reduction requires exactly four partials")
+    owner_tokens = partials[0].shape[0]
+    expected_shape = (owner_tokens, 4096)
+    if owner_tokens not in (16384, 32768):
+        raise RuntimeError(
+            "TP4 BF16 reduction only supports owner shards with "
+            f"16384 or 32768 tokens, got {owner_tokens}"
+        )
+    device = partials[0].device
+    for tensor in (*partials, output):
+        if (
+            tensor.shape != expected_shape
+            or tensor.dtype != torch.bfloat16
+            or tensor.device != device
+            or device.type != "cuda"
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                "TP4 exact reduction tensors must be contiguous CUDA BF16 "
+                f"{expected_shape} on {device}"
+            )
+    if output.data_ptr() in {partial.data_ptr() for partial in partials}:
+        raise RuntimeError("TP4 exact reduction output must not alias an input")
+    _tp4_nccl_ring_bf16_reduce_custom_op(*partials, output)
+    return output
+
+
 _TP4_PACKED_OUTPUT_ROW_BYTES = 2 * 4096 + 2 * (4096 // _QUANT_GROUP_SIZE)
 
 
@@ -899,11 +966,13 @@ __all__ = [
     "inverse_rope_fp8_wo_a_ue8m0",
     "load_mhc_post_vec8_extension",
     "load_mhc_pre_norm_mxfp8_quant_extension",
+    "load_tp4_nccl_ring_bf16_reduce_extension",
     "mhc_post_vec8",
     "mhc_pre_norm_mxfp8_quant",
     "tp4_pack_attention_output_ue8m0",
     "tp4_pack_wo_b_input_ue8m0",
     "tp4_direct_push_wo_b_input_ue8m0",
+    "tp4_nccl_ring_bf16_reduce",
     "tp4_peer_pull_wo_b_input_ue8m0",
     "tp4_unpack_attention_scale_ue8m0",
     "tp4_unpack_wo_b_scale_ue8m0",

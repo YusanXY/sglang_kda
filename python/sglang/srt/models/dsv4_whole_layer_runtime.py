@@ -103,6 +103,7 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_packed_send: Optional[torch.Tensor]
     attention_packed_recv: Optional[torch.Tensor]
     attention_packed_recv_q: Optional[torch.Tensor]
+    attention_projected_local: Optional[torch.Tensor]
     attention_projected_gather: Optional[torch.Tensor]
     attention_symm_handle: Any
     attention_symm_peer0: Optional[torch.Tensor]
@@ -114,6 +115,7 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_symm_rank: int
     attention_symm_direct_push: bool
     tp4_token_shard_attention: bool
+    tp4_local_wob: bool
     q_lora_bf16: torch.Tensor
     q_lora_fp8: torch.Tensor
     q_lora_scale: torch.Tensor
@@ -183,6 +185,9 @@ class DSV4WholeLayerRuntime:
         self._use_tp4_direct_push_wob = (
             os.environ.get("SGLANG_DSV4_HUGE_TP4_DIRECT_PUSH_WOB", "0") == "1"
         )
+        self._use_tp4_local_wob = (
+            os.environ.get("SGLANG_DSV4_HUGE_TP4_LOCAL_WOB", "0") == "1"
+        )
         if self._use_tp4_symmetric_wob and not self._use_tp4_token_shard_attention:
             raise RuntimeError(
                 "TP4 symmetric WO_B A2A requires TP4 token-sharded attention"
@@ -190,6 +195,14 @@ class DSV4WholeLayerRuntime:
         if self._use_tp4_symmetric_wob != self._use_tp4_direct_push_wob:
             raise RuntimeError(
                 "v15 requires symmetric WO_B A2A and direct-push to be enabled together"
+            )
+        if self._use_tp4_local_wob and not self._use_tp4_token_shard_attention:
+            raise RuntimeError(
+                "TP4 local WO_B requires TP4 token-sharded attention"
+            )
+        if self._use_tp4_local_wob and self._use_tp4_symmetric_wob:
+            raise RuntimeError(
+                "TP4 local WO_B and symmetric/direct-push WO_B are exclusive"
             )
         self._generation = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
@@ -201,6 +214,7 @@ class DSV4WholeLayerRuntime:
         self._wo_a_workspace: Optional[
             tuple[
                 torch.device,
+                torch.Tensor,
                 torch.Tensor,
                 torch.Tensor,
                 torch.Tensor,
@@ -266,10 +280,13 @@ class DSV4WholeLayerRuntime:
         from sglang.jit_kernel.dsv4.e2e import (
             load_mhc_post_vec8_extension,
             load_mhc_pre_norm_mxfp8_quant_extension,
+            load_tp4_nccl_ring_bf16_reduce_extension,
         )
 
         load_mhc_post_vec8_extension()
         load_mhc_pre_norm_mxfp8_quant_extension(160)
+        if self._use_tp4_local_wob:
+            load_tp4_nccl_ring_bf16_reduce_extension()
         from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
 
@@ -419,6 +436,35 @@ class DSV4WholeLayerRuntime:
                     8, 8, 1024
                 ).permute(0, 2, 1)
 
+                if self._use_tp4_local_wob:
+                    wo_b_weight_chunks = [
+                        torch.empty_like(local_wo_b_weight) for _ in range(4)
+                    ]
+                    tp_group.all_gather(
+                        local_wo_b_weight.contiguous(),
+                        output_tensor_list=wo_b_weight_chunks,
+                    )
+                    attn._dsv4_huge_wo_b_weight_chunks = tuple(
+                        wo_b_weight_chunks
+                    )
+                    wo_b_words = (
+                        local_wo_b_scale.untyped_storage().nbytes() // 4
+                    )
+                    local_wo_b_physical = local_wo_b_scale.as_strided(
+                        (wo_b_words,), (1,)
+                    )
+                    wo_b_scale_physical_chunks = [
+                        torch.empty_like(local_wo_b_physical) for _ in range(4)
+                    ]
+                    tp_group.all_gather(
+                        local_wo_b_physical,
+                        output_tensor_list=wo_b_scale_physical_chunks,
+                    )
+                    attn._dsv4_huge_wo_b_scale_chunks = tuple(
+                        physical.view(4, 4096).transpose(0, 1)
+                        for physical in wo_b_scale_physical_chunks
+                    )
+
                 if (
                     tuple(attn._dsv4_huge_full_wo_a_weight.shape)
                     != (8192, 4096)
@@ -427,6 +473,21 @@ class DSV4WholeLayerRuntime:
                 ):
                     raise RuntimeError(
                         f"layer {layer_id}: failed to construct full C4 WO_A layout"
+                    )
+                if self._use_tp4_local_wob and (
+                    any(
+                        tuple(weight.shape) != (4096, 2048)
+                        or not weight.is_contiguous()
+                        for weight in attn._dsv4_huge_wo_b_weight_chunks
+                    )
+                    or any(
+                        tuple(scale.shape) != (4096, 4)
+                        or scale.stride() != (1, 4096)
+                        for scale in attn._dsv4_huge_wo_b_scale_chunks
+                    )
+                ):
+                    raise RuntimeError(
+                        f"layer {layer_id}: failed to construct full C4 WO_B layouts"
                     )
 
     def _bind_tp4_symmetric_workspace(self, device: torch.device) -> None:
@@ -603,6 +664,7 @@ class DSV4WholeLayerRuntime:
                 attention_packed_send,
                 attention_packed_recv,
                 attention_packed_recv_q,
+                attention_projected_local,
                 attention_projected_gather,
             ) = (
                 self._get_tp4_attention_workspace(num_tokens, positions.device)
@@ -649,6 +711,7 @@ class DSV4WholeLayerRuntime:
             attention_q_local, attention_q_recv = None, None
             attention_packed_send, attention_packed_recv = None, None
             attention_packed_recv_q = None
+            attention_projected_local = None
             attention_projected_gather = None
             attention_symm_handle = None
             attention_symm_peer0 = None
@@ -700,6 +763,7 @@ class DSV4WholeLayerRuntime:
             attention_packed_send=attention_packed_send,
             attention_packed_recv=attention_packed_recv,
             attention_packed_recv_q=attention_packed_recv_q,
+            attention_projected_local=attention_projected_local,
             attention_projected_gather=attention_projected_gather,
             attention_symm_handle=attention_symm_handle,
             attention_symm_peer0=attention_symm_peer0,
@@ -711,6 +775,9 @@ class DSV4WholeLayerRuntime:
             attention_symm_rank=attention_symm_rank,
             attention_symm_direct_push=attention_symm_direct_push,
             tp4_token_shard_attention=tp4_token_shard_attention,
+            tp4_local_wob=(
+                self._use_tp4_local_wob and tp4_token_shard_attention
+            ),
             q_lora_bf16=q_lora_bf16,
             q_lora_fp8=q_lora_fp8,
             q_lora_scale=q_lora_scale,
@@ -742,6 +809,8 @@ class DSV4WholeLayerRuntime:
         num_tokens: int,
         device: torch.device,
     ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -851,6 +920,9 @@ class DSV4WholeLayerRuntime:
             projected_gather = q_local.view(-1)[
                 : _MAX_FORWARD_TOKENS * 4096
             ].view(_MAX_FORWARD_TOKENS, 4096)
+            projected_local = q_recv.view(-1)[
+                : (_MAX_FORWARD_TOKENS // 4) * 4096
+            ].view(_MAX_FORWARD_TOKENS // 4, 4096)
             self._tp4_attention_workspace = (
                 device,
                 q_local,
@@ -858,6 +930,7 @@ class DSV4WholeLayerRuntime:
                 packed_send,
                 packed_recv,
                 packed_recv_q,
+                projected_local,
                 projected_gather,
             )
         else:
@@ -868,6 +941,7 @@ class DSV4WholeLayerRuntime:
                 packed_send,
                 packed_recv,
                 packed_recv_q,
+                projected_local,
                 projected_gather,
             ) = workspace
         return (
@@ -876,6 +950,7 @@ class DSV4WholeLayerRuntime:
             packed_send[:num_tokens],
             packed_recv[:num_tokens],
             packed_recv_q[:num_tokens],
+            projected_local[: num_tokens // 4],
             projected_gather[:num_tokens],
         )
 
