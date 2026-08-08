@@ -228,42 +228,35 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
 // and moves aligned 16-byte vectors instead of issuing warp-granular peer
 // stores from the norm/RoPE producer.
 template <typename DType, bool kUsePDL>
-__global__ __launch_bounds__(256) void tp4_remote_bulk_route_q_kernel(
-    const DType* __restrict__ input,
-    DType* __restrict__ peer0,
-    DType* __restrict__ peer1,
-    DType* __restrict__ peer2,
-    DType* __restrict__ peer3,
-    int64_t shard_elements,
-    int64_t source_rank) {
+__global__ __launch_bounds__(256) void tp4_trilink_bulk_route_q_kernel(
+    const DType* __restrict__ input0,
+    const DType* __restrict__ input1,
+    const DType* __restrict__ input2,
+    DType* __restrict__ destination0,
+    DType* __restrict__ destination1,
+    DType* __restrict__ destination2,
+    int64_t shard_elements) {
   static_assert(sizeof(DType) == 2);
   device::PDLWaitPrimary<kUsePDL>();
   using Copy = int4;
   constexpr int64_t kElementsPerCopy = sizeof(Copy) / sizeof(DType);
-  const int remote_slot = static_cast<int>(blockIdx.y);
-  const int destination_rank =
-      remote_slot >= source_rank ? remote_slot + 1 : remote_slot;
   const int64_t shard_copies = shard_elements / kElementsPerCopy;
-  const Copy* source = reinterpret_cast<const Copy*>(input) +
-      destination_rank * shard_copies;
-  Copy* destination = reinterpret_cast<Copy*>(peer0);
-  switch (destination_rank) {
-    case 1:
-      destination = reinterpret_cast<Copy*>(peer1);
-      break;
-    case 2:
-      destination = reinterpret_cast<Copy*>(peer2);
-      break;
-    case 3:
-      destination = reinterpret_cast<Copy*>(peer3);
-      break;
-  }
-  destination += source_rank * shard_copies;
+  const Copy* source0 = reinterpret_cast<const Copy*>(input0);
+  const Copy* source1 = reinterpret_cast<const Copy*>(input1);
+  const Copy* source2 = reinterpret_cast<const Copy*>(input2);
+  Copy* output0 = reinterpret_cast<Copy*>(destination0);
+  Copy* output1 = reinterpret_cast<Copy*>(destination1);
+  Copy* output2 = reinterpret_cast<Copy*>(destination2);
   const int64_t thread =
       static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t index = thread; index < shard_copies; index += stride) {
-    destination[index] = source[index];
+    const Copy value0 = source0[index];
+    const Copy value1 = source1[index];
+    const Copy value2 = source2[index];
+    output0[index] = value0;
+    output1[index] = value1;
+    output2[index] = value2;
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -478,17 +471,65 @@ struct FusedQNormRopeKernel {
     // Preserve the CTA budget that saturated direct-output peer writes in
     // v17, split evenly over the four independent destinations.
     const int total_blocks = batch_size == 65536 ? 8192 : 16384;
-    const int blocks_per_destination = (total_blocks + 2) / 3;
-    LaunchKernel(dim3(blocks_per_destination, 3), dim3(256), device_.unwrap())
+    auto* input = static_cast<const DType*>(q_local.data_ptr());
+    auto* output0 = static_cast<DType*>(peer0.data_ptr());
+    auto* output1 = static_cast<DType*>(peer1.data_ptr());
+    auto* output2 = static_cast<DType*>(peer2.data_ptr());
+    auto* output3 = static_cast<DType*>(peer3.data_ptr());
+    const DType* input0 = nullptr;
+    const DType* input1 = nullptr;
+    const DType* input2 = nullptr;
+    DType* destination0 = nullptr;
+    DType* destination1 = nullptr;
+    DType* destination2 = nullptr;
+    switch (source_rank) {
+      case 0:
+        input0 = input + shard_elements;
+        input1 = input + 2 * shard_elements;
+        input2 = input + 3 * shard_elements;
+        destination0 = output1;
+        destination1 = output2;
+        destination2 = output3;
+        break;
+      case 1:
+        input0 = input;
+        input1 = input + 2 * shard_elements;
+        input2 = input + 3 * shard_elements;
+        destination0 = output0;
+        destination1 = output2;
+        destination2 = output3;
+        break;
+      case 2:
+        input0 = input;
+        input1 = input + shard_elements;
+        input2 = input + 3 * shard_elements;
+        destination0 = output0;
+        destination1 = output1;
+        destination2 = output3;
+        break;
+      default:
+        input0 = input;
+        input1 = input + shard_elements;
+        input2 = input + 2 * shard_elements;
+        destination0 = output0;
+        destination1 = output1;
+        destination2 = output2;
+        break;
+    }
+    const int64_t output_offset = source_rank * shard_elements;
+    destination0 += output_offset;
+    destination1 += output_offset;
+    destination2 += output_offset;
+    LaunchKernel(dim3(total_blocks), dim3(256), device_.unwrap())
         .enable_pdl(kUsePDL)(
-            tp4_remote_bulk_route_q_kernel<DType, kUsePDL>,
-            static_cast<const DType*>(q_local.data_ptr()),
-            static_cast<DType*>(peer0.data_ptr()),
-            static_cast<DType*>(peer1.data_ptr()),
-            static_cast<DType*>(peer2.data_ptr()),
-            static_cast<DType*>(peer3.data_ptr()),
-            shard_elements,
-            source_rank);
+            tp4_trilink_bulk_route_q_kernel<DType, kUsePDL>,
+            input0,
+            input1,
+            input2,
+            destination0,
+            destination1,
+            destination2,
+            shard_elements);
   }
 
   static void tp4_stage(

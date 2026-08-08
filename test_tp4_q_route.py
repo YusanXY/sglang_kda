@@ -1,4 +1,5 @@
 import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -17,7 +18,8 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    tokens, heads, head_dim = 65536, 16, 512
+    tokens = int(sys.argv[1]) if len(sys.argv) > 1 else 65536
+    heads, head_dim = 16, 512
     torch.manual_seed(20260809 + rank)
     q_input = torch.randn(
         (tokens, heads, head_dim), dtype=torch.bfloat16, device=device
