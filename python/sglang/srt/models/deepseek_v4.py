@@ -1488,41 +1488,51 @@ class MQALayer(MqaAttentionBase):
         if tp4_token_shard_attention and e2e_descriptor.tp4_local_wob:
             from sglang.jit_kernel.dsv4.e2e import (
                 tp4_nccl_ring_bf16_reduce,
+                tp4_quantize_local_wo_b_input_ue8m0,
             )
-            from sglang.srt.layers.quantization.fp8_utils import (
-                deepgemm_w8a8_block_fp8_linear_with_fallback,
+            from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+                gemm_nt_f8f8bf16,
             )
 
             wo_b_weights = getattr(self, "_dsv4_huge_wo_b_weight_chunks", None)
             wo_b_scales = getattr(self, "_dsv4_huge_wo_b_scale_chunks", None)
             projected_local = e2e_descriptor.attention_projected_local
             projected_gather = e2e_descriptor.attention_projected_gather
+            wo_b_q = e2e_descriptor.attention_wob_q
+            wo_b_s_storage = e2e_descriptor.attention_wob_s_storage
+            wo_b_q_chunks = e2e_descriptor.attention_wob_q_chunks
+            wo_b_s_chunks = e2e_descriptor.attention_wob_s_chunks
+            wo_b_partial_chunks = e2e_descriptor.attention_wob_partial_chunks
             if (
                 wo_b_weights is None
                 or wo_b_scales is None
                 or projected_local is None
                 or projected_gather is None
+                or wo_b_q is None
+                or wo_b_s_storage is None
+                or wo_b_q_chunks is None
+                or wo_b_s_chunks is None
+                or wo_b_partial_chunks is None
             ):
                 raise RuntimeError(
                     f"layer {self.layer_id}: local C4 WO_B buffers were not bound"
                 )
-            wo_b_input = o.flatten(1)
-            partials = tuple(
-                deepgemm_w8a8_block_fp8_linear_with_fallback(
-                    input=input_chunk.contiguous(),
-                    weight=weight_chunk,
-                    block_size=[128, 128],
-                    weight_scale=scale_chunk,
-                    input_scale=None,
-                    bias=None,
-                )
-                for input_chunk, weight_chunk, scale_chunk in zip(
-                    wo_b_input.split(2048, dim=1), wo_b_weights, wo_b_scales
-                )
+            tp4_quantize_local_wo_b_input_ue8m0(
+                o, wo_b_q, wo_b_s_storage
             )
-            if len(partials) != 4:
-                raise AssertionError("C4 local WO_B must produce four partials")
-            tp4_nccl_ring_bf16_reduce(partials, projected_local)
+            for input_chunk, input_scale, weight_chunk, scale_chunk, partial in zip(
+                wo_b_q_chunks,
+                wo_b_s_chunks,
+                wo_b_weights,
+                wo_b_scales,
+                wo_b_partial_chunks,
+            ):
+                gemm_nt_f8f8bf16(
+                    (input_chunk, input_scale),
+                    (weight_chunk, scale_chunk),
+                    partial,
+                )
+            tp4_nccl_ring_bf16_reduce(wo_b_partial_chunks, projected_local)
             get_tp_group().all_gather_into_tensor(
                 projected_gather, projected_local
             )

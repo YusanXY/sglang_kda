@@ -781,6 +781,81 @@ __global__ void tp4_direct_push_wo_b_input_kernel(
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// Quantize the full WO_A owner shard once and materialize the four contiguous
+// local WO_B operands.  This is the local counterpart of direct_push: it
+// preserves the exact group-128 FP8/UE8M0 arithmetic while replacing four
+// strided copies plus four generic quantizer launches with one GPU launch.
+template <typename T, bool kUsePDL>
+__global__ void tp4_quantize_local_wo_b_input_kernel(
+    const T* __restrict__ input,
+    fp8_e4m3_t* __restrict__ output_q,
+    uint32_t* __restrict__ output_s,
+    int64_t shard_tokens) {
+  static_assert(sizeof(T) == 2);
+  device::PDLWaitPrimary<kUsePDL>();
+  // One 512-thread CTA owns all four destination chunks of one token.  The
+  // previous 128-thread mapping launched four independent CTAs for the same
+  // source row; co-locating them cuts CTA scheduling traffic by 4x while each
+  // 128-thread quadrant retains the exact quantization reduction topology.
+  const int local_thread = threadIdx.x & 127;
+  const int destination = threadIdx.x >> 7;
+  const int64_t token = blockIdx.x;
+  const int group = local_thread / kThreadsPerGroup;
+  const int lane = local_thread % kThreadsPerGroup;
+  constexpr int kGroupsPerDestination = kTP4PackedWoBQBytes / kQuantGroup;
+  static_assert(kGroupsPerDestination == kGroupsPerBlock);
+
+  const int64_t input_offset =
+      token * (4 * kTP4PackedWoBQBytes) +
+      static_cast<int64_t>(destination) * kTP4PackedWoBQBytes +
+      static_cast<int64_t>(group) * kQuantGroup;
+  constexpr int kVec = kInputVecBytes / sizeof(T);
+  int4 raw[kInputInt4Count];
+  T* values_t = reinterpret_cast<T*>(raw);
+#pragma unroll
+  for (uint32_t i = 0; i < kInputInt4Count; ++i) {
+    raw[i] = reinterpret_cast<const int4*>(
+        input + input_offset + lane * kVec)[i];
+  }
+  float values[kVec];
+  float local_absmax = kLocalAbsmaxFloor;
+#pragma unroll
+  for (int i = 0; i < kVec; ++i) {
+    values[i] = static_cast<float>(values_t[i]);
+    local_absmax = fmaxf(local_absmax, fabsf(values[i]));
+  }
+  const float absmax = subgroup_reduce_max<kThreadsPerGroup>(local_absmax);
+  constexpr float kFP8MaxInv = 1.0f / kFP8E4M3Max;
+  const int32_t scale_ue8m0 = cast_to_ue8m0(absmax * kFP8MaxInv);
+  const float quant_mul = inv_scale_ue8m0(scale_ue8m0);
+  int4 packed;
+  auto* packed_pairs = reinterpret_cast<fp8x2_e4m3_t*>(&packed);
+#pragma unroll
+  for (int i = 0; i < kVec; i += 2) {
+    packed_pairs[i / 2] =
+        pack_fp8(values[i] * quant_mul, values[i + 1] * quant_mul);
+  }
+  fp8_e4m3_t* destination_q = output_q +
+      (static_cast<int64_t>(destination) * shard_tokens + token) *
+          kTP4PackedWoBQBytes;
+  reinterpret_cast<int4*>(destination_q + group * kQuantGroup + lane * kVec)[0] =
+      packed;
+
+  const int warp_lane = local_thread & 31;
+  const uint32_t packed_scales =
+      static_cast<uint32_t>(__shfl_sync(0xffffffff, scale_ue8m0, 0)) |
+      (static_cast<uint32_t>(__shfl_sync(0xffffffff, scale_ue8m0, 8)) << 8) |
+      (static_cast<uint32_t>(__shfl_sync(0xffffffff, scale_ue8m0, 16)) << 16) |
+      (static_cast<uint32_t>(__shfl_sync(0xffffffff, scale_ue8m0, 24)) << 24);
+  if (warp_lane == 0) {
+    const int word = local_thread >> 5;
+    output_s[
+        (static_cast<int64_t>(destination) * 4 + word) * shard_tokens + token] =
+        packed_scales;
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template <typename T, int kHeadDim, int kRopeDim, bool kUsePDL>
 struct TP4PackedWoBInputUE8M0Kernel {
   static void pack(
@@ -949,6 +1024,40 @@ struct TP4PackedWoBInputUE8M0Kernel {
             static_cast<uint8_t*>(peer3.data_ptr()),
             shard_tokens,
             static_cast<int>(source_rank));
+  }
+
+  static void quantize_local(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView output_q,
+      tvm::ffi::TensorView output_s) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto SSize = SymbolicSize{"shard_tokens"};
+    TensorMatcher({SSize, 8, 1024})
+        .with_strides({8192, 1024, 1})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(input);
+    TensorMatcher({4, SSize, kTP4PackedWoBQBytes})
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .verify(output_q);
+    TensorMatcher({4, 4, SSize})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(output_s);
+    const int64_t shard_tokens = SSize.unwrap();
+    RuntimeCheck(
+        shard_tokens == 16384 || shard_tokens == 32768,
+        "TP4 local WO_B quant only supports Req16/Req128 owner shards");
+    LaunchKernel(dim3(shard_tokens), dim3(512), device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_quantize_local_wo_b_input_kernel<T, kUsePDL>,
+            static_cast<const T*>(input.data_ptr()),
+            static_cast<fp8_e4m3_t*>(output_q.data_ptr()),
+            static_cast<uint32_t*>(output_s.data_ptr()),
+            shard_tokens);
   }
 };
 

@@ -58,19 +58,22 @@ __global__ void tp4_nccl_ring_bf16_reduce_kernel(
     T* __restrict__ output,
     int64_t num_elements) {
   device::PDLWaitPrimary<kUsePDL>();
-  const int64_t first =
-      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) *
-      kElementsPerThread;
+  const int64_t block_first =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x * kElementsPerThread;
+  const int64_t first = block_first + threadIdx.x * 2;
+  const int group = static_cast<int>(
+      (block_first % kNCCLPeriodElements) / kNCCLChannelGroupElements);
   if (first < num_elements) {
     // Both strict shapes, 16384x4096 and 32768x4096, are multiples of the
     // vector width and channel-group size.  Keep a guarded tail so the host
     // wrapper remains safe if its validation is tightened or extended.
 #pragma unroll
-    for (int offset = 0; offset < kElementsPerThread; offset += 2) {
-      const int64_t index = first + offset;
+    for (int round = 0; round < kElementsPerThread / 2; ++round) {
+      // Consecutive warp lanes access consecutive BF16 pairs.  Advancing by
+      // one full CTA plane between rounds keeps every 128B sector full; the
+      // old thread-contiguous vector mapping issued strided 4B transactions.
+      const int64_t index = first + round * blockDim.x * 2;
       if (index + 1 < num_elements) {
-        const int group = static_cast<int>(
-            (index % kNCCLPeriodElements) / kNCCLChannelGroupElements);
         const __nv_bfloat162 a = load_pair(input0 + index);
         const __nv_bfloat162 b = load_pair(input1 + index);
         const __nv_bfloat162 c = load_pair(input2 + index);

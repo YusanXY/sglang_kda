@@ -566,6 +566,10 @@ def _jit_tp4_packed_output_module(
                 "direct_push_wob",
                 f"TP4PackedWoBInputUE8M0Kernel<{args}>::direct_push",
             ),
+            (
+                "quantize_local_wob",
+                f"TP4PackedWoBInputUE8M0Kernel<{args}>::quantize_local",
+            ),
         ],
         extra_cuda_cflags=["--use_fast_math"],
     )
@@ -787,6 +791,24 @@ def _tp4_direct_push_wo_b_input_custom_op(
     module.direct_push_wob(input, peer0, peer1, peer2, peer3, source_rank)
 
 
+@register_custom_op(
+    op_name="dsv4_tp4_quantize_local_wo_b_input_ue8m0",
+    mutates_args=["output_q", "output_s"],
+)
+def _tp4_quantize_local_wo_b_input_custom_op(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s: torch.Tensor,
+) -> None:
+    module = _jit_tp4_packed_output_module(
+        input.dtype,
+        _HEAD_DIM,
+        _ROPE_DIM,
+        is_arch_support_pdl(),
+    )
+    module.quantize_local_wob(input, output_q, output_s)
+
+
 @debug_kernel_api
 def tp4_pack_wo_b_input_ue8m0(
     input: torch.Tensor,
@@ -962,6 +984,55 @@ def tp4_direct_push_wo_b_input_ue8m0(
         )
 
 
+@debug_kernel_api
+def tp4_quantize_local_wo_b_input_ue8m0(
+    input: torch.Tensor,
+    output_q: torch.Tensor,
+    output_s_storage: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse C4 WO_B input layout conversion and block-FP8 quantization."""
+    if (
+        input.device.type != "cuda"
+        or input.dtype != torch.bfloat16
+        or input.ndim != 3
+        or input.shape[1:] != (8, 1024)
+        or not input.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 local WO_B quant input must be contiguous CUDA BF16 "
+            "[owner_T,8,1024]"
+        )
+    owner_tokens = input.shape[0]
+    if owner_tokens not in (16384, 32768):
+        raise RuntimeError(
+            "TP4 local WO_B quant only supports owner_T=16384 or 32768"
+        )
+    if (
+        output_q.shape != (4, owner_tokens, 2048)
+        or output_q.dtype != torch.float8_e4m3fn
+        or output_q.device != input.device
+        or not output_q.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 local WO_B output_q must be contiguous CUDA FP8 "
+            f"{(4, owner_tokens, 2048)}"
+        )
+    if (
+        output_s_storage.shape != (4, 4, owner_tokens)
+        or output_s_storage.dtype != torch.int32
+        or output_s_storage.device != input.device
+        or not output_s_storage.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 local WO_B scale storage must be contiguous CUDA int32 "
+            f"{(4, 4, owner_tokens)}"
+        )
+    _tp4_quantize_local_wo_b_input_custom_op(
+        input, output_q, output_s_storage
+    )
+    return output_q, output_s_storage.transpose(1, 2)
+
+
 __all__ = [
     "inverse_rope_fp8_wo_a_ue8m0",
     "load_mhc_post_vec8_extension",
@@ -974,6 +1045,7 @@ __all__ = [
     "tp4_direct_push_wo_b_input_ue8m0",
     "tp4_nccl_ring_bf16_reduce",
     "tp4_peer_pull_wo_b_input_ue8m0",
+    "tp4_quantize_local_wo_b_input_ue8m0",
     "tp4_unpack_attention_scale_ue8m0",
     "tp4_unpack_wo_b_scale_ue8m0",
 ]

@@ -105,6 +105,11 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_packed_recv_q: Optional[torch.Tensor]
     attention_projected_local: Optional[torch.Tensor]
     attention_projected_gather: Optional[torch.Tensor]
+    attention_wob_q: Optional[torch.Tensor]
+    attention_wob_s_storage: Optional[torch.Tensor]
+    attention_wob_q_chunks: Any
+    attention_wob_s_chunks: Any
+    attention_wob_partial_chunks: Any
     attention_symm_handle: Any
     attention_symm_peer0: Optional[torch.Tensor]
     attention_symm_peer1: Optional[torch.Tensor]
@@ -666,6 +671,11 @@ class DSV4WholeLayerRuntime:
                 attention_packed_recv_q,
                 attention_projected_local,
                 attention_projected_gather,
+                attention_wob_q,
+                attention_wob_s_storage,
+                attention_wob_q_chunks,
+                attention_wob_s_chunks,
+                attention_wob_partial_chunks,
             ) = (
                 self._get_tp4_attention_workspace(num_tokens, positions.device)
             )
@@ -713,6 +723,11 @@ class DSV4WholeLayerRuntime:
             attention_packed_recv_q = None
             attention_projected_local = None
             attention_projected_gather = None
+            attention_wob_q = None
+            attention_wob_s_storage = None
+            attention_wob_q_chunks = None
+            attention_wob_s_chunks = None
+            attention_wob_partial_chunks = None
             attention_symm_handle = None
             attention_symm_peer0 = None
             attention_symm_peer1 = None
@@ -765,6 +780,11 @@ class DSV4WholeLayerRuntime:
             attention_packed_recv_q=attention_packed_recv_q,
             attention_projected_local=attention_projected_local,
             attention_projected_gather=attention_projected_gather,
+            attention_wob_q=attention_wob_q,
+            attention_wob_s_storage=attention_wob_s_storage,
+            attention_wob_q_chunks=attention_wob_q_chunks,
+            attention_wob_s_chunks=attention_wob_s_chunks,
+            attention_wob_partial_chunks=attention_wob_partial_chunks,
             attention_symm_handle=attention_symm_handle,
             attention_symm_peer0=attention_symm_peer0,
             attention_symm_peer1=attention_symm_peer1,
@@ -809,9 +829,6 @@ class DSV4WholeLayerRuntime:
         num_tokens: int,
         device: torch.device,
     ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -886,6 +903,12 @@ class DSV4WholeLayerRuntime:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Any,
+        Any,
+        Any,
     ]:
         workspace = self._tp4_attention_workspace
         if workspace is None or workspace[0] != device:
@@ -944,6 +967,31 @@ class DSV4WholeLayerRuntime:
                 projected_local,
                 projected_gather,
             ) = workspace
+        owner_tokens = num_tokens // 4
+        q_recv_bytes = q_recv.view(torch.uint8).reshape(-1)
+        projected_local_capacity_bytes = (
+            (_MAX_FORWARD_TOKENS // 4) * 4096 * 2
+        )
+        wob_q_capacity_bytes = _MAX_FORWARD_TOKENS * 2048
+        wob_q = q_recv_bytes[
+            projected_local_capacity_bytes :
+            projected_local_capacity_bytes + 4 * owner_tokens * 2048
+        ].view(torch.float8_e4m3fn).view(4, owner_tokens, 2048)
+        wob_s_offset = projected_local_capacity_bytes + wob_q_capacity_bytes
+        wob_s_storage = q_recv_bytes[
+            wob_s_offset : wob_s_offset + 4 * 4 * owner_tokens * 4
+        ].view(torch.int32).view(4, 4, owner_tokens)
+        wob_partial_offset = wob_s_offset + (
+            4 * 4 * (_MAX_FORWARD_TOKENS // 4) * 4
+        )
+        wob_partials = q_recv_bytes[
+            wob_partial_offset :
+            wob_partial_offset + 4 * owner_tokens * 4096 * 2
+        ].view(torch.bfloat16).view(4, owner_tokens, 4096)
+        wob_q_chunks = tuple(wob_q[index] for index in range(4))
+        wob_s_logical = wob_s_storage.transpose(1, 2)
+        wob_s_chunks = tuple(wob_s_logical[index] for index in range(4))
+        wob_partial_chunks = tuple(wob_partials[index] for index in range(4))
         return (
             q_local[:num_tokens],
             q_recv[:num_tokens],
@@ -952,6 +1000,11 @@ class DSV4WholeLayerRuntime:
             packed_recv_q[:num_tokens],
             projected_local[: num_tokens // 4],
             projected_gather[:num_tokens],
+            wob_q,
+            wob_s_storage,
+            wob_q_chunks,
+            wob_s_chunks,
+            wob_partial_chunks,
         )
 
     def _get_q_lora_workspace(
