@@ -99,7 +99,7 @@ def mhc_post_vec8(
 def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
     args = make_cpp_args(use_pdl)
     return load_jit(
-        make_name("tp4_moe_mhc_post_hc4_h4096_owner_v39b"),
+        make_name("tp4_moe_mhc_post_hc4_h4096_owner_v40a3_stream_barrier"),
         *args,
         cuda_files=["deepseek_v4/tp4_moe_mhc_post.cuh"],
         cuda_wrappers=[
@@ -116,8 +116,13 @@ def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
                 "run_owner_post",
                 f"Tp4MoeMhcPostKernel<{args}>::run_owner_post",
             ),
+            (
+                "run_stream_barrier",
+                f"Tp4MoeMhcPostKernel<{args}>::run_stream_barrier",
+            ),
         ],
         extra_cuda_cflags=["--use_fast_math"],
+        extra_ldflags=["-lcuda"],
     )
 
 
@@ -217,6 +222,25 @@ def _tp4_moe_owner_mhc_post_custom_op(
         post_mix,
         comb_mix,
         output,
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_stream_mem_barrier",
+    mutates_args=["sync0", "sync1", "sync2", "sync3"],
+)
+def _tp4_stream_mem_barrier_custom_op(
+    sync0: torch.Tensor,
+    sync1: torch.Tensor,
+    sync2: torch.Tensor,
+    sync3: torch.Tensor,
+    local_rank: int,
+    slot: int,
+    epoch: int,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_stream_barrier(
+        sync0, sync1, sync2, sync3, local_rank, slot, epoch
     )
 
 
@@ -349,6 +373,41 @@ def tp4_moe_owner_mhc_post(
         *owners, residual, post_mix, comb_mix, output
     )
     return output
+
+
+@debug_kernel_api
+def tp4_stream_mem_barrier(
+    syncs: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    local_rank: int,
+    slot: int,
+    epoch: int,
+) -> None:
+    """Enqueue a zero-kernel TP4 barrier using CUDA stream memory ops."""
+
+    if len(syncs) != 4 or local_rank not in range(4):
+        raise RuntimeError("TP4 stream barrier requires four peers and rank 0..3")
+    device = syncs[0].device
+    for sync in syncs:
+        if (
+            sync.shape != (256,)
+            or sync.dtype != torch.int32
+            or sync.device != device
+            or device.type != "cuda"
+            or not sync.is_contiguous()
+        ):
+            raise RuntimeError(
+                "TP4 stream barrier requires contiguous CUDA int32[256] peers"
+            )
+    if slot not in range(256) or not 1 <= epoch <= 0x7FFFFFFF:
+        raise RuntimeError("invalid TP4 stream barrier slot or epoch")
+    _tp4_stream_mem_barrier_custom_op(
+        *syncs, local_rank, slot, epoch
+    )
 
 
 @debug_kernel_api
@@ -1497,6 +1556,7 @@ __all__ = [
     "tp4_moe_mhc_post",
     "tp4_moe_owner_mhc_post",
     "tp4_moe_owner_reduce",
+    "tp4_stream_mem_barrier",
     "tp4_moe_mhc_post_multimem",
     "tp4_nccl_ring_bf16_reduce",
     "tp4_peer_pull_wo_b_input_ue8m0",
