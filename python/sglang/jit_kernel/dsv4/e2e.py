@@ -96,6 +96,184 @@ def mhc_post_vec8(
 
 
 @cache_once
+def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
+    args = make_cpp_args(use_pdl)
+    return load_jit(
+        make_name("tp4_moe_mhc_post_hc4_h4096_exact_v1"),
+        *args,
+        cuda_files=["deepseek_v4/tp4_moe_mhc_post.cuh"],
+        cuda_wrappers=[
+            ("run", f"Tp4MoeMhcPostKernel<{args}>::run"),
+            (
+                "run_multimem",
+                f"Tp4MoeMhcPostKernel<{args}>::run_multimem",
+            ),
+        ],
+        extra_cuda_cflags=["--use_fast_math"],
+    )
+
+
+def load_tp4_moe_mhc_post_extension() -> None:
+    """Compile the strict TP4 MoE reduction+mHC post kernel before serving."""
+
+    _jit_tp4_moe_mhc_post_module(False)
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_moe_mhc_post",
+    mutates_args=["output"],
+)
+def _tp4_moe_mhc_post_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run(
+        input0,
+        input1,
+        input2,
+        input3,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_moe_mhc_post_multimem",
+    mutates_args=["output"],
+)
+def _tp4_moe_mhc_post_multimem_custom_op(
+    multicast_ptr: int,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_multimem(
+        multicast_ptr,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+
+
+@debug_kernel_api
+def tp4_moe_mhc_post(
+    partials: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Reduce peer-visible MoE partials and immediately apply mHC post."""
+
+    if len(partials) != 4:
+        raise RuntimeError("TP4 fused MoE/mHC post requires four partials")
+    m = residual.shape[0]
+    if m not in (65536, 131072):
+        raise RuntimeError(
+            "TP4 fused MoE/mHC post requires M=65536 or M=131072, "
+            f"got {m}"
+        )
+    expected = (
+        *((tensor, (m, 4096), torch.bfloat16) for tensor in partials),
+        (residual, (m, 4, 4096), torch.bfloat16),
+        (post_mix, (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (output, (m, 4, 4096), torch.bfloat16),
+    )
+    device = residual.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid TP4 fused MoE/mHC tensor: expected contiguous "
+                f"{shape} {dtype}, got {tuple(tensor.shape)} {tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError(
+                "all TP4 fused MoE/mHC tensors must share one CUDA device"
+            )
+    _tp4_moe_mhc_post_custom_op(
+        *partials,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+    return output
+
+
+@debug_kernel_api
+def tp4_moe_mhc_post_multimem(
+    multicast_ptr: int,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Use NVLS multimem reduction and immediately apply mHC post."""
+
+    if multicast_ptr <= 0 or multicast_ptr % 16:
+        raise RuntimeError(
+            "TP4 multimem MoE/mHC post requires a 16-byte aligned multicast VA"
+        )
+    m = residual.shape[0]
+    if m not in (65536, 131072):
+        raise RuntimeError(
+            "TP4 multimem MoE/mHC post requires M=65536 or M=131072, "
+            f"got {m}"
+        )
+    expected = (
+        (residual, (m, 4, 4096), torch.bfloat16),
+        (post_mix, (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (output, (m, 4, 4096), torch.bfloat16),
+    )
+    device = residual.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid TP4 multimem MoE/mHC tensor: expected contiguous "
+                f"{shape} {dtype}, got {tuple(tensor.shape)} {tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError(
+                "all TP4 multimem MoE/mHC tensors must share one CUDA device"
+            )
+    _tp4_moe_mhc_post_multimem_custom_op(
+        multicast_ptr,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+    return output
+
+
+@cache_once
 def _jit_mhc_pre_norm_mxfp8_quant_module(threads: int, use_pdl: bool) -> Module:
     args = make_cpp_args(threads, use_pdl)
     return load_jit(
@@ -1179,6 +1357,7 @@ __all__ = [
     "load_mhc_post_vec8_extension",
     "load_mhc_pre_norm_mxfp8_quant_extension",
     "load_tp4_nccl_ring_bf16_reduce_extension",
+    "load_tp4_moe_mhc_post_extension",
     "mhc_post_vec8",
     "mhc_pre_norm_mxfp8_quant",
     "tp4_pack_attention_output_ue8m0",
@@ -1186,6 +1365,8 @@ __all__ = [
     "tp4_direct_push_wo_b_input_ue8m0",
     "tp4_direct_push_bf16_gather",
     "tp4_fused_reduce_push_bf16_gather",
+    "tp4_moe_mhc_post",
+    "tp4_moe_mhc_post_multimem",
     "tp4_nccl_ring_bf16_reduce",
     "tp4_peer_pull_wo_b_input_ue8m0",
     "tp4_quantize_local_wo_b_input_ue8m0",

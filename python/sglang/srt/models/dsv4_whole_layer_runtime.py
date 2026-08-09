@@ -107,6 +107,11 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_q_peer3: Optional[torch.Tensor]
     attention_q_rank: int
     attention_q_direct_route: bool
+    moe_partial_local: Optional[torch.Tensor]
+    moe_partial_peer0: Optional[torch.Tensor]
+    moe_partial_peer1: Optional[torch.Tensor]
+    moe_partial_peer2: Optional[torch.Tensor]
+    moe_partial_peer3: Optional[torch.Tensor]
     attention_packed_send: Optional[torch.Tensor]
     attention_packed_recv: Optional[torch.Tensor]
     attention_packed_recv_q: Optional[torch.Tensor]
@@ -315,10 +320,12 @@ class DSV4WholeLayerRuntime:
             load_mhc_post_vec8_extension,
             load_mhc_pre_norm_mxfp8_quant_extension,
             load_tp4_nccl_ring_bf16_reduce_extension,
+            load_tp4_moe_mhc_post_extension,
         )
 
         load_mhc_post_vec8_extension()
         load_mhc_pre_norm_mxfp8_quant_extension(160)
+        load_tp4_moe_mhc_post_extension()
         if self._use_tp4_local_wob:
             load_tp4_nccl_ring_bf16_reduce_extension()
         from sglang.srt.layers import deep_gemm_wrapper
@@ -807,6 +814,15 @@ class DSV4WholeLayerRuntime:
             attention_q_peer2 = attention_q_peers[2]
             attention_q_peer3 = attention_q_peers[3]
             attention_q_direct_route = tp4_token_shard_attention
+            moe_partial_peers = tuple(
+                peer.view(-1)[: num_tokens * 4096].view(num_tokens, 4096)
+                for peer in attention_q_peers
+            )
+            moe_partial_local = moe_partial_peers[attention_q_rank]
+            moe_partial_peer0 = moe_partial_peers[0]
+            moe_partial_peer1 = moe_partial_peers[1]
+            moe_partial_peer2 = moe_partial_peers[2]
+            moe_partial_peer3 = moe_partial_peers[3]
             if (
                 self._use_tp4_local_wob_direct_gather
                 and tp4_token_shard_attention
@@ -894,6 +910,11 @@ class DSV4WholeLayerRuntime:
             attention_q_peer3 = None
             attention_q_rank = -1
             attention_q_direct_route = False
+            moe_partial_local = None
+            moe_partial_peer0 = None
+            moe_partial_peer1 = None
+            moe_partial_peer2 = None
+            moe_partial_peer3 = None
             attention_packed_send, attention_packed_recv = None, None
             attention_packed_recv_q = None
             attention_projected_local = None
@@ -964,6 +985,11 @@ class DSV4WholeLayerRuntime:
             attention_q_peer3=attention_q_peer3,
             attention_q_rank=attention_q_rank,
             attention_q_direct_route=attention_q_direct_route,
+            moe_partial_local=moe_partial_local,
+            moe_partial_peer0=moe_partial_peer0,
+            moe_partial_peer1=moe_partial_peer1,
+            moe_partial_peer2=moe_partial_peer2,
+            moe_partial_peer3=moe_partial_peer3,
             attention_packed_send=attention_packed_send,
             attention_packed_recv=attention_packed_recv,
             attention_packed_recv_q=attention_packed_recv_q,
@@ -1715,21 +1741,50 @@ def _execute_common(
         )
     )
 
-    hidden_states = layer._run_moe_ffn_dp_sync(
-        hidden_states,
-        descriptor.forward_batch,
-        input_ids=descriptor.input_ids,
-        input_ids_global=descriptor.input_ids_global,
-        shared_x_quant=shared_x_quant,
-        routed_x_quant=routed_x_quant,
+    moe_partial_local = descriptor.moe_partial_local
+    moe_partials = (
+        descriptor.moe_partial_peer0,
+        descriptor.moe_partial_peer1,
+        descriptor.moe_partial_peer2,
+        descriptor.moe_partial_peer3,
     )
-    hidden_states = _huge_mhc_post(
-        hidden_states=hidden_states,
+    if (
+        moe_partial_local is None
+        or any(partial is None for partial in moe_partials)
+        or descriptor.attention_q_handle is None
+    ):
+        raise RuntimeError(
+            "DSV4 fused MoE/mHC post requires the TP4 symmetric workspace"
+        )
+    from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+
+    with moe_output_buffer_ctx(moe_partial_local):
+        moe_result = layer._run_moe_ffn_dp_sync(
+            hidden_states,
+            descriptor.forward_batch,
+            input_ids=descriptor.input_ids,
+            input_ids_global=descriptor.input_ids_global,
+            shared_x_quant=shared_x_quant,
+            routed_x_quant=routed_x_quant,
+            huge_fused_moe_post=True,
+        )
+    if moe_result.data_ptr() != moe_partial_local.data_ptr():
+        raise RuntimeError(
+            "FlashInfer MoE did not honor the Huge symmetric output buffer"
+        )
+    # The first GPU barrier publishes all four FlashInfer MoE partials.  The
+    # second prevents the next layer's Q producer from reusing this symmetric
+    # storage while another rank is still reading it.
+    barrier_channel = handle.layer_id & 1
+    descriptor.attention_q_handle.barrier(channel=barrier_channel)
+    hidden_states = _huge_tp4_moe_mhc_post(
+        partials=moe_partials,
         residual=residual,
         post=post,
         comb=comb,
         output=descriptor.mhc_residual_out,
     )
+    descriptor.attention_q_handle.barrier(channel=barrier_channel)
     return hidden_states, None, None, None
 
 
@@ -1852,6 +1907,21 @@ def _huge_mhc_post(
     from sglang.jit_kernel.dsv4.e2e import mhc_post_vec8
 
     return mhc_post_vec8(hidden_states, residual, post, comb, output)
+
+
+def _huge_tp4_moe_mhc_post(
+    *,
+    partials: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Reduce TP4 MoE partials and consume them in mHC post on the GPU."""
+
+    from sglang.jit_kernel.dsv4.e2e import tp4_moe_mhc_post
+
+    return tp4_moe_mhc_post(partials, residual, post, comb, output)
 
 
 def _execute_c0(

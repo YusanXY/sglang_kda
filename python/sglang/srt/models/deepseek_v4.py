@@ -2154,6 +2154,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids_global: torch.Tensor,
         shared_x_quant=None,
         routed_x_quant=None,
+        huge_fused_moe_post: bool = False,
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -2167,6 +2168,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
+        if huge_fused_moe_post and (
+            get_server_args().dsv4_worker_backend != "huge_kernel"
+            or _use_cp
+            or _use_tp_moe_gather
+            or _use_tp_attn_a2a_scatter
+        ):
+            raise RuntimeError(
+                "DSV4 fused MoE/mHC post requires Huge DP1 without CP or "
+                "attention/MoE gather-scatter"
+            )
         if (shared_x_quant is not None or routed_x_quant is not None) and (
             _use_cp or _use_tp_moe_gather or _use_tp_attn_a2a_scatter
         ):
@@ -2203,7 +2214,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             and forward_batch.dp_padding_mode.is_max_len()
             and get_parallel().tp_size == get_parallel().attn_dp_size
         )
-        mlp_reduce_scatter = _use_cp or _use_reduce_scatterv or _use_reduce_scatter
+        mlp_reduce_scatter = (
+            _use_cp
+            or _use_reduce_scatterv
+            or _use_reduce_scatter
+            or huge_fused_moe_post
+        )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
         # on LOCAL hidden before the gather and add it back after the combine
         # (reduce_scatterv OR dp_scatter), instead of on the gathered global buffer.
