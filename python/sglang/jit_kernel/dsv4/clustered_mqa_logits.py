@@ -53,7 +53,59 @@ class ClusteredMqaMetadata:
     logits_workspace: torch.Tensor
     max_context: int
     total_q: int
+    global_total_q: int
+    query_begin: int
+    query_end: int
+    request_begin: int
+    request_end: int
     extension: Any
+
+
+def _plan_tp_query_shard(
+    lengths: tuple[int, ...],
+    total_q: int,
+    *,
+    tp_rank: int | None,
+    tp_size: int | None,
+) -> tuple[int, int, int, int]:
+    """Return request-aligned query/request bounds for the TP-local owner.
+
+    C4 sparse attention already assigns one contiguous token quarter to each
+    TP rank.  The indexer must use the identical partition so its local top-k
+    outputs can be consumed directly without an all-gather.  Request alignment
+    is mandatory because the sparse epilogue uses per-request cache geometry.
+    """
+
+    if (tp_rank is None) != (tp_size is None):
+        raise RuntimeError("clustered MQA TP rank and size must be provided together")
+    if tp_rank is None:
+        return 0, total_q, 0, len(lengths)
+    if tp_size != 4 or not 0 <= tp_rank < tp_size:
+        raise RuntimeError(
+            "DSV4 Huge TP-local C4 indexer requires TP4 and a valid rank; "
+            f"got rank={tp_rank}, size={tp_size}"
+        )
+    if total_q % tp_size:
+        raise RuntimeError(
+            "DSV4 Huge TP-local C4 indexer requires M divisible by TP4; "
+            f"got M={total_q}"
+        )
+
+    query_begin = total_q * tp_rank // tp_size
+    query_end = total_q * (tp_rank + 1) // tp_size
+    request_offsets = [0]
+    for length in lengths:
+        request_offsets.append(request_offsets[-1] + length)
+    try:
+        request_begin = request_offsets.index(query_begin)
+        request_end = request_offsets.index(query_end)
+    except ValueError as exc:
+        raise RuntimeError(
+            "DSV4 Huge TP-local C4 indexer requires request-aligned token "
+            f"quarters; query range [{query_begin},{query_end}) does not align "
+            f"with request offsets {request_offsets}"
+        ) from exc
+    return query_begin, query_end, request_begin, request_end
 
 
 def _source_digest() -> str:
@@ -138,6 +190,8 @@ def prepare_clustered_mqa_metadata(
     indexer_metadata: Any,
     extend_lens_cpu: Sequence[int],
     logits_workspace: torch.Tensor | None = None,
+    tp_rank: int | None = None,
+    tp_size: int | None = None,
 ) -> ClusteredMqaMetadata | None:
     """Build one grouped device schedule when requests have complete Q16 groups.
 
@@ -150,21 +204,36 @@ def prepare_clustered_mqa_metadata(
     if any(length % QUERIES_PER_CLUSTER for length in lengths):
         return None
 
-    c4_seq_lens = indexer_metadata.c4_seq_lens.reshape(-1)
-    total_q = int(c4_seq_lens.numel())
-    if total_q == 0 or total_q % QUERIES_PER_CLUSTER:
+    global_c4_seq_lens = indexer_metadata.c4_seq_lens.reshape(-1)
+    global_total_q = int(global_c4_seq_lens.numel())
+    if global_total_q == 0 or global_total_q % QUERIES_PER_CLUSTER:
         raise RuntimeError(
             "clustered DSV4 MQA requires a nonempty aggregate M divisible by 16"
         )
-    if sum(lengths) != total_q:
+    if sum(lengths) != global_total_q:
         raise RuntimeError(
             "clustered DSV4 MQA host/device shape mismatch: "
-            f"extend lengths sum to {sum(lengths)}, c4 rows={total_q}"
+            f"extend lengths sum to {sum(lengths)}, c4 rows={global_total_q}"
         )
-    page_table = indexer_metadata.page_table
-    if page_table.ndim != 2 or page_table.shape[0] != total_q:
+    global_page_table = indexer_metadata.page_table
+    if global_page_table.ndim != 2 or global_page_table.shape[0] != global_total_q:
         raise RuntimeError(
             "clustered DSV4 MQA requires one page-table row per query token"
+        )
+
+    query_begin, query_end, request_begin, request_end = _plan_tp_query_shard(
+        lengths,
+        global_total_q,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+    )
+    c4_seq_lens = global_c4_seq_lens[query_begin:query_end]
+    page_table = global_page_table[query_begin:query_end]
+    total_q = query_end - query_begin
+    if total_q == 0 or total_q % QUERIES_PER_CLUSTER:
+        raise RuntimeError(
+            "clustered DSV4 MQA TP-local M must be nonempty and divisible by 16; "
+            f"got {total_q}"
         )
 
     grouped_lens = c4_seq_lens.view(-1, QUERIES_PER_CLUSTER)
@@ -218,6 +287,11 @@ def prepare_clustered_mqa_metadata(
         logits_workspace=logits_workspace,
         max_context=max_context,
         total_q=total_q,
+        global_total_q=global_total_q,
+        query_begin=query_begin,
+        query_end=query_end,
+        request_begin=request_begin,
+        request_end=request_end,
         extension=load_clustered_mqa_extension(),
     )
 
@@ -236,7 +310,15 @@ def refresh_clustered_mqa_metadata_for_graph_replay_(
     )
     if live is None:
         raise RuntimeError("captured clustered MQA replay unexpectedly has a Q16 tail")
-    scalar_fields = ("max_context", "total_q")
+    scalar_fields = (
+        "max_context",
+        "total_q",
+        "global_total_q",
+        "query_begin",
+        "query_end",
+        "request_begin",
+        "request_end",
+    )
     for name in scalar_fields:
         current = getattr(captured, name)
         incoming = getattr(live, name)

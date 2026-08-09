@@ -321,6 +321,7 @@ class C4IndexerBackendMixin:
     def _forward_prepare_multi_stream(
         self,
         x: torch.Tensor,
+        compressor_x: torch.Tensor,
         q_lora: torch.Tensor,
         q_lora_quant: Optional[Tuple[torch.Tensor, torch.Tensor]],
         c4_indexer: C4Indexer,
@@ -342,7 +343,7 @@ class C4IndexerBackendMixin:
         stream_weights.wait_stream(current_stream)
 
         self.forward_indexer_compressor(
-            x=x,
+            x=compressor_x,
             forward_batch=forward_batch,
             layer_id=c4_indexer.layer_id,
             compressor=c4_indexer.compressor,
@@ -373,6 +374,7 @@ class C4IndexerBackendMixin:
     def _forward_prepare_normal(
         self,
         x: torch.Tensor,
+        compressor_x: torch.Tensor,
         q_lora: torch.Tensor,
         q_lora_quant: Optional[Tuple[torch.Tensor, torch.Tensor]],
         c4_indexer: C4Indexer,
@@ -392,7 +394,7 @@ class C4IndexerBackendMixin:
         )
         if not skip_compressor:
             self.forward_indexer_compressor(
-                x=x,
+                x=compressor_x,
                 forward_batch=forward_batch,
                 layer_id=c4_indexer.layer_id,
                 compressor=c4_indexer.compressor,
@@ -593,9 +595,50 @@ class C4IndexerBackendMixin:
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
 
+        # C4 sparse attention already assigns one contiguous token quarter to
+        # each TP rank.  For the strict eager high-load buckets, move that same
+        # boundary in front of the indexer Q GEMMs: each rank computes only its
+        # owned wq_b/weight projection, Q quantization, paged logits and top-k.
+        # The compressor remains full-M on every rank because its K/cache writes
+        # are needed by future queries independent of the current token owner.
+        compressor_x = x
+        clustered_metadata = metadata.clustered_mqa_metadata
+        query_begin = 0
+        query_end = num_queries
+        request_begin = 0
+        request_end: Optional[int] = None
+        if clustered_metadata is not None and (
+            clustered_metadata.query_begin != 0
+            or clustered_metadata.query_end != clustered_metadata.global_total_q
+        ):
+            if not self.dsv4_huge_mode:
+                raise RuntimeError("TP-local C4 indexer is exclusive to Huge mode")
+            if clustered_metadata.global_total_q != num_queries:
+                raise RuntimeError(
+                    "TP-local C4 indexer metadata/query mismatch: "
+                    f"metadata M={clustered_metadata.global_total_q}, "
+                    f"live M={num_queries}"
+                )
+            query_begin = clustered_metadata.query_begin
+            query_end = clustered_metadata.query_end
+            request_begin = clustered_metadata.request_begin
+            request_end = clustered_metadata.request_end
+            x = x[query_begin:query_end]
+            q_lora = q_lora[query_begin:query_end]
+            positions = positions[query_begin:query_end]
+            if q_lora_quant is not None:
+                # The packed UE8M0 scale view has stride(-1)==global M.
+                # DeepGEMM's local-M TMA contract cannot consume a row slice
+                # with that inherited stride.  Quantize this rank's BF16
+                # quarter for now; a prebound CUDA scale-pack path can later
+                # reuse the already-produced FP8 values without changing the
+                # indexer/top-k ownership contract established here.
+                q_lora_quant = None
+
         if enable_multi_stream:
             q_indexer, weights = self._forward_prepare_multi_stream(
                 x=x,
+                compressor_x=compressor_x,
                 q_lora=q_lora,
                 q_lora_quant=q_lora_quant,
                 c4_indexer=c4_indexer,
@@ -608,6 +651,7 @@ class C4IndexerBackendMixin:
             assert q_lora_ready is None
             q_indexer, weights = self._forward_prepare_normal(
                 x=x,
+                compressor_x=compressor_x,
                 q_lora=q_lora,
                 q_lora_quant=q_lora_quant,
                 c4_indexer=c4_indexer,
@@ -673,6 +717,13 @@ class C4IndexerBackendMixin:
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 
         def match_num_queries(tensor: torch.Tensor, value: int) -> torch.Tensor:
+            if query_begin != 0 or query_end != num_queries:
+                if tensor.shape[0] != num_queries:
+                    raise RuntimeError(
+                        "TP-local C4 indexer requires full-M metadata before "
+                        f"slicing; got rows={tensor.shape[0]}, M={num_queries}"
+                    )
+                return tensor[query_begin:query_end]
             if tensor.shape[0] == query_rows:
                 return tensor
             if tensor.shape[0] > query_rows:
@@ -718,7 +769,6 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            clustered_metadata = metadata.clustered_mqa_metadata
             if self.dsv4_huge_mode and clustered_metadata is not None:
                 if not isinstance(q_indexer, torch.Tensor):
                     raise RuntimeError("dsv4 huge clustered MQA requires FP8 Q")
@@ -748,6 +798,22 @@ class C4IndexerBackendMixin:
                 combined_indices, combined_lens = (
                     cache.get_fused_c4_epilogue_outputs()
                 )
+                raw_indices = raw_indices[query_begin:query_end]
+                combined_indices = combined_indices[query_begin:query_end]
+                combined_lens = combined_lens[query_begin:query_end]
+                if request_end is None:
+                    request_end = cache.seq_lens.shape[0]
+                query_start_loc = cache.query_start_loc[
+                    request_begin : request_end + 1
+                ]
+                full_seq_lens = cache.seq_lens[request_begin:request_end]
+                swa_gather_lens = cache.swa_gather_lens[
+                    request_begin:request_end
+                ]
+                compressed_base = cache.c4_compressed_base[
+                    request_begin:request_end
+                ]
+                swa_base = cache.c4_swa_base[request_begin:request_end]
                 from sglang.jit_kernel.dsv4.clustered_mqa_logits import (
                     clustered_fp8_paged_mqa_topk,
                 )
@@ -761,11 +827,11 @@ class C4IndexerBackendMixin:
                     page_indices=c4_sparse_page_indices,
                     raw_indices=raw_indices,
                     positions=positions,
-                    query_start_loc=cache.query_start_loc,
-                    full_seq_lens=cache.seq_lens,
-                    swa_gather_lens=cache.swa_gather_lens,
-                    compressed_base=cache.c4_compressed_base,
-                    swa_base=cache.c4_swa_base,
+                    query_start_loc=query_start_loc,
+                    full_seq_lens=full_seq_lens,
+                    swa_gather_lens=swa_gather_lens,
+                    compressed_base=compressed_base,
+                    swa_base=swa_base,
                     combined_indices=combined_indices,
                     combined_lens=combined_lens,
                 )

@@ -749,10 +749,20 @@ class DSV4WholeLayerRuntime:
         # Breakable Graph mode the captured object keeps stable addresses and
         # DSV4Metadata refreshes its live schedule in place before every replay.
         if self._use_clustered_mqa:
+            tp_rank = None
+            tp_size = None
+            if tp4_token_shard_attention:
+                from sglang.srt.distributed.parallel_state import get_tp_group
+
+                tp_group = get_tp_group()
+                tp_rank = tp_group.rank_in_group
+                tp_size = tp_group.world_size
             metadata.clustered_mqa_metadata = prepare_clustered_mqa_metadata(
                 indexer_metadata=indexer_metadata,
                 extend_lens_cpu=extend_lens,
                 logits_workspace=self._clustered_logits_workspace,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
             )
         else:
             metadata.clustered_mqa_metadata = None
