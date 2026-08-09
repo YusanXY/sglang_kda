@@ -99,7 +99,7 @@ def mhc_post_vec8(
 def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
     args = make_cpp_args(use_pdl)
     return load_jit(
-        make_name("tp4_moe_mhc_post_hc4_h4096_owner_v58b_gpu_sync_split"),
+        make_name("tp4_moe_mhc_post_hc4_h4096_owner_v59a_cooperative_sync"),
         *args,
         cuda_files=["deepseek_v4/tp4_moe_mhc_post.cuh"],
         cuda_wrappers=[

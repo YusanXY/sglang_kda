@@ -11,6 +11,7 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 
 namespace {
@@ -567,29 +568,17 @@ void tp4_moe_owner_persistent_kernel(
     *reinterpret_cast<uint4*>(local_output + element) = reduced_raw;
   }
 
-  // A release-system arrival atomically publishes each block's owner-quarter
-  // writes while incrementing the resident-grid counter.  This replaces the
-  // much more expensive threadfence_system + device-scope atomic pair on every
-  // CTA.  The last arriving block advances the epoch after all release atoms
-  // are globally ordered.
-  __syncthreads();
-  if (tid == 0) {
-    const uint32_t ticket = tp4_moe_mhc_atomic_add_release_sys(
-        local_flags + kTp4OwnerFlagArrived, 1U);
-    if (ticket + 1 == gridDim.x) {
-      atomicExch(local_flags + kTp4OwnerFlagArrived, 0U);
-      tp4_moe_mhc_store_release_sys(
-          local_flags + kTp4OwnerFlagProducedEpoch, next_epoch);
-    }
+  // A cooperative grid barrier replaces one system-scope arrival atomic per
+  // CTA.  The single system release below transitively publishes the reduced
+  // quarter after every producer has crossed the grid barrier.
+  auto grid = cooperative_groups::this_grid();
+  grid.sync();
+  if (blockIdx.x == 0 && tid == 0) {
+    __threadfence_system();
+    tp4_moe_mhc_store_release_sys(
+        local_flags + kTp4OwnerFlagProducedEpoch, next_epoch);
   }
-  __syncthreads();
-  if (tid == 0) {
-    while (tp4_moe_mhc_load_acquire_sys(
-               local_flags + kTp4OwnerFlagProducedEpoch) != next_epoch) {
-      __nanosleep(64);
-    }
-  }
-  __syncthreads();
+  grid.sync();
 
   // One CTA polls the four peer epochs.  It releases the local grid with a
   // second system-scope flag, keeping the cross-rank control loop on GPU.
@@ -609,17 +598,8 @@ void tp4_moe_owner_persistent_kernel(
         __nanosleep(128);
       }
     }
-    tp4_moe_mhc_store_release_sys(
-        local_flags + kTp4OwnerFlagPeerReadyEpoch, next_epoch);
   }
-  __syncthreads();
-  if (tid == 0) {
-    while (tp4_moe_mhc_load_acquire_sys(
-               local_flags + kTp4OwnerFlagPeerReadyEpoch) != next_epoch) {
-      __nanosleep(64);
-    }
-  }
-  __syncthreads();
+  grid.sync();
 
   // v58b split: finish the GPU-resident cross-rank dependency here.  The
   // wrapper immediately launches the occupancy-tuned owner-post kernel on the
@@ -1060,12 +1040,19 @@ struct Tp4MoeMhcPostKernel {
         .flags3 = reinterpret_cast<uint32_t*>(flags3.data_ptr()),
         .owner_rank = static_cast<uint32_t>(owner_rank),
     };
-    LaunchKernel(
-        kTp4OwnerPersistentBlocks,
-        kTp4MoeMhcThreads,
-        device.unwrap())
-        .enable_pdl(kUsePDL)(
-            tp4_moe_owner_persistent_kernel<kUsePDL>, params);
+    RuntimeCheck(
+        !kUsePDL,
+        "TP4 cooperative owner synchronization does not support PDL");
+    auto cooperative_params = params;
+    void* cooperative_args[] = {&cooperative_params};
+    RuntimeDeviceCheck(cudaLaunchCooperativeKernel(
+        reinterpret_cast<const void*>(
+            tp4_moe_owner_persistent_kernel<kUsePDL>),
+        dim3(kTp4OwnerPersistentBlocks),
+        dim3(kTp4MoeMhcThreads),
+        cooperative_args,
+        0,
+        LaunchKernel::resolve_device(device.unwrap())));
     LaunchKernel(
         M.unwrap() / kTp4OwnerPostTokensPerCTA,
         kTp4MoeMhcThreads,
