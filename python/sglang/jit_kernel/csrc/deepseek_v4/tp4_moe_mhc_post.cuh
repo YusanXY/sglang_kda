@@ -18,7 +18,7 @@ namespace {
 constexpr uint32_t kTp4MoeMhcHC = 4;
 constexpr uint32_t kTp4MoeMhcHidden = 4096;
 constexpr uint32_t kTp4MoeMhcVec = 8;
-constexpr uint32_t kTp4MoeMhcThreads = 512;
+constexpr uint32_t kTp4MoeMhcThreads = 256;
 constexpr uint64_t kNCCLChannelGroupElements = 1ULL << 20;
 constexpr uint64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 
@@ -93,6 +93,25 @@ SGL_DEVICE float2 tp4_moe_mhc_fma2(
   return accumulator;
 }
 
+SGL_DEVICE void tp4_moe_mhc_cp_async_16(
+    void* shared_dst, const void* global_src) {
+  const uint32_t shared_addr =
+      static_cast<uint32_t>(__cvta_generic_to_shared(shared_dst));
+  asm volatile(
+      "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
+          "r"(shared_addr),
+      "l"(global_src));
+}
+
+SGL_DEVICE void tp4_moe_mhc_cp_async_commit() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int kPending>
+SGL_DEVICE void tp4_moe_mhc_cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" : : "n"(kPending));
+}
+
 template <bool kUsePDL, bool kUseMultimem>
 __global__ void tp4_moe_mhc_post_kernel(
     const Tp4MoeMhcPostParams __grid_constant__ params) {
@@ -102,6 +121,7 @@ __global__ void tp4_moe_mhc_post_kernel(
   const uint32_t tid = threadIdx.x;
   __shared__ float coefficients[
       kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
+  __shared__ __align__(16) uint4 peer_stages[2][4][kTp4MoeMhcThreads];
   if (tid < kTp4MoeMhcHC) {
     coefficients[tid] = params.post_mix[token * kTp4MoeMhcHC + tid];
   }
@@ -122,6 +142,24 @@ __global__ void tp4_moe_mhc_post_kernel(
   const uint64_t residual_base =
       static_cast<uint64_t>(token) * kTp4MoeMhcHC * kTp4MoeMhcHidden;
 
+  if constexpr (!kUseMultimem) {
+#pragma unroll
+    for (uint32_t stage = 0; stage < 2; ++stage) {
+      const uint32_t chunk = tid + stage * kTp4MoeMhcThreads;
+      const uint64_t element_offset =
+          hidden_base + static_cast<uint64_t>(chunk) * kTp4MoeMhcVec;
+      tp4_moe_mhc_cp_async_16(
+          &peer_stages[stage][0][tid], params.input0 + element_offset);
+      tp4_moe_mhc_cp_async_16(
+          &peer_stages[stage][1][tid], params.input1 + element_offset);
+      tp4_moe_mhc_cp_async_16(
+          &peer_stages[stage][2][tid], params.input2 + element_offset);
+      tp4_moe_mhc_cp_async_16(
+          &peer_stages[stage][3][tid], params.input3 + element_offset);
+      tp4_moe_mhc_cp_async_commit();
+    }
+  }
+
   for (uint32_t chunk = tid; chunk < kChunksPerToken;
        chunk += kTp4MoeMhcThreads) {
     uint4 reduced_raw;
@@ -130,14 +168,16 @@ __global__ void tp4_moe_mhc_post_kernel(
           params.multicast_input + hidden_base +
           static_cast<uint64_t>(chunk) * kTp4MoeMhcVec);
     } else {
-      const uint4 input0_raw = reinterpret_cast<const uint4*>(
-          params.input0 + hidden_base)[chunk];
-      const uint4 input1_raw = reinterpret_cast<const uint4*>(
-          params.input1 + hidden_base)[chunk];
-      const uint4 input2_raw = reinterpret_cast<const uint4*>(
-          params.input2 + hidden_base)[chunk];
-      const uint4 input3_raw = reinterpret_cast<const uint4*>(
-          params.input3 + hidden_base)[chunk];
+      const uint32_t stage = chunk / kTp4MoeMhcThreads;
+      if (stage == 0) {
+        tp4_moe_mhc_cp_async_wait<1>();
+      } else {
+        tp4_moe_mhc_cp_async_wait<0>();
+      }
+      const uint4 input0_raw = peer_stages[stage][0][tid];
+      const uint4 input1_raw = peer_stages[stage][1][tid];
+      const uint4 input2_raw = peer_stages[stage][2][tid];
+      const uint4 input3_raw = peer_stages[stage][3][tid];
       const auto* input0_pairs =
           reinterpret_cast<const __nv_bfloat162*>(&input0_raw);
       const auto* input1_pairs =
