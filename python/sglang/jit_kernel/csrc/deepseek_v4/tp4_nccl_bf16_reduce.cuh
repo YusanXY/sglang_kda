@@ -24,8 +24,8 @@ namespace {
 constexpr int64_t kNCCLChannelGroupElements = 1LL << 20;  // 2 MiB BF16
 constexpr int64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 constexpr int kElementsPerThread = 8;
-constexpr int kTokensPerReadyGroup = 2;
-constexpr int64_t kMaxReadyGroups = 131072 / kTokensPerReadyGroup;
+constexpr int kTokensPerReadyGroup = 4;
+constexpr int64_t kMaxReadyGroups = 131072 / 2;
 
 SGL_DEVICE uint32_t load_acquire_sys(const uint32_t* pointer) {
   uint32_t value;
@@ -207,7 +207,7 @@ __global__ void tp4_fused_reduce_push_bf16_gather_kernel(
 }
 
 // Token-group specialization for the no-Graph Req16/Req128 path.  One CTA
-// owns two complete tokens, so it can publish a system-scope ready epoch only
+// owns a small group of complete tokens, so it can publish a system-scope ready epoch only
 // after every BF16 value for that group has reached all four destination
 // buffers.  The following mHC-post kernel consumes these epochs directly on
 // GPU, replacing the process-wide symmetric-memory barrier with fine-grained
