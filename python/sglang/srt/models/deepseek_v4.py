@@ -1215,14 +1215,39 @@ class MQALayer(MqaAttentionBase):
                     raise RuntimeError(
                         "Huge C4 requires direct symmetric peer-Q loading"
                     )
-                q_out = e2e_descriptor.attention_q_recv
+                use_alt_symmetric_slot = bool(self.layer_id & 1)
+                q_out = (
+                    e2e_descriptor.attention_q_recv_alt
+                    if use_alt_symmetric_slot
+                    else e2e_descriptor.attention_q_recv
+                )
+                q_peer0 = (
+                    e2e_descriptor.attention_q_peer0_alt
+                    if use_alt_symmetric_slot
+                    else e2e_descriptor.attention_q_peer0
+                )
+                q_peer1 = (
+                    e2e_descriptor.attention_q_peer1_alt
+                    if use_alt_symmetric_slot
+                    else e2e_descriptor.attention_q_peer1
+                )
+                q_peer2 = (
+                    e2e_descriptor.attention_q_peer2_alt
+                    if use_alt_symmetric_slot
+                    else e2e_descriptor.attention_q_peer2
+                )
+                q_peer3 = (
+                    e2e_descriptor.attention_q_peer3_alt
+                    if use_alt_symmetric_slot
+                    else e2e_descriptor.attention_q_peer3
+                )
                 if (
                     q_out is None
                     or e2e_descriptor.attention_q_handle is None
-                    or e2e_descriptor.attention_q_peer0 is None
-                    or e2e_descriptor.attention_q_peer1 is None
-                    or e2e_descriptor.attention_q_peer2 is None
-                    or e2e_descriptor.attention_q_peer3 is None
+                    or q_peer0 is None
+                    or q_peer1 is None
+                    or q_peer2 is None
+                    or q_peer3 is None
                     or e2e_descriptor.attention_q_local is None
                     or e2e_descriptor.attention_packed_send is None
                     or e2e_descriptor.attention_packed_recv is None
@@ -1361,7 +1386,7 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                     tp4_token_shard_workspace=(
                         (
-                            e2e_descriptor.attention_q_recv,
+                            q_out,
                             e2e_descriptor.attention_packed_send,
                             e2e_descriptor.attention_packed_recv,
                             e2e_descriptor.attention_packed_recv_q,
@@ -1370,10 +1395,10 @@ class MQALayer(MqaAttentionBase):
                             positions,
                             e2e_descriptor.attention_q_handle,
                             e2e_descriptor.attention_q_direct_route,
-                            e2e_descriptor.attention_q_peer0,
-                            e2e_descriptor.attention_q_peer1,
-                            e2e_descriptor.attention_q_peer2,
-                            e2e_descriptor.attention_q_peer3,
+                            q_peer0,
+                            q_peer1,
+                            q_peer2,
+                            q_peer3,
                             e2e_descriptor.attention_q_rank,
                         )
                         if tp4_token_shard_attention else None
