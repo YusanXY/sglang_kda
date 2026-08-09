@@ -505,13 +505,6 @@ void tp4_moe_owner_persistent_kernel(
     local_flags = params.flags3;
   }
 
-  // Every block samples the previous epoch before any block can publish the
-  // next one: publication requires all resident blocks to reach the arrival
-  // counter below.
-  const uint32_t previous_epoch = tp4_moe_mhc_load_acquire_sys(
-      local_flags + kTp4OwnerFlagProducedEpoch);
-  const uint32_t next_epoch = previous_epoch + 1;
-
   __nv_bfloat16* local_output =
       const_cast<__nv_bfloat16*>(params.post.input0);
   if (owner_rank == 1) {
@@ -569,20 +562,20 @@ void tp4_moe_owner_persistent_kernel(
   }
 
   // A cooperative grid barrier replaces one system-scope arrival atomic per
-  // CTA.  The single system release below transitively publishes the reduced
-  // quarter after every producer has crossed the grid barrier.
+  // CTA.  Only the grid leader touches the system-scope epoch: the previous
+  // implementation made all 592*256 threads issue the same acquire load.
+  // The leader can publish and immediately poll the peer leaders because its
+  // own reduction grid is already quiescent at this point.
   auto grid = cooperative_groups::this_grid();
   grid.sync();
   if (blockIdx.x == 0 && tid == 0) {
+    const uint32_t next_epoch =
+        tp4_moe_mhc_load_acquire_sys(
+            local_flags + kTp4OwnerFlagProducedEpoch) +
+        1;
     __threadfence_system();
     tp4_moe_mhc_store_release_sys(
         local_flags + kTp4OwnerFlagProducedEpoch, next_epoch);
-  }
-  grid.sync();
-
-  // One CTA polls the four peer epochs.  It releases the local grid with a
-  // second system-scope flag, keeping the cross-rank control loop on GPU.
-  if (blockIdx.x == 0 && tid == 0) {
     bool ready = false;
     while (!ready) {
       ready =
