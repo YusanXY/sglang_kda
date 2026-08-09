@@ -29,7 +29,7 @@ _QUANT_GROUP_SIZE = 128
 def _jit_mhc_post_vec8_module(use_pdl: bool) -> Module:
     args = make_cpp_args(use_pdl)
     return load_jit(
-        make_name("mhc_post_vec8_hc4_h4096_v66c_group4"),
+        make_name("mhc_post_vec8_hc4_h4096_v66d_group8"),
         *args,
         cuda_files=["deepseek_v4/mhc_post_vec8.cuh"],
         cuda_wrappers=[
@@ -954,7 +954,7 @@ def inverse_rope_fp8_wo_a_ue8m0(
 def _jit_tp4_nccl_ring_bf16_reduce_module(use_pdl: bool) -> Module:
     args = make_cpp_args(torch.bfloat16, use_pdl)
     return load_jit(
-        make_name("tp4_nccl_ring_bf16_reduce_v66c_group4"),
+        make_name("tp4_nccl_ring_bf16_reduce_v66d_group8"),
         *args,
         cuda_files=["deepseek_v4/tp4_nccl_bf16_reduce.cuh"],
         cuda_wrappers=[

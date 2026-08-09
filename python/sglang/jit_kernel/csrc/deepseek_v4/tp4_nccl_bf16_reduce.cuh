@@ -24,7 +24,7 @@ namespace {
 constexpr int64_t kNCCLChannelGroupElements = 1LL << 20;  // 2 MiB BF16
 constexpr int64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 constexpr int kElementsPerThread = 8;
-constexpr int kTokensPerReadyGroup = 4;
+constexpr int kTokensPerReadyGroup = 8;
 constexpr int64_t kMaxReadyGroups = 131072 / 2;
 
 SGL_DEVICE uint32_t load_acquire_sys(const uint32_t* pointer) {

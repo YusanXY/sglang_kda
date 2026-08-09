@@ -19,7 +19,7 @@ constexpr uint32_t kMhcPostHC = 4;
 constexpr uint32_t kMhcPostHidden = 4096;
 constexpr uint32_t kMhcPostVec = 8;
 constexpr uint32_t kMhcPostThreads = 256;
-constexpr uint32_t kMhcPostTokensPerReadyGroup = 4;
+constexpr uint32_t kMhcPostTokensPerReadyGroup = 8;
 constexpr uint32_t kMhcPostMaxReadyGroups = 131072 / 2;
 
 struct MhcPostVec8Params {
