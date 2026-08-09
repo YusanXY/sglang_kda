@@ -18,7 +18,7 @@ namespace {
 constexpr uint32_t kTp4MoeMhcHC = 4;
 constexpr uint32_t kTp4MoeMhcHidden = 4096;
 constexpr uint32_t kTp4MoeMhcVec = 8;
-constexpr uint32_t kTp4MoeMhcThreads = 128;
+constexpr uint32_t kTp4MoeMhcThreads = 512;
 constexpr uint64_t kNCCLChannelGroupElements = 1ULL << 20;
 constexpr uint64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 
