@@ -469,7 +469,7 @@ def inverse_rope_fp8_wo_a_ue8m0(
 def _jit_tp4_nccl_ring_bf16_reduce_module(use_pdl: bool) -> Module:
     args = make_cpp_args(torch.bfloat16, use_pdl)
     return load_jit(
-        make_name("tp4_nccl_ring_bf16_reduce_exact_v2"),
+        make_name("tp4_nccl_ring_bf16_reduce_exact_v3"),
         *args,
         cuda_files=["deepseek_v4/tp4_nccl_bf16_reduce.cuh"],
         cuda_wrappers=[
@@ -477,6 +477,10 @@ def _jit_tp4_nccl_ring_bf16_reduce_module(use_pdl: bool) -> Module:
             (
                 "direct_push_gather",
                 f"TP4NcclRingBF16ReduceKernel<{args}>::direct_push_gather",
+            ),
+            (
+                "fused_reduce_push_gather",
+                f"TP4NcclRingBF16ReduceKernel<{args}>::fused_reduce_push_gather",
             ),
         ],
     )
@@ -517,6 +521,35 @@ def _tp4_direct_push_bf16_gather_custom_op(
     module = _jit_tp4_nccl_ring_bf16_reduce_module(is_arch_support_pdl())
     module.direct_push_gather(
         input, peer0, peer1, peer2, peer3, source_rank
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_fused_reduce_push_bf16_gather",
+    mutates_args=["peer0", "peer1", "peer2", "peer3"],
+)
+def _tp4_fused_reduce_push_bf16_gather_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    peer0: torch.Tensor,
+    peer1: torch.Tensor,
+    peer2: torch.Tensor,
+    peer3: torch.Tensor,
+    source_rank: int,
+) -> None:
+    module = _jit_tp4_nccl_ring_bf16_reduce_module(is_arch_support_pdl())
+    module.fused_reduce_push_gather(
+        input0,
+        input1,
+        input2,
+        input3,
+        peer0,
+        peer1,
+        peer2,
+        peer3,
+        source_rank,
     )
 
 
@@ -587,6 +620,56 @@ def tp4_direct_push_bf16_gather(
         raise RuntimeError("TP4 direct BF16 gather input must be contiguous BF16")
     _tp4_direct_push_bf16_gather_custom_op(
         input, *peers, source_rank
+    )
+
+
+@debug_kernel_api
+def tp4_fused_reduce_push_bf16_gather(
+    partials: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    peers: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    source_rank: int,
+) -> None:
+    """Reduce four WO_B partials and push the owner shard in one CUDA launch."""
+    if len(partials) != 4:
+        raise RuntimeError("TP4 fused BF16 reduce/gather requires four partials")
+    owner_tokens = partials[0].shape[0]
+    expected_input_shape = (owner_tokens, 4096)
+    if owner_tokens not in (16384, 32768):
+        raise RuntimeError(
+            "TP4 fused BF16 reduce/gather only supports owner shards with "
+            f"16384 or 32768 tokens, got {owner_tokens}"
+        )
+    if source_rank not in range(4) or len(peers) != 4:
+        raise RuntimeError(
+            "TP4 fused BF16 reduce/gather requires four peers and TP rank"
+        )
+    device = partials[0].device
+    for tensor in partials:
+        if (
+            tensor.shape != expected_input_shape
+            or tensor.dtype != torch.bfloat16
+            or tensor.device != device
+            or device.type != "cuda"
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                "TP4 fused BF16 partials must be contiguous CUDA BF16 "
+                f"{expected_input_shape} on {device}"
+            )
+    expected_peer_shape = (131072, 4096)
+    for peer in peers:
+        if (
+            peer.shape != expected_peer_shape
+            or peer.dtype != torch.bfloat16
+            or peer.device != device
+            or not peer.is_contiguous()
+        ):
+            raise RuntimeError(
+                "TP4 fused BF16 gather peers must be contiguous CUDA BF16 "
+                f"{expected_peer_shape} on {device}"
+            )
+    _tp4_fused_reduce_push_bf16_gather_custom_op(
+        *partials, *peers, source_rank
     )
 
 
@@ -1102,6 +1185,7 @@ __all__ = [
     "tp4_pack_wo_b_input_ue8m0",
     "tp4_direct_push_wo_b_input_ue8m0",
     "tp4_direct_push_bf16_gather",
+    "tp4_fused_reduce_push_bf16_gather",
     "tp4_nccl_ring_bf16_reduce",
     "tp4_peer_pull_wo_b_input_ue8m0",
     "tp4_quantize_local_wo_b_input_ue8m0",

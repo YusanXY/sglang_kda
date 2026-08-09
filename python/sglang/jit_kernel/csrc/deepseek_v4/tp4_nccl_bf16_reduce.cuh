@@ -123,6 +123,69 @@ __global__ void tp4_direct_push_bf16_gather_kernel(
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// Fuse the exact four-way BF16 reduction with the symmetric output gather.
+// Each rank owns one contiguous token quarter.  Writing that completed quarter
+// directly into all four output buffers removes the large reduced intermediate
+// read/write and one launch per attention layer while preserving the observed
+// NCCL BF16 accumulation order byte-for-byte.
+template <typename T, bool kUsePDL>
+__global__ void tp4_fused_reduce_push_bf16_gather_kernel(
+    const T* __restrict__ input0,
+    const T* __restrict__ input1,
+    const T* __restrict__ input2,
+    const T* __restrict__ input3,
+    T* __restrict__ destination0,
+    T* __restrict__ destination1,
+    T* __restrict__ destination2,
+    T* __restrict__ destination3,
+    int64_t num_elements,
+    int64_t output_element_offset) {
+  static_assert(sizeof(T) == sizeof(__nv_bfloat16));
+  device::PDLWaitPrimary<kUsePDL>();
+  using Copy = int4;
+  constexpr int kElementsPerCopy = sizeof(Copy) / sizeof(T);
+  constexpr int kPairsPerCopy = kElementsPerCopy / 2;
+  const int64_t num_copies = num_elements / kElementsPerCopy;
+  const int64_t output_copy_offset = output_element_offset / kElementsPerCopy;
+  const Copy* source0 = reinterpret_cast<const Copy*>(input0);
+  const Copy* source1 = reinterpret_cast<const Copy*>(input1);
+  const Copy* source2 = reinterpret_cast<const Copy*>(input2);
+  const Copy* source3 = reinterpret_cast<const Copy*>(input3);
+  Copy* output0 = reinterpret_cast<Copy*>(destination0) + output_copy_offset;
+  Copy* output1 = reinterpret_cast<Copy*>(destination1) + output_copy_offset;
+  Copy* output2 = reinterpret_cast<Copy*>(destination2) + output_copy_offset;
+  Copy* output3 = reinterpret_cast<Copy*>(destination3) + output_copy_offset;
+  const int64_t thread =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t copy_index = thread; copy_index < num_copies;
+       copy_index += stride) {
+    const Copy a = source0[copy_index];
+    const Copy b = source1[copy_index];
+    const Copy c = source2[copy_index];
+    const Copy d = source3[copy_index];
+    Copy reduced;
+    const auto* a_pairs = reinterpret_cast<const __nv_bfloat162*>(&a);
+    const auto* b_pairs = reinterpret_cast<const __nv_bfloat162*>(&b);
+    const auto* c_pairs = reinterpret_cast<const __nv_bfloat162*>(&c);
+    const auto* d_pairs = reinterpret_cast<const __nv_bfloat162*>(&d);
+    auto* reduced_pairs = reinterpret_cast<__nv_bfloat162*>(&reduced);
+    const int group = static_cast<int>(
+        ((copy_index * kElementsPerCopy) % kNCCLPeriodElements) /
+        kNCCLChannelGroupElements);
+#pragma unroll
+    for (int pair = 0; pair < kPairsPerCopy; ++pair) {
+      reduced_pairs[pair] = add4_ordered(
+          a_pairs[pair], b_pairs[pair], c_pairs[pair], d_pairs[pair], group);
+    }
+    output0[copy_index] = reduced;
+    output1[copy_index] = reduced;
+    output2[copy_index] = reduced;
+    output3[copy_index] = reduced;
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template <typename T, bool kUsePDL>
 struct TP4NcclRingBF16ReduceKernel {
   static void run(
@@ -240,6 +303,79 @@ struct TP4NcclRingBF16ReduceKernel {
             destination0,
             destination1,
             destination2,
+            num_elements,
+            source_rank * num_elements);
+  }
+
+  static void fused_reduce_push_gather(
+      tvm::ffi::TensorView input0,
+      tvm::ffi::TensorView input1,
+      tvm::ffi::TensorView input2,
+      tvm::ffi::TensorView input3,
+      tvm::ffi::TensorView peer0,
+      tvm::ffi::TensorView peer1,
+      tvm::ffi::TensorView peer2,
+      tvm::ffi::TensorView peer3,
+      int64_t source_rank) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto M = SymbolicSize{"owner_tokens"};
+    constexpr int64_t kHidden = 4096;
+    constexpr int64_t kMaxTokens = 131072;
+    TensorMatcher({M, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(input0);
+    TensorMatcher({M, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(input1);
+    TensorMatcher({M, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(input2);
+    TensorMatcher({M, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(input3);
+    TensorMatcher({kMaxTokens, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(peer0);
+    TensorMatcher({kMaxTokens, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(peer1);
+    TensorMatcher({kMaxTokens, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(peer2);
+    TensorMatcher({kMaxTokens, kHidden})
+        .with_dtype<T>()
+        .with_device(device)
+        .verify(peer3);
+    const int64_t owner_tokens = M.unwrap();
+    RuntimeCheck(
+        owner_tokens == 16384 || owner_tokens == 32768,
+        "TP4 fused BF16 reduce/gather only supports Req16/Req128 owner shards");
+    RuntimeCheck(
+        source_rank >= 0 && source_rank < 4,
+        "TP4 fused BF16 reduce/gather requires source_rank in [0, 4)");
+    const int64_t num_elements = owner_tokens * kHidden;
+    constexpr int kThreads = 256;
+    const int blocks = owner_tokens == 16384 ? 8192 : 16384;
+    LaunchKernel(dim3(blocks), dim3(kThreads), device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_fused_reduce_push_bf16_gather_kernel<T, kUsePDL>,
+            static_cast<const T*>(input0.data_ptr()),
+            static_cast<const T*>(input1.data_ptr()),
+            static_cast<const T*>(input2.data_ptr()),
+            static_cast<const T*>(input3.data_ptr()),
+            static_cast<T*>(peer0.data_ptr()),
+            static_cast<T*>(peer1.data_ptr()),
+            static_cast<T*>(peer2.data_ptr()),
+            static_cast<T*>(peer3.data_ptr()),
             num_elements,
             source_rank * num_elements);
   }
