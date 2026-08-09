@@ -19,6 +19,7 @@ constexpr uint32_t kTp4MoeMhcHC = 4;
 constexpr uint32_t kTp4MoeMhcHidden = 4096;
 constexpr uint32_t kTp4MoeMhcVec = 8;
 constexpr uint32_t kTp4MoeMhcThreads = 256;
+constexpr uint32_t kTp4OwnerPostTokensPerCTA = 4;
 constexpr uint64_t kNCCLChannelGroupElements = 1ULL << 20;
 constexpr uint64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 
@@ -326,22 +327,12 @@ template <bool kUsePDL>
 __global__ void tp4_moe_owner_mhc_post_kernel(
     const Tp4MoeMhcPostParams __grid_constant__ params) {
   device::PDLWaitPrimary<kUsePDL>();
-  const uint32_t token = blockIdx.x;
   const uint32_t tid = threadIdx.x;
-  __shared__ float coefficients[
-      kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
-  if (tid < kTp4MoeMhcHC) {
-    coefficients[tid] = params.post_mix[token * kTp4MoeMhcHC + tid];
-  }
-  if (tid < kTp4MoeMhcHC * kTp4MoeMhcHC) {
-    coefficients[kTp4MoeMhcHC + tid] =
-        params.comb_mix[
-            token * kTp4MoeMhcHC * kTp4MoeMhcHC + tid];
-  }
-  __syncthreads();
-
   const uint32_t owner_tokens = params.num_tokens / 4;
-  const uint32_t owner = token / owner_tokens;
+  const uint32_t owner = blockIdx.x & 3;
+  const uint32_t owner_block = blockIdx.x >> 2;
+  const uint32_t first_token =
+      owner * owner_tokens + owner_block * kTp4OwnerPostTokensPerCTA;
   const __nv_bfloat16* owner_input = params.input0;
   if (owner == 1) {
     owner_input = params.input1;
@@ -350,73 +341,91 @@ __global__ void tp4_moe_owner_mhc_post_kernel(
   } else if (owner == 3) {
     owner_input = params.input3;
   }
+  __shared__ float coefficients[
+      kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
   constexpr uint32_t kChunksPerToken =
       kTp4MoeMhcHidden / kTp4MoeMhcVec;
-  const uint64_t hidden_base =
-      static_cast<uint64_t>(token) * kTp4MoeMhcHidden;
-  const uint64_t residual_base =
-      static_cast<uint64_t>(token) * kTp4MoeMhcHC * kTp4MoeMhcHidden;
-  auto* output_chunks = reinterpret_cast<uint4*>(
-      params.output + residual_base);
-
-  for (uint32_t chunk = tid; chunk < kChunksPerToken;
-       chunk += kTp4MoeMhcThreads) {
-    const uint4 hidden_raw = *reinterpret_cast<const uint4*>(
-        owner_input + hidden_base +
-        static_cast<uint64_t>(chunk) * kTp4MoeMhcVec);
-    const auto* hidden_pairs =
-        reinterpret_cast<const __nv_bfloat162*>(&hidden_raw);
-    float2 hidden_values[kTp4MoeMhcVec / 2];
-#pragma unroll
-    for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
-      hidden_values[pair] = __bfloat1622float2(hidden_pairs[pair]);
+  #pragma unroll
+  for (uint32_t token_offset = 0;
+       token_offset < kTp4OwnerPostTokensPerCTA; ++token_offset) {
+    const uint32_t token = first_token + token_offset;
+    if (tid < kTp4MoeMhcHC) {
+      coefficients[tid] = params.post_mix[token * kTp4MoeMhcHC + tid];
     }
-
-    float2 residual_values[kTp4MoeMhcHC][kTp4MoeMhcVec / 2];
-#pragma unroll
-    for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
-         ++input_route) {
-      const auto* route_chunks = reinterpret_cast<const uint4*>(
-          params.residual + residual_base +
-          static_cast<uint64_t>(input_route) * kTp4MoeMhcHidden);
-      const uint4 residual_raw = route_chunks[chunk];
-      residual_values[input_route][0] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.x));
-      residual_values[input_route][1] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.y));
-      residual_values[input_route][2] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.z));
-      residual_values[input_route][3] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.w));
+    if (tid < kTp4MoeMhcHC * kTp4MoeMhcHC) {
+      coefficients[kTp4MoeMhcHC + tid] =
+          params.comb_mix[
+              token * kTp4MoeMhcHC * kTp4MoeMhcHC + tid];
     }
+    __syncthreads();
 
-#pragma unroll
-    for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
-         ++output_route) {
-      __nv_bfloat162 rounded[kTp4MoeMhcVec / 2];
+    const uint64_t hidden_base =
+        static_cast<uint64_t>(token) * kTp4MoeMhcHidden;
+    const uint64_t residual_base =
+        static_cast<uint64_t>(token) * kTp4MoeMhcHC * kTp4MoeMhcHidden;
+    auto* output_chunks = reinterpret_cast<uint4*>(
+        params.output + residual_base);
+
+    for (uint32_t chunk = tid; chunk < kChunksPerToken;
+         chunk += kTp4MoeMhcThreads) {
+      const uint4 hidden_raw = *reinterpret_cast<const uint4*>(
+          owner_input + hidden_base +
+          static_cast<uint64_t>(chunk) * kTp4MoeMhcVec);
+      const auto* hidden_pairs =
+          reinterpret_cast<const __nv_bfloat162*>(&hidden_raw);
+      float2 hidden_values[kTp4MoeMhcVec / 2];
 #pragma unroll
       for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
-        float2 value = make_float2(
-            coefficients[output_route] * hidden_values[pair].x,
-            coefficients[output_route] * hidden_values[pair].y);
-#pragma unroll
-        for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
-             ++input_route) {
-          value = tp4_moe_mhc_fma2(
-              coefficients[
-                  kTp4MoeMhcHC +
-                  input_route * kTp4MoeMhcHC + output_route],
-              residual_values[input_route][pair],
-              value);
-        }
-        rounded[pair] = __float22bfloat162_rn(value);
+        hidden_values[pair] = __bfloat1622float2(hidden_pairs[pair]);
       }
-      output_chunks[output_route * kChunksPerToken + chunk] = make_uint4(
-          tp4_moe_mhc_bf16x2_to_uint(rounded[0]),
-          tp4_moe_mhc_bf16x2_to_uint(rounded[1]),
-          tp4_moe_mhc_bf16x2_to_uint(rounded[2]),
-          tp4_moe_mhc_bf16x2_to_uint(rounded[3]));
+
+      float2 residual_values[kTp4MoeMhcHC][kTp4MoeMhcVec / 2];
+#pragma unroll
+      for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+           ++input_route) {
+        const auto* route_chunks = reinterpret_cast<const uint4*>(
+            params.residual + residual_base +
+            static_cast<uint64_t>(input_route) * kTp4MoeMhcHidden);
+        const uint4 residual_raw = route_chunks[chunk];
+        residual_values[input_route][0] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.x));
+        residual_values[input_route][1] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.y));
+        residual_values[input_route][2] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.z));
+        residual_values[input_route][3] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.w));
+      }
+
+#pragma unroll
+      for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
+           ++output_route) {
+        __nv_bfloat162 rounded[kTp4MoeMhcVec / 2];
+#pragma unroll
+        for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+          float2 value = make_float2(
+              coefficients[output_route] * hidden_values[pair].x,
+              coefficients[output_route] * hidden_values[pair].y);
+#pragma unroll
+          for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+               ++input_route) {
+            value = tp4_moe_mhc_fma2(
+                coefficients[
+                    kTp4MoeMhcHC +
+                    input_route * kTp4MoeMhcHC + output_route],
+                residual_values[input_route][pair],
+                value);
+          }
+          rounded[pair] = __float22bfloat162_rn(value);
+        }
+        output_chunks[output_route * kChunksPerToken + chunk] = make_uint4(
+            tp4_moe_mhc_bf16x2_to_uint(rounded[0]),
+            tp4_moe_mhc_bf16x2_to_uint(rounded[1]),
+            tp4_moe_mhc_bf16x2_to_uint(rounded[2]),
+            tp4_moe_mhc_bf16x2_to_uint(rounded[3]));
+      }
     }
+    __syncthreads();
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -663,7 +672,10 @@ struct Tp4MoeMhcPostKernel {
         .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
         .num_tokens = static_cast<uint32_t>(M.unwrap()),
     };
-    LaunchKernel(M.unwrap(), kTp4MoeMhcThreads, device.unwrap())
+    LaunchKernel(
+        M.unwrap() / kTp4OwnerPostTokensPerCTA,
+        kTp4MoeMhcThreads,
+        device.unwrap())
         .enable_pdl(kUsePDL)(
             tp4_moe_owner_mhc_post_kernel<kUsePDL>, params);
   }
