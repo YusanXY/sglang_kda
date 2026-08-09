@@ -1589,7 +1589,10 @@ class MQALayer(MqaAttentionBase):
                         e2e_descriptor.attention_wob_ready_peer2,
                         e2e_descriptor.attention_wob_ready_peer3,
                     )
-                    if any(flags is None for flags in ready_peers):
+                    if (
+                        e2e_descriptor.attention_wob_ready_local is None
+                        or any(flags is None for flags in ready_peers)
+                    ):
                         raise RuntimeError(
                             f"layer {self.layer_id}: incomplete token-ready flags"
                         )
@@ -1601,7 +1604,7 @@ class MQALayer(MqaAttentionBase):
                     tp4_fused_reduce_push_bf16_gather_ready(
                         wo_b_partial_chunks,
                         output_peers,
-                        ready_peers,
+                        e2e_descriptor.attention_wob_ready_local,
                         e2e_descriptor.attention_wob_output_rank,
                         ready_epoch,
                     )

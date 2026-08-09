@@ -2013,7 +2013,12 @@ def _separate_mhc_post_ffn_pre(
         comb=comb,
         output=descriptor.mhc_residual_mid,
         ready_flags=(
-            descriptor.attention_wob_ready_local
+            (
+                descriptor.attention_wob_ready_peer0,
+                descriptor.attention_wob_ready_peer1,
+                descriptor.attention_wob_ready_peer2,
+                descriptor.attention_wob_ready_peer3,
+            )
             if descriptor.num_tokens == 65536
             else None
         ),
@@ -2070,7 +2075,7 @@ def _huge_mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
     output: torch.Tensor,
-    ready_flags: Optional[torch.Tensor] = None,
+    ready_flags: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ready_epoch: int = 0,
 ) -> torch.Tensor:
     """Run the strict CUDA post primitive into graph-stable GPU storage."""

@@ -222,10 +222,7 @@ __global__ void tp4_fused_reduce_push_bf16_gather_ready_kernel(
     T* __restrict__ destination1,
     T* __restrict__ destination2,
     T* __restrict__ destination3,
-    uint32_t* __restrict__ ready0,
-    uint32_t* __restrict__ ready1,
-    uint32_t* __restrict__ ready2,
-    uint32_t* __restrict__ ready3,
+    uint32_t* __restrict__ ready_owner,
     int64_t owner_tokens,
     int64_t output_element_offset,
     int64_t output_group_offset,
@@ -293,10 +290,7 @@ __global__ void tp4_fused_reduce_push_bf16_gather_ready_kernel(
     // leader.  The following system-scope release stores publish that complete
     // block of remote writes without a redundant explicit system fence.
     const int64_t global_group = output_group_offset + owner_group;
-    store_release_sys(ready0 + global_group, ready_epoch);
-    store_release_sys(ready1 + global_group, ready_epoch);
-    store_release_sys(ready2 + global_group, ready_epoch);
-    store_release_sys(ready3 + global_group, ready_epoch);
+    store_release_sys(ready_owner + global_group, ready_epoch);
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -504,10 +498,7 @@ struct TP4NcclRingBF16ReduceKernel {
       tvm::ffi::TensorView peer1,
       tvm::ffi::TensorView peer2,
       tvm::ffi::TensorView peer3,
-      tvm::ffi::TensorView ready0,
-      tvm::ffi::TensorView ready1,
-      tvm::ffi::TensorView ready2,
-      tvm::ffi::TensorView ready3,
+      tvm::ffi::TensorView ready_owner,
       int64_t source_rank,
       int64_t ready_epoch) {
     using namespace host;
@@ -524,10 +515,10 @@ struct TP4NcclRingBF16ReduceKernel {
     TensorMatcher({kMaxTokens, kHidden}).with_dtype<T>().with_device(device).verify(peer1);
     TensorMatcher({kMaxTokens, kHidden}).with_dtype<T>().with_device(device).verify(peer2);
     TensorMatcher({kMaxTokens, kHidden}).with_dtype<T>().with_device(device).verify(peer3);
-    TensorMatcher({kMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready0);
-    TensorMatcher({kMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready1);
-    TensorMatcher({kMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready2);
-    TensorMatcher({kMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready3);
+    TensorMatcher({kMaxReadyGroups})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(ready_owner);
     const int64_t owner_tokens = M.unwrap();
     RuntimeCheck(
         owner_tokens == 16384 || owner_tokens == 32768,
@@ -547,10 +538,7 @@ struct TP4NcclRingBF16ReduceKernel {
             static_cast<T*>(peer1.data_ptr()),
             static_cast<T*>(peer2.data_ptr()),
             static_cast<T*>(peer3.data_ptr()),
-            static_cast<uint32_t*>(ready0.data_ptr()),
-            static_cast<uint32_t*>(ready1.data_ptr()),
-            static_cast<uint32_t*>(ready2.data_ptr()),
-            static_cast<uint32_t*>(ready3.data_ptr()),
+            static_cast<uint32_t*>(ready_owner.data_ptr()),
             owner_tokens,
             source_rank * owner_elements,
             source_rank * owner_groups,

@@ -28,7 +28,10 @@ struct MhcPostVec8Params {
   const float* __restrict__ post_mix;
   const float* __restrict__ comb_mix;
   __nv_bfloat16* __restrict__ output;
-  const uint32_t* __restrict__ ready_flags;
+  const uint32_t* __restrict__ ready0;
+  const uint32_t* __restrict__ ready1;
+  const uint32_t* __restrict__ ready2;
+  const uint32_t* __restrict__ ready3;
   uint32_t ready_epoch;
   uint32_t num_tokens;
 };
@@ -74,10 +77,20 @@ __global__ void mhc_post_vec8_kernel(
 
   const uint32_t token = blockIdx.x;
   const uint32_t tid = threadIdx.x;
-  if (params.ready_flags != nullptr) {
+  if (params.ready0 != nullptr) {
     if (tid == 0) {
+      const uint32_t owner_tokens = params.num_tokens / 4;
+      const uint32_t owner = token / owner_tokens;
+      const uint32_t* ready_owner = params.ready0;
+      if (owner == 1) {
+        ready_owner = params.ready1;
+      } else if (owner == 2) {
+        ready_owner = params.ready2;
+      } else if (owner == 3) {
+        ready_owner = params.ready3;
+      }
       const uint32_t group = token / kMhcPostTokensPerReadyGroup;
-      while (mhc_post_load_acquire_sys(params.ready_flags + group) !=
+      while (mhc_post_load_acquire_sys(ready_owner + group) !=
              params.ready_epoch) {
         __nanosleep(128);
       }
@@ -208,7 +221,10 @@ struct MhcPostVec8Kernel {
         .post_mix = static_cast<const float*>(post_mix.data_ptr()),
         .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
         .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-        .ready_flags = nullptr,
+        .ready0 = nullptr,
+        .ready1 = nullptr,
+        .ready2 = nullptr,
+        .ready3 = nullptr,
         .ready_epoch = 0,
         .num_tokens = static_cast<uint32_t>(M.unwrap()),
     };
@@ -222,7 +238,10 @@ struct MhcPostVec8Kernel {
       const tvm::ffi::TensorView post_mix,
       const tvm::ffi::TensorView comb_mix,
       const tvm::ffi::TensorView output,
-      const tvm::ffi::TensorView ready_flags,
+      const tvm::ffi::TensorView ready0,
+      const tvm::ffi::TensorView ready1,
+      const tvm::ffi::TensorView ready2,
+      const tvm::ffi::TensorView ready3,
       int64_t ready_epoch) {
     using namespace host;
     auto device = SymbolicDevice{};
@@ -254,10 +273,10 @@ struct MhcPostVec8Kernel {
         .with_dtype<bf16_t>()
         .with_device(device)
         .verify(output);
-    TensorMatcher({kMhcPostMaxReadyGroups})
-        .with_dtype<int32_t>()
-        .with_device(device)
-        .verify(ready_flags);
+    TensorMatcher({kMhcPostMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready0);
+    TensorMatcher({kMhcPostMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready1);
+    TensorMatcher({kMhcPostMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready2);
+    TensorMatcher({kMhcPostMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready3);
     RuntimeCheck(
         M.unwrap() == 65536 || M.unwrap() == 131072,
         "ready-aware mHC post only supports M=65536/131072");
@@ -271,7 +290,10 @@ struct MhcPostVec8Kernel {
         .post_mix = static_cast<const float*>(post_mix.data_ptr()),
         .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
         .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-        .ready_flags = static_cast<const uint32_t*>(ready_flags.data_ptr()),
+        .ready0 = static_cast<const uint32_t*>(ready0.data_ptr()),
+        .ready1 = static_cast<const uint32_t*>(ready1.data_ptr()),
+        .ready2 = static_cast<const uint32_t*>(ready2.data_ptr()),
+        .ready3 = static_cast<const uint32_t*>(ready3.data_ptr()),
         .ready_epoch = static_cast<uint32_t>(ready_epoch),
         .num_tokens = static_cast<uint32_t>(M.unwrap()),
     };
