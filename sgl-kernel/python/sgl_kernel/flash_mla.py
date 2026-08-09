@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -380,4 +380,41 @@ def flash_mla_sparse_fwd_tp4_sharded_output(
 
     return torch.ops.sgl_kernel.sparse_prefill_fwd_tp4_sharded_output.default(
         q_sources, kv, indices, sm_scale, d_v, attn_sink, topk_length
+    )
+
+
+def flash_mla_sparse_fwd_tp4_peer_q_output(
+    q_peers: Sequence[torch.Tensor],
+    token_shard_rank: int,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run TP4 sparse prefill by directly loading Q from symmetric peers.
+
+    Every entry in ``q_peers`` is a peer mapping of a contiguous
+    ``[token_capacity, 16, 512]`` producer buffer.  ``token_shard_rank`` picks
+    this rank's active token quarter.  The output remains
+    ``[token_shard, source_rank, 16, 512]`` for the local projection path.
+    """
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    if len(q_peers) != 4:
+        raise ValueError(f"TP4 peer-Q path requires exactly 4 peers, got {len(q_peers)}")
+
+    return torch.ops.sgl_kernel.sparse_prefill_fwd_tp4_peer_q_output.default(
+        q_peers[0],
+        q_peers[1],
+        q_peers[2],
+        q_peers[3],
+        token_shard_rank,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        attn_sink,
+        topk_length,
     )

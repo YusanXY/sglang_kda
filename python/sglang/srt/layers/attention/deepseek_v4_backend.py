@@ -1803,17 +1803,7 @@ class DeepseekV4AttnBackend(
         compress_ratio: Literal[0, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
-        tp4_token_shard_workspace: Optional[
-            Tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-            ]
-        ] = None,
+        tp4_token_shard_workspace: Optional[Tuple[Any, ...]] = None,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -1992,17 +1982,7 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
-        tp4_token_shard_workspace: Optional[
-            Tuple[
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-                torch.Tensor,
-            ]
-        ] = None,
+        tp4_token_shard_workspace: Optional[Tuple[Any, ...]] = None,
     ) -> torch.Tensor:
         """Unified prefill via flash_mla_sparse_fwd. Replaces the
         flash_mla_with_kvcache call on the extend path. Per request,
@@ -2149,6 +2129,11 @@ class DeepseekV4AttnBackend(
                 _positions,
                 q_symmetric_handle,
                 q_direct_route,
+                q_peer0,
+                q_peer1,
+                q_peer2,
+                q_peer3,
+                q_rank,
             ) = tp4_token_shard_workspace
             if q_recv.shape != q_flat.shape:
                 raise RuntimeError(
@@ -2169,24 +2154,36 @@ class DeepseekV4AttnBackend(
                     raise RuntimeError(
                         "TP4 fused Q routing requires its symmetric handle"
                     )
-                # The norm/RoPE producer already routed each contiguous token
-                # quarter into the destination's source-major Q tensor. This
-                # GPU barrier replaces NCCL SendRecv and orders remote writes
-                # before the local FlashMLA consumer.
+                if any(
+                    peer is None
+                    for peer in (q_peer0, q_peer1, q_peer2, q_peer3)
+                ):
+                    raise RuntimeError(
+                        "TP4 peer-Q FlashMLA requires four symmetric peer mappings"
+                    )
+                if q_rank != tp_group.rank_in_group:
+                    raise RuntimeError(
+                        "TP4 peer-Q rank mismatch: "
+                        f"descriptor={q_rank}, tp={tp_group.rank_in_group}"
+                    )
+                # The norm/RoPE producer wrote local16 Q into this rank's
+                # symmetric buffer. This GPU barrier orders all four producer
+                # writes before FlashMLA issues peer TMA loads.
                 q_symmetric_handle.barrier(channel=layer_id & 1)
             else:
                 raise RuntimeError(
-                    "Huge TP4 token sharding requires fused symmetric Q routing"
+                    "Huge TP4 token sharding requires direct symmetric peer-Q loading"
                 )
             shard_tokens = num_tokens // 4
             shard_begin = tp_group.rank_in_group * shard_tokens
             shard_end = shard_begin + shard_tokens
             from sgl_kernel.flash_mla import (
-                flash_mla_sparse_fwd_tp4_sharded_output,
+                flash_mla_sparse_fwd_tp4_peer_q_output,
             )
 
-            output_token_major = flash_mla_sparse_fwd_tp4_sharded_output(
-                q_sources=q_recv.view(4, shard_tokens, 16, 512),
+            output_token_major = flash_mla_sparse_fwd_tp4_peer_q_output(
+                q_peers=(q_peer0, q_peer1, q_peer2, q_peer3),
+                token_shard_rank=q_rank,
                 kv=kv,
                 indices=combined_indices[shard_begin:shard_end].unsqueeze(1),
                 sm_scale=self.softmax_scale,

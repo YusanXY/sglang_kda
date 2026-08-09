@@ -160,6 +160,38 @@ if(FLASHMLA_ENABLE_SM100)
     else()
         message(STATUS "FlashMLA SM100 h64 TP4 token-sharded sparse prefill v6 already patched")
     endif()
+
+    # Huge Eager Req16/128 peer-Q specialization.  The normalized local16 Q
+    # stays in a symmetric producer buffer.  FlashMLA directly TMA-loads this
+    # rank's token quarter from all four peer mappings, removing the standalone
+    # TP4 Q router.  Apply this only after the v6 token-shard patch because the
+    # increment is intentionally based on that checked source state.
+    set(FLASHMLA_TP4_PEER_Q_MARKER
+        "run_fwd_phase1_tp4_peer_q_output_kernel")
+    file(READ "${FLASHMLA_HEAD64_PHASE1}"
+        FLASHMLA_HEAD64_PHASE1_CONTENT_AFTER_TP4_V6)
+    string(FIND "${FLASHMLA_HEAD64_PHASE1_CONTENT_AFTER_TP4_V6}"
+        "${FLASHMLA_TP4_PEER_Q_MARKER}"
+        FLASHMLA_TP4_PEER_Q_PATCHED)
+    if(FLASHMLA_TP4_PEER_Q_PATCHED EQUAL -1)
+        find_program(FLASHMLA_PATCH_EXECUTABLE patch REQUIRED)
+        execute_process(
+            COMMAND "${FLASHMLA_PATCH_EXECUTABLE}" -p1 -i
+                "${CMAKE_CURRENT_LIST_DIR}/patches/flashmla-sm100-head64-tp4-peer-q-v30b.patch"
+            WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+            RESULT_VARIABLE FLASHMLA_TP4_PEER_Q_PATCH_RESULT
+            OUTPUT_VARIABLE FLASHMLA_TP4_PEER_Q_PATCH_STDOUT
+            ERROR_VARIABLE FLASHMLA_TP4_PEER_Q_PATCH_STDERR)
+        if(NOT FLASHMLA_TP4_PEER_Q_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to patch pinned FlashMLA TP4 peer-Q kernel:\n"
+                "${FLASHMLA_TP4_PEER_Q_PATCH_STDOUT}\n"
+                "${FLASHMLA_TP4_PEER_Q_PATCH_STDERR}")
+        endif()
+        message(STATUS "Patched FlashMLA SM100 h64 TP4 peer-Q sparse prefill v30b")
+    else()
+        message(STATUS "FlashMLA SM100 h64 TP4 peer-Q sparse prefill v30b already patched")
+    endif()
 endif()
 
 

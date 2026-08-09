@@ -1125,15 +1125,21 @@ class DSV4WholeLayerRuntime:
                     "TP4 symmetric Q workspace was not bound on this device"
                 )
             q_recv = symmetric_q[2]
-            # After the first Q all-to-all and FlashMLA complete, both BF16
-            # buffers are dead for the current layer. Reinterpret their first
-            # 2064 bytes/token as post-WO_A FP8+scale send/receive rows. Each
-            # row carries one rank's 2048 WO_B inputs and sixteen scales.
+            # Peer-Q FlashMLA reads q_recv remotely.  Keep that symmetric
+            # producer buffer immutable until the layer's TP4 output-gather
+            # barrier orders the next layer, and put all post-attention aliases
+            # in a separate local allocation. This avoids a second TP barrier
+            # between attention and WO_A/WO_B while preventing a fast rank from
+            # clobbering Q that another rank is still consuming.
+            q_output_scratch = torch.empty_like(q_recv)
+            # After FlashMLA, q_local and q_output_scratch are available for
+            # post-WO_A FP8+scale send/receive rows. Each row carries one
+            # rank's 2048 WO_B inputs and sixteen scales.
             packed_row_bytes = 2064
             packed_send = q_local.view(torch.uint8).reshape(-1)[
                 : _MAX_FORWARD_TOKENS * packed_row_bytes
             ].view(_MAX_FORWARD_TOKENS, packed_row_bytes)
-            packed_recv = q_recv.view(torch.uint8).reshape(-1)[
+            packed_recv = q_output_scratch.view(torch.uint8).reshape(-1)[
                 : _MAX_FORWARD_TOKENS * packed_row_bytes
             ].view(_MAX_FORWARD_TOKENS, packed_row_bytes)
             packed_recv_q = packed_recv[:, :2048].view(
@@ -1144,13 +1150,14 @@ class DSV4WholeLayerRuntime:
             projected_gather = q_local.view(-1)[
                 : _MAX_FORWARD_TOKENS * 4096
             ].view(_MAX_FORWARD_TOKENS, 4096)
-            projected_local = q_recv.view(-1)[
+            projected_local = q_output_scratch.view(-1)[
                 : (_MAX_FORWARD_TOKENS // 4) * 4096
             ].view(_MAX_FORWARD_TOKENS // 4, 4096)
             self._tp4_attention_workspace = (
                 device,
                 q_local,
                 q_recv,
+                q_output_scratch,
                 packed_send,
                 packed_recv,
                 packed_recv_q,
@@ -1162,6 +1169,7 @@ class DSV4WholeLayerRuntime:
                 _,
                 q_local,
                 q_recv,
+                q_output_scratch,
                 packed_send,
                 packed_recv,
                 packed_recv_q,
@@ -1169,7 +1177,7 @@ class DSV4WholeLayerRuntime:
                 projected_gather,
             ) = workspace
         owner_tokens = num_tokens // 4
-        q_recv_bytes = q_recv.view(torch.uint8).reshape(-1)
+        q_recv_bytes = q_output_scratch.view(torch.uint8).reshape(-1)
         projected_local_capacity_bytes = (
             (_MAX_FORWARD_TOKENS // 4) * 4096 * 2
         )

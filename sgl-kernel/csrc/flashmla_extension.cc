@@ -254,6 +254,133 @@ static at::Tensor sgl_sparse_prefill_fwd_tp4_sharded_output(
   return out;
 }
 
+// TP4 eager path without an explicit Q all-to-all/router.  Each q_peer tensor
+// is the peer mapping of one producer rank's symmetric
+// [token_capacity, 16, 512] buffer.  FlashMLA directly loads the destination
+// token quarter from all four mappings into its 64-head shared-memory tile.
+static at::Tensor sgl_sparse_prefill_fwd_tp4_peer_q_output(
+    const at::Tensor& q_peer_0,
+    const at::Tensor& q_peer_1,
+    const at::Tensor& q_peer_2,
+    const at::Tensor& q_peer_3,
+    int64_t token_shard_rank,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length) {
+  using bf16 = cutlass::bfloat16_t;
+  constexpr int kWorldSize = 4;
+  constexpr int kLocalHeads = 16;
+  constexpr int kHeads = kWorldSize * kLocalHeads;
+  constexpr int kHeadDim = 512;
+
+  Arch arch;
+  TORCH_CHECK(
+      arch.is_sm100f(),
+      "sparse_prefill_fwd_tp4_peer_q_output requires an SM100-family GPU");
+  KU_CHECK_NDIM(q_peer_0, 3);
+  KU_CHECK_NDIM(q_peer_1, 3);
+  KU_CHECK_NDIM(q_peer_2, 3);
+  KU_CHECK_NDIM(q_peer_3, 3);
+  KU_CHECK_NDIM(kv, 3);
+  KU_CHECK_NDIM(indices, 3);
+  KU_CHECK_NDIM(attn_sink, 1);
+  KU_CHECK_NDIM(topk_length, 1);
+
+  const int s_q = indices.size(0);
+  const int active_s_q = s_q * kWorldSize;
+  const int s_kv = kv.size(0);
+  const int h_kv = kv.size(1);
+  const int topk = indices.size(2);
+  TORCH_CHECK(
+      token_shard_rank >= 0 && token_shard_rank < kWorldSize,
+      "token_shard_rank must be in [0, 4)");
+  auto check_peer_shape = [&](const at::Tensor& q_peer, int peer_rank) {
+    TORCH_CHECK(
+        q_peer.size(0) >= active_s_q &&
+            q_peer.size(1) == kLocalHeads &&
+            q_peer.size(2) == kHeadDim,
+        "TP4 peer Q ", peer_rank,
+        " must have shape [capacity>=4*s_q, 16, 512]");
+  };
+  check_peer_shape(q_peer_0, 0);
+  check_peer_shape(q_peer_1, 1);
+  check_peer_shape(q_peer_2, 2);
+  check_peer_shape(q_peer_3, 3);
+  TORCH_CHECK(h_kv == 1, "TP4 peer-Q sparse prefill requires h_kv=1");
+  TORCH_CHECK(d_v == kHeadDim, "TP4 peer-Q sparse prefill requires d_v=512");
+
+  KU_CHECK_DEVICE(q_peer_0);
+  KU_CHECK_DEVICE(q_peer_1);
+  KU_CHECK_DEVICE(q_peer_2);
+  KU_CHECK_DEVICE(q_peer_3);
+  KU_CHECK_DEVICE(kv);
+  KU_CHECK_DEVICE(indices);
+  KU_CHECK_DEVICE(attn_sink);
+  KU_CHECK_DEVICE(topk_length);
+  KU_CHECK_DTYPE(q_peer_0, torch::kBFloat16);
+  KU_CHECK_DTYPE(q_peer_1, torch::kBFloat16);
+  KU_CHECK_DTYPE(q_peer_2, torch::kBFloat16);
+  KU_CHECK_DTYPE(q_peer_3, torch::kBFloat16);
+  KU_CHECK_DTYPE(kv, torch::kBFloat16);
+  KU_CHECK_DTYPE(indices, torch::kInt32);
+  KU_CHECK_DTYPE(attn_sink, torch::kFloat32);
+  KU_CHECK_DTYPE(topk_length, torch::kInt32);
+  KU_CHECK_CONTIGUOUS(q_peer_0);
+  KU_CHECK_CONTIGUOUS(q_peer_1);
+  KU_CHECK_CONTIGUOUS(q_peer_2);
+  KU_CHECK_CONTIGUOUS(q_peer_3);
+  KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
+  KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
+  KU_CHECK_SHAPE(kv, s_kv, h_kv, kHeadDim);
+  KU_CHECK_SHAPE(indices, s_q, h_kv, topk);
+  KU_CHECK_SHAPE(attn_sink, kHeads);
+  KU_CHECK_SHAPE(topk_length, s_q);
+
+  at::cuda::CUDAGuard device_guard{
+      static_cast<char>(q_peer_0.get_device())};
+  auto out = torch::empty(
+      {s_q, kWorldSize, kLocalHeads, kHeadDim}, q_peer_0.options());
+  SparseAttnFwdParams params = {
+      s_q,
+      s_kv,
+      kHeads,
+      h_kv,
+      kHeadDim,
+      kHeadDim,
+      topk,
+      static_cast<float>(sm_scale),
+      static_cast<float>(sm_scale) * LOG_2_E,
+      reinterpret_cast<bf16*>(q_peer_0.data_ptr()),
+      reinterpret_cast<bf16*>(kv.data_ptr()),
+      indices.data_ptr<int>(),
+      ku::get_optional_tensor_ptr<float>(attn_sink),
+      ku::get_optional_tensor_ptr<int>(topk_length),
+      kLocalHeads * kHeadDim,
+      kHeadDim,
+      int64_stride_to_int(kv.stride(0)),
+      int64_stride_to_int(kv.stride(1)),
+      int64_stride_to_int(indices.stride(0)),
+      int64_stride_to_int(indices.stride(1)),
+      reinterpret_cast<bf16*>(out.data_ptr()),
+      nullptr,
+      nullptr,
+      arch.num_sms,
+      at::cuda::getCurrentCUDAStream().stream(),
+  };
+  sm100::fwd::head64::run_fwd_phase1_tp4_peer_q_output_kernel<512>(
+      params,
+      reinterpret_cast<bf16*>(q_peer_0.data_ptr()),
+      reinterpret_cast<bf16*>(q_peer_1.data_ptr()),
+      reinterpret_cast<bf16*>(q_peer_2.data_ptr()),
+      reinterpret_cast<bf16*>(q_peer_3.data_ptr()),
+      active_s_q,
+      static_cast<int>(token_shard_rank));
+  return out;
+}
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From FlashMLA
@@ -312,6 +439,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "sparse_prefill_fwd_tp4_sharded_output",
       torch::kCUDA,
       &sgl_sparse_prefill_fwd_tp4_sharded_output);
+
+  m.def(
+      "sparse_prefill_fwd_tp4_peer_q_output(Tensor q_peer_0, Tensor q_peer_1, Tensor q_peer_2, Tensor q_peer_3, "
+      "int token_shard_rank, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? attn_sink=None, "
+      "Tensor? topk_length=None) -> Tensor");
+  m.impl(
+      "sparse_prefill_fwd_tp4_peer_q_output",
+      torch::kCUDA,
+      &sgl_sparse_prefill_fwd_tp4_peer_q_output);
 
   m.def(
       "fwd_kvcache_mla_fp8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

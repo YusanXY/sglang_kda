@@ -1,0 +1,293 @@
+diff --git a/csrc/sm100/prefill/sparse/fwd/head64/config.h b/csrc/sm100/prefill/sparse/fwd/head64/config.h
+index 8d6eb77..25b97fd 100644
+--- a/csrc/sm100/prefill/sparse/fwd/head64/config.h
++++ b/csrc/sm100/prefill/sparse/fwd/head64/config.h
+@@ -21,6 +21,19 @@ struct TmaParams {
+     CUtensorMap tensor_map_kv_nope;
+ };
+
++template<typename Shape_Q_NoPE, typename TMA_Q_NoPE,
++         typename Shape_O, typename TMA_O>
++struct Tp4PeerQTmaParams {
++    Shape_Q_NoPE shape_Q_nope;
++    TMA_Q_NoPE tma_Q_nope_0;
++    TMA_Q_NoPE tma_Q_nope_1;
++    TMA_Q_NoPE tma_Q_nope_2;
++    TMA_Q_NoPE tma_Q_nope_3;
++    Shape_O shape_O;
++    TMA_O tma_O;
++    CUtensorMap tensor_map_kv_nope;
++};
++
+ struct float2x2 {
+     float2 lo, hi;
+ };
+@@ -53,6 +66,16 @@ using SmemLayoutQNoPE = decltype(coalesce(tile_to_shape(
+     Step<_1, _2>{}
+ ), Shape<_1, _1>{}));
+
++// A 64x512 UMMA K-major tile interleaves the four 16-head groups inside every
++// 64-column swizzle atom.  Therefore a peer cannot target one compact 16x512
++// slice.  Use the exact 16x64 atom sub-tile and place eight of them at the
++// parent layout's explicit (column_tile, peer) offsets.
++using SmemLayoutQNoPEPeerTile = decltype(coalesce(tile_to_shape(
++    UMMA::Layout_K_SW128_Atom<bf16>{},
++    Shape<Int<B_H / 4>, Int<64>>{},
++    Step<_1, _2>{}
++), Shape<_1, _1>{}));
++
+ using SmemLayoutQRoPE = decltype(coalesce(tile_to_shape(
+     UMMA::Layout_K_SW64_Atom<bf16>{},
+     Shape<Int<B_H>, Int<D_Q-D_V>>{},
+diff --git a/csrc/sm100/prefill/sparse/fwd/head64/phase1.h b/csrc/sm100/prefill/sparse/fwd/head64/phase1.h
+index 9ebaf0e..494a31c 100644
+--- a/csrc/sm100/prefill/sparse/fwd/head64/phase1.h
++++ b/csrc/sm100/prefill/sparse/fwd/head64/phase1.h
+@@ -14,4 +14,14 @@ template<int D_QK>
+ void run_fwd_phase1_tp4_sharded_output_kernel(
+     const SparseAttnFwdParams& params);
+
++template<int D_QK>
++void run_fwd_phase1_tp4_peer_q_output_kernel(
++    const SparseAttnFwdParams& params,
++    cutlass::bfloat16_t* q_peer_0,
++    cutlass::bfloat16_t* q_peer_1,
++    cutlass::bfloat16_t* q_peer_2,
++    cutlass::bfloat16_t* q_peer_3,
++    int total_s_q,
++    int token_shard_rank);
++
+ }
+diff --git a/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu b/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
+index e72d77d..497f468 100644
+--- a/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
++++ b/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
+@@ -7,5 +7,13 @@ template void run_fwd_phase1_kernel<512>(const SparseAttnFwdParams& params);
+ template void run_fwd_phase1_output_kernel<512>(const SparseAttnFwdParams& params);
+ template void run_fwd_phase1_tp4_sharded_output_kernel<512>(
+     const SparseAttnFwdParams& params);
++template void run_fwd_phase1_tp4_peer_q_output_kernel<512>(
++    const SparseAttnFwdParams& params,
++    cutlass::bfloat16_t* q_peer_0,
++    cutlass::bfloat16_t* q_peer_1,
++    cutlass::bfloat16_t* q_peer_2,
++    cutlass::bfloat16_t* q_peer_3,
++    int total_s_q,
++    int token_shard_rank);
+
+ }
+diff --git a/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh b/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
+index 0be8291..76b3fb6 100644
+--- a/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
++++ b/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
+@@ -87,6 +87,7 @@ template<
+     bool STORE_STATS,
+     int OUTPUT_HEADS,
+     bool TP4_DEST_MAJOR,
++    bool TP4_PEER_Q,
+     typename TmaParams>
+ __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
+ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
+@@ -134,7 +135,14 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
+             if constexpr (HAVE_ROPE) {
+                 cute::prefetch_tma_descriptor(tma_params.tma_Q_rope.get_tma_descriptor());
+             }
+-            cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
++            if constexpr (TP4_PEER_Q) {
++                cute::prefetch_tma_descriptor(tma_params.tma_Q_nope_0.get_tma_descriptor());
++                cute::prefetch_tma_descriptor(tma_params.tma_Q_nope_1.get_tma_descriptor());
++                cute::prefetch_tma_descriptor(tma_params.tma_Q_nope_2.get_tma_descriptor());
++                cute::prefetch_tma_descriptor(tma_params.tma_Q_nope_3.get_tma_descriptor());
++            } else {
++                cute::prefetch_tma_descriptor(tma_params.tma_Q_nope.get_tma_descriptor());
++            }
+
+             plan.bar_prologue_q_nope.init(1);
+             plan.bar_prologue_q_rope.init(1);
+@@ -146,9 +154,51 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
+                 ku::launch_tma_copy(tma_params.tma_Q_rope, gQ_rope, sQ_rope, plan.bar_prologue_q_rope, TMA::CacheHintSm90::EVICT_FIRST);
+             }
+
+-            Tensor gQ_nope = tma_params.tma_Q_nope.get_tma_tensor(tma_params.shape_Q_nope)(_, _, s_q_idx);
+-            Tensor sQ_nope = make_tensor(make_smem_ptr(plan.u.q_full.q_nope.data()), SmemLayoutQNoPE{});
+-            ku::launch_tma_copy(tma_params.tma_Q_nope, gQ_nope, sQ_nope, plan.bar_prologue_q_nope, TMA::CacheHintSm90::EVICT_FIRST);
++            if constexpr (TP4_PEER_Q) {
++                constexpr int kLocalHeads = B_H / 4;
++                constexpr int kColumnsPerTile = 64;
++                constexpr int kPeerTileElements =
++                    kLocalHeads * kColumnsPerTile;
++                constexpr int kFullTileElements = B_H * kColumnsPerTile;
++                auto copy_peer_q = [&](const auto& tma_q, int peer_rank) {
++                    CUTE_UNROLL
++                    for (int column_tile = 0;
++                         column_tile < D_V / kColumnsPerTile;
++                         ++column_tile) {
++                        Tensor gQ_nope = tma_q.get_tma_tensor(
++                            tma_params.shape_Q_nope)(
++                                _, _, column_tile, s_q_idx);
++                        Tensor sQ_nope = make_tensor(
++                            make_smem_ptr(
++                                plan.u.q_full.q_nope.data() +
++                                column_tile * kFullTileElements +
++                                peer_rank * kPeerTileElements),
++                            SmemLayoutQNoPEPeerTile{});
++                        ku::launch_tma_copy(
++                            tma_q,
++                            gQ_nope,
++                            sQ_nope,
++                            plan.bar_prologue_q_nope,
++                            TMA::CacheHintSm90::EVICT_FIRST);
++                    }
++                };
++                copy_peer_q(tma_params.tma_Q_nope_0, 0);
++                copy_peer_q(tma_params.tma_Q_nope_1, 1);
++                copy_peer_q(tma_params.tma_Q_nope_2, 2);
++                copy_peer_q(tma_params.tma_Q_nope_3, 3);
++            } else {
++                Tensor gQ_nope = tma_params.tma_Q_nope.get_tma_tensor(
++                    tma_params.shape_Q_nope)(_, _, s_q_idx);
++                Tensor sQ_nope = make_tensor(
++                    make_smem_ptr(plan.u.q_full.q_nope.data()),
++                    SmemLayoutQNoPE{});
++                ku::launch_tma_copy(
++                    tma_params.tma_Q_nope,
++                    gQ_nope,
++                    sQ_nope,
++                    plan.bar_prologue_q_nope,
++                    TMA::CacheHintSm90::EVICT_FIRST);
++            }
+
+             cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
+             cute::prefetch_tma_descriptor(&(tma_params.tensor_map_kv_nope));
+@@ -378,8 +428,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
+                         cutlass::arch::fence_view_async_tmem_load();
+                     }
+                     bf16* output_base = params.out +
+-                        (((static_cast<int64_t>(output_head / kLocalHeads) * params.s_q + s_q_idx) *
+-                          kLocalHeads + output_head % kLocalHeads) * D_V) +
++                        (((static_cast<int64_t>(s_q_idx) * kWorldSize +
++                           output_head / kLocalHeads) * kLocalHeads +
++                          output_head % kLocalHeads) * D_V) +
+                         c*(D_V/2) + (idx_in_warpgroup/64)*(D_V/4) + k*B_EPI;
+                     CUTE_UNROLL
+                     for (int i = 0; i < B_EPI/8; ++i) {
+@@ -798,7 +849,8 @@ void run_fwd_phase1_kernel_impl(const SparseAttnFwdParams& params) {
+         tensor_map_kv_nope
+     };
+     auto kernel = &sparse_attn_fwd_kernel<
+-        D_QK == 576, STORE_STATS, OUTPUT_HEADS, false, decltype(tma_params)>;
++        D_QK == 576, STORE_STATS, OUTPUT_HEADS, false, false,
++        decltype(tma_params)>;
+
+     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+@@ -906,7 +958,108 @@ void run_fwd_phase1_tp4_sharded_output_kernel(
+         shape_O, tma_O,
+         tensor_map_kv_nope};
+     auto kernel = &sparse_attn_fwd_kernel<
+-        false, false, B_H, true, decltype(tma_params)>;
++        false, false, B_H, true, false, decltype(tma_params)>;
++    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
++    KU_CUDA_CHECK(cudaFuncSetAttribute(
++        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    kernel<<<params.s_q, NUM_THREADS, smem_size, params.stream>>>(
++        params, tma_params);
++    KU_CHECK_KERNEL_LAUNCH();
++}
++
++// TP4 peer-Q specialization.  Every producer rank keeps its normalized Q in
++// one symmetric [global_token, 16, 512] buffer.  The destination rank selects
++// its token quarter from all four peer mappings and TMA-loads the four head
++// slices directly into FlashMLA shared memory.  This removes the standalone
++// peer write router and its local receive buffer traffic.
++template<int D_QK>
++void run_fwd_phase1_tp4_peer_q_output_kernel(
++    const SparseAttnFwdParams& params,
++    bf16* q_peer_0,
++    bf16* q_peer_1,
++    bf16* q_peer_2,
++    bf16* q_peer_3,
++    int total_s_q,
++    int token_shard_rank) {
++    KU_ASSERT(params.h_kv == 1);
++    KU_ASSERT(params.topk % B_TOPK == 0);
++    KU_ASSERT(params.h_q == B_H);
++    KU_ASSERT(params.d_qk == D_QK);
++    KU_ASSERT(token_shard_rank >= 0 && token_shard_rank < 4);
++    KU_ASSERT(total_s_q == params.s_q * 4);
++    static_assert(D_QK == 512);
++    constexpr int kLocalHeads = 16;
++    constexpr int kWorldSize = 4;
++    static_assert(kLocalHeads * kWorldSize == B_H);
++
++    const int64_t token_offset =
++        static_cast<int64_t>(token_shard_rank) * params.s_q;
++    const int64_t element_offset =
++        token_offset * kLocalHeads * D_QK;
++    auto shape_Q_nope = make_shape(
++        Int<kLocalHeads>{}, Int<64>{}, Int<D_V / 64>{}, params.s_q);
++    auto stride_Q = make_stride(
++        Int<D_QK>{}, _1{}, Int<64>{}, Int<kLocalHeads * D_QK>{});
++    auto make_peer_q_tma = [&](bf16* q_peer) {
++        return cute::make_tma_copy(
++            SM90_TMA_LOAD{},
++            make_tensor(
++                make_gmem_ptr(q_peer + element_offset),
++                make_layout(shape_Q_nope, stride_Q)),
++            SmemLayoutQNoPEPeerTile{});
++    };
++    auto tma_Q_nope_0 = make_peer_q_tma(q_peer_0);
++    auto tma_Q_nope_1 = make_peer_q_tma(q_peer_1);
++    auto tma_Q_nope_2 = make_peer_q_tma(q_peer_2);
++    auto tma_Q_nope_3 = make_peer_q_tma(q_peer_3);
++
++    auto shape_O = make_shape(params.h_q, params.d_v, params.s_q);
++    auto tma_O = cute::make_tma_copy(
++        SM90_TMA_STORE{},
++        make_tensor(
++            make_gmem_ptr((bf16*)params.out),
++            make_layout(
++                shape_O,
++                make_stride(params.d_v, _1{}, params.h_q * params.d_v))),
++        SmemLayoutOTiles<1>{});
++
++    CUtensorMap tensor_map_kv_nope;
++    {
++        uint64_t size[2] = {D_V, (unsigned long)params.s_kv};
++        uint64_t stride[1] = {params.stride_kv_s_kv * sizeof(bf16)};
++        uint32_t box_size[2] = {64, 1};
++        uint32_t elem_stride[2] = {1, 1};
++        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(
++            cuTensorMapEncodeTiled)(
++                &tensor_map_kv_nope,
++                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
++                2,
++                params.kv,
++                size,
++                stride,
++                box_size,
++                elem_stride,
++                CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
++                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
++                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
++                CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
++        KU_ASSERT(res == CUresult::CUDA_SUCCESS);
++    }
++
++    Tp4PeerQTmaParams<
++        decltype(shape_Q_nope), decltype(tma_Q_nope_0),
++        decltype(shape_O), decltype(tma_O)>
++    tma_params = {
++        shape_Q_nope,
++        tma_Q_nope_0,
++        tma_Q_nope_1,
++        tma_Q_nope_2,
++        tma_Q_nope_3,
++        shape_O,
++        tma_O,
++        tensor_map_kv_nope};
++    auto kernel = &sparse_attn_fwd_kernel<
++        false, false, B_H, true, true, decltype(tma_params)>;
+     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+     KU_CUDA_CHECK(cudaFuncSetAttribute(
+         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
