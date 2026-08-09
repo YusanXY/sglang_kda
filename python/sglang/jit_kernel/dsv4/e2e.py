@@ -99,7 +99,7 @@ def mhc_post_vec8(
 def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
     args = make_cpp_args(use_pdl)
     return load_jit(
-        make_name("tp4_moe_mhc_post_hc4_h4096_cpasync2_v38a"),
+        make_name("tp4_moe_mhc_post_hc4_h4096_owner_v39b"),
         *args,
         cuda_files=["deepseek_v4/tp4_moe_mhc_post.cuh"],
         cuda_wrappers=[
@@ -107,6 +107,14 @@ def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
             (
                 "run_multimem",
                 f"Tp4MoeMhcPostKernel<{args}>::run_multimem",
+            ),
+            (
+                "run_owner_reduce",
+                f"Tp4MoeMhcPostKernel<{args}>::run_owner_reduce",
+            ),
+            (
+                "run_owner_post",
+                f"Tp4MoeMhcPostKernel<{args}>::run_owner_post",
             ),
         ],
         extra_cuda_cflags=["--use_fast_math"],
@@ -167,6 +175,51 @@ def _tp4_moe_mhc_post_multimem_custom_op(
     )
 
 
+@register_custom_op(
+    op_name="dsv4_tp4_moe_owner_reduce",
+    mutates_args=["local_output"],
+)
+def _tp4_moe_owner_reduce_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    local_output: torch.Tensor,
+    owner_rank: int,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_owner_reduce(
+        input0, input1, input2, input3, local_output, owner_rank
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_moe_owner_mhc_post",
+    mutates_args=["output"],
+)
+def _tp4_moe_owner_mhc_post_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_owner_post(
+        input0,
+        input1,
+        input2,
+        input3,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+
+
 @debug_kernel_api
 def tp4_moe_mhc_post(
     partials: Tuple[
@@ -218,6 +271,82 @@ def tp4_moe_mhc_post(
         post_mix,
         comb_mix,
         output,
+    )
+    return output
+
+
+@debug_kernel_api
+def tp4_moe_owner_reduce(
+    partials: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    local_output: torch.Tensor,
+    owner_rank: int,
+) -> torch.Tensor:
+    """Reduce one rank-owned token quarter in-place in symmetric storage."""
+
+    if len(partials) != 4 or owner_rank not in range(4):
+        raise RuntimeError("TP4 owner reduction requires four partials and rank 0..3")
+    m = partials[0].shape[0]
+    expected_shape = (m, 4096)
+    if m not in (65536, 131072):
+        raise RuntimeError("TP4 owner reduction requires M=65536 or M=131072")
+    device = partials[0].device
+    for tensor in (*partials, local_output):
+        if (
+            tensor.shape != expected_shape
+            or tensor.dtype != torch.bfloat16
+            or tensor.device != device
+            or device.type != "cuda"
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"invalid TP4 owner reduction tensor, expected {expected_shape}"
+            )
+    _tp4_moe_owner_reduce_custom_op(*partials, local_output, owner_rank)
+    return local_output
+
+
+@debug_kernel_api
+def tp4_moe_owner_mhc_post(
+    owners: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Read each reduced token from its owner and apply mHC post locally."""
+
+    if len(owners) != 4:
+        raise RuntimeError("TP4 owner mHC post requires four owner buffers")
+    m = residual.shape[0]
+    expected = (
+        *((tensor, (m, 4096), torch.bfloat16) for tensor in owners),
+        (residual, (m, 4, 4096), torch.bfloat16),
+        (post_mix, (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (output, (m, 4, 4096), torch.bfloat16),
+    )
+    device = residual.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or tensor.device != device
+            or device.type != "cuda"
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(f"invalid TP4 owner mHC tensor, expected {shape} {dtype}")
+    _tp4_moe_owner_mhc_post_custom_op(
+        *owners, residual, post_mix, comb_mix, output
     )
     return output
 
@@ -1366,6 +1495,8 @@ __all__ = [
     "tp4_direct_push_bf16_gather",
     "tp4_fused_reduce_push_bf16_gather",
     "tp4_moe_mhc_post",
+    "tp4_moe_owner_mhc_post",
+    "tp4_moe_owner_reduce",
     "tp4_moe_mhc_post_multimem",
     "tp4_nccl_ring_bf16_reduce",
     "tp4_peer_pull_wo_b_input_ue8m0",

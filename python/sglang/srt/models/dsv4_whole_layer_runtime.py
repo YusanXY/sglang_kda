@@ -1779,6 +1779,9 @@ def _execute_common(
     descriptor.attention_q_handle.barrier(channel=barrier_channel)
     hidden_states = _huge_tp4_moe_mhc_post(
         partials=moe_partials,
+        owner_rank=descriptor.attention_q_rank,
+        symmetric_handle=descriptor.attention_q_handle,
+        barrier_channel=barrier_channel,
         residual=residual,
         post=post,
         comb=comb,
@@ -1912,16 +1915,27 @@ def _huge_mhc_post(
 def _huge_tp4_moe_mhc_post(
     *,
     partials: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    owner_rank: int,
+    symmetric_handle: Any,
+    barrier_channel: int,
     residual: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Reduce TP4 MoE partials and consume them in mHC post on the GPU."""
+    """Owner-reduce TP4 MoE partials and consume them without replication."""
 
-    from sglang.jit_kernel.dsv4.e2e import tp4_moe_mhc_post
+    from sglang.jit_kernel.dsv4.e2e import (
+        tp4_moe_owner_mhc_post,
+        tp4_moe_owner_reduce,
+    )
 
-    return tp4_moe_mhc_post(partials, residual, post, comb, output)
+    tp4_moe_owner_reduce(partials, partials[owner_rank], owner_rank)
+    # Publish the four disjoint reduced token quarters.  This is the only new
+    # hard boundary versus the previous direct four-peer kernel; all owner
+    # routing and mHC math remain device-side.
+    symmetric_handle.barrier(channel=barrier_channel)
+    return tp4_moe_owner_mhc_post(partials, residual, post, comb, output)
 
 
 def _execute_c0(

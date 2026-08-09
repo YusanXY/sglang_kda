@@ -261,6 +261,166 @@ __global__ void tp4_moe_mhc_post_kernel(
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// Two-stage owner protocol for the strict no-Graph TP4 prefill buckets.
+// Stage 1 assigns one contiguous token quarter to every rank.  A rank reads
+// that quarter from all four MoE partial buffers and overwrites only the same
+// quarter in its local symmetric buffer with the exact NCCL-ordered result.
+// The four owner quarters are disjoint, so this in-place write cannot clobber
+// data another rank still needs.  Stage 2 reads every token from its owner and
+// immediately applies mHC post without materializing a replicated [M,H]
+// all-reduce result.
+template <bool kUsePDL>
+__global__ void tp4_moe_owner_reduce_kernel(
+    const __nv_bfloat16* __restrict__ input0,
+    const __nv_bfloat16* __restrict__ input1,
+    const __nv_bfloat16* __restrict__ input2,
+    const __nv_bfloat16* __restrict__ input3,
+    __nv_bfloat16* __restrict__ local_output,
+    uint64_t owner_first,
+    uint64_t owner_elements) {
+  device::PDLWaitPrimary<kUsePDL>();
+  constexpr uint32_t kPairsPerVector = kTp4MoeMhcVec / 2;
+  const uint64_t vector_index =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const uint64_t num_vectors = owner_elements / kTp4MoeMhcVec;
+  const uint64_t vector_stride =
+      static_cast<uint64_t>(gridDim.x) * blockDim.x;
+  for (uint64_t vector = vector_index; vector < num_vectors;
+       vector += vector_stride) {
+    const uint64_t element = owner_first + vector * kTp4MoeMhcVec;
+    const uint4 input0_raw =
+        *reinterpret_cast<const uint4*>(input0 + element);
+    const uint4 input1_raw =
+        *reinterpret_cast<const uint4*>(input1 + element);
+    const uint4 input2_raw =
+        *reinterpret_cast<const uint4*>(input2 + element);
+    const uint4 input3_raw =
+        *reinterpret_cast<const uint4*>(input3 + element);
+    uint4 reduced_raw;
+    const auto* input0_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input0_raw);
+    const auto* input1_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input1_raw);
+    const auto* input2_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input2_raw);
+    const auto* input3_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input3_raw);
+    auto* reduced_pairs = reinterpret_cast<__nv_bfloat162*>(&reduced_raw);
+    const uint32_t group = static_cast<uint32_t>(
+        (element % kNCCLPeriodElements) / kNCCLChannelGroupElements);
+#pragma unroll
+    for (uint32_t pair = 0; pair < kPairsPerVector; ++pair) {
+      reduced_pairs[pair] = tp4_moe_mhc_add4_ordered(
+          input0_pairs[pair],
+          input1_pairs[pair],
+          input2_pairs[pair],
+          input3_pairs[pair],
+          group);
+    }
+    *reinterpret_cast<uint4*>(local_output + element) = reduced_raw;
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+template <bool kUsePDL>
+__global__ void tp4_moe_owner_mhc_post_kernel(
+    const Tp4MoeMhcPostParams __grid_constant__ params) {
+  device::PDLWaitPrimary<kUsePDL>();
+  const uint32_t token = blockIdx.x;
+  const uint32_t tid = threadIdx.x;
+  __shared__ float coefficients[
+      kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
+  if (tid < kTp4MoeMhcHC) {
+    coefficients[tid] = params.post_mix[token * kTp4MoeMhcHC + tid];
+  }
+  if (tid < kTp4MoeMhcHC * kTp4MoeMhcHC) {
+    coefficients[kTp4MoeMhcHC + tid] =
+        params.comb_mix[
+            token * kTp4MoeMhcHC * kTp4MoeMhcHC + tid];
+  }
+  __syncthreads();
+
+  const uint32_t owner_tokens = params.num_tokens / 4;
+  const uint32_t owner = token / owner_tokens;
+  const __nv_bfloat16* owner_input = params.input0;
+  if (owner == 1) {
+    owner_input = params.input1;
+  } else if (owner == 2) {
+    owner_input = params.input2;
+  } else if (owner == 3) {
+    owner_input = params.input3;
+  }
+  constexpr uint32_t kChunksPerToken =
+      kTp4MoeMhcHidden / kTp4MoeMhcVec;
+  const uint64_t hidden_base =
+      static_cast<uint64_t>(token) * kTp4MoeMhcHidden;
+  const uint64_t residual_base =
+      static_cast<uint64_t>(token) * kTp4MoeMhcHC * kTp4MoeMhcHidden;
+  auto* output_chunks = reinterpret_cast<uint4*>(
+      params.output + residual_base);
+
+  for (uint32_t chunk = tid; chunk < kChunksPerToken;
+       chunk += kTp4MoeMhcThreads) {
+    const uint4 hidden_raw = *reinterpret_cast<const uint4*>(
+        owner_input + hidden_base +
+        static_cast<uint64_t>(chunk) * kTp4MoeMhcVec);
+    const auto* hidden_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&hidden_raw);
+    float2 hidden_values[kTp4MoeMhcVec / 2];
+#pragma unroll
+    for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+      hidden_values[pair] = __bfloat1622float2(hidden_pairs[pair]);
+    }
+
+    float2 residual_values[kTp4MoeMhcHC][kTp4MoeMhcVec / 2];
+#pragma unroll
+    for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+         ++input_route) {
+      const auto* route_chunks = reinterpret_cast<const uint4*>(
+          params.residual + residual_base +
+          static_cast<uint64_t>(input_route) * kTp4MoeMhcHidden);
+      const uint4 residual_raw = route_chunks[chunk];
+      residual_values[input_route][0] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.x));
+      residual_values[input_route][1] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.y));
+      residual_values[input_route][2] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.z));
+      residual_values[input_route][3] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.w));
+    }
+
+#pragma unroll
+    for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
+         ++output_route) {
+      __nv_bfloat162 rounded[kTp4MoeMhcVec / 2];
+#pragma unroll
+      for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+        float2 value = make_float2(
+            coefficients[output_route] * hidden_values[pair].x,
+            coefficients[output_route] * hidden_values[pair].y);
+#pragma unroll
+        for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+             ++input_route) {
+          value = tp4_moe_mhc_fma2(
+              coefficients[
+                  kTp4MoeMhcHC +
+                  input_route * kTp4MoeMhcHC + output_route],
+              residual_values[input_route][pair],
+              value);
+        }
+        rounded[pair] = __float22bfloat162_rn(value);
+      }
+      output_chunks[output_route * kChunksPerToken + chunk] = make_uint4(
+          tp4_moe_mhc_bf16x2_to_uint(rounded[0]),
+          tp4_moe_mhc_bf16x2_to_uint(rounded[1]),
+          tp4_moe_mhc_bf16x2_to_uint(rounded[2]),
+          tp4_moe_mhc_bf16x2_to_uint(rounded[3]));
+    }
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template <bool kUsePDL>
 struct Tp4MoeMhcPostKernel {
   static void run(
@@ -399,6 +559,113 @@ struct Tp4MoeMhcPostKernel {
     LaunchKernel(M.unwrap(), kTp4MoeMhcThreads, device.unwrap())
         .enable_pdl(kUsePDL)(
             tp4_moe_mhc_post_kernel<kUsePDL, true>, params);
+  }
+
+  static void run_owner_reduce(
+      const tvm::ffi::TensorView input0,
+      const tvm::ffi::TensorView input1,
+      const tvm::ffi::TensorView input2,
+      const tvm::ffi::TensorView input3,
+      const tvm::ffi::TensorView local_output,
+      int64_t owner_rank) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto M = SymbolicSize{"num_tokens"};
+    device.set_options<kDLCUDA>();
+    for (const auto tensor : {input0, input1, input2, input3, local_output}) {
+      TensorMatcher({M, kTp4MoeMhcHidden})
+          .with_strides({kTp4MoeMhcHidden, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .verify(tensor);
+    }
+    RuntimeCheck(
+        M.unwrap() == 65536 || M.unwrap() == 131072,
+        "TP4 owner reduction only supports M=65536 or M=131072");
+    RuntimeCheck(
+        owner_rank >= 0 && owner_rank < 4,
+        "TP4 owner reduction requires owner_rank in [0,4)");
+    const uint64_t owner_elements =
+        static_cast<uint64_t>(M.unwrap() / 4) * kTp4MoeMhcHidden;
+    const uint64_t owner_first = owner_rank * owner_elements;
+    // A grid-stride loop keeps enough CTAs resident to saturate the NVLink
+    // reads without paying scheduler overhead for one CTA per 4 KiB.  These
+    // are the same empirically stable CTA counts used by the strict Huge
+    // attention owner-gather path for 16K/32K owner-token shards.
+    const uint32_t blocks = M.unwrap() == 65536 ? 8192 : 16384;
+    LaunchKernel(blocks, kTp4MoeMhcThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_moe_owner_reduce_kernel<kUsePDL>,
+            reinterpret_cast<const __nv_bfloat16*>(input0.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(input1.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(input2.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(input3.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(local_output.data_ptr()),
+            owner_first,
+            owner_elements);
+  }
+
+  static void run_owner_post(
+      const tvm::ffi::TensorView input0,
+      const tvm::ffi::TensorView input1,
+      const tvm::ffi::TensorView input2,
+      const tvm::ffi::TensorView input3,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView post_mix,
+      const tvm::ffi::TensorView comb_mix,
+      const tvm::ffi::TensorView output) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto M = SymbolicSize{"num_tokens"};
+    device.set_options<kDLCUDA>();
+    for (const auto tensor : {input0, input1, input2, input3}) {
+      TensorMatcher({M, kTp4MoeMhcHidden})
+          .with_strides({kTp4MoeMhcHidden, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .verify(tensor);
+    }
+    TensorMatcher({M, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(residual);
+    TensorMatcher({M, kTp4MoeMhcHC})
+        .with_strides({kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(post_mix);
+    TensorMatcher({M, kTp4MoeMhcHC, kTp4MoeMhcHC})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHC, kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(comb_mix);
+    TensorMatcher({M, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+    RuntimeCheck(
+        M.unwrap() == 65536 || M.unwrap() == 131072,
+        "TP4 owner mHC post only supports M=65536 or M=131072");
+    const auto params = Tp4MoeMhcPostParams{
+        .input0 = reinterpret_cast<const __nv_bfloat16*>(input0.data_ptr()),
+        .input1 = reinterpret_cast<const __nv_bfloat16*>(input1.data_ptr()),
+        .input2 = reinterpret_cast<const __nv_bfloat16*>(input2.data_ptr()),
+        .input3 = reinterpret_cast<const __nv_bfloat16*>(input3.data_ptr()),
+        .multicast_input = nullptr,
+        .residual = reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        .post_mix = static_cast<const float*>(post_mix.data_ptr()),
+        .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
+        .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .num_tokens = static_cast<uint32_t>(M.unwrap()),
+    };
+    LaunchKernel(M.unwrap(), kTp4MoeMhcThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_moe_owner_mhc_post_kernel<kUsePDL>, params);
   }
 };
 
