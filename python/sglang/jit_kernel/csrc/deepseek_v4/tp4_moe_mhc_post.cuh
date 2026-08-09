@@ -147,6 +147,17 @@ SGL_DEVICE void tp4_moe_mhc_store_release_sys(
       : "memory");
 }
 
+SGL_DEVICE uint32_t tp4_moe_mhc_atomic_add_release_sys(
+    uint32_t* ptr, const uint32_t value) {
+  uint32_t previous;
+  asm volatile(
+      "atom.release.sys.global.add.u32 %0, [%1], %2;"
+      : "=r"(previous)
+      : "l"(ptr), "r"(value)
+      : "memory");
+  return previous;
+}
+
 template <int kPending>
 SGL_DEVICE void tp4_moe_mhc_cp_async_wait() {
   asm volatile("cp.async.wait_group %0;\n" : : "n"(kPending));
@@ -484,9 +495,14 @@ void tp4_moe_owner_persistent_kernel(
   device::PDLWaitPrimary<kUsePDL>();
   const uint32_t tid = threadIdx.x;
   const uint32_t owner_rank = params.owner_rank;
-  uint32_t* peer_flags[4] = {
-      params.flags0, params.flags1, params.flags2, params.flags3};
-  uint32_t* local_flags = peer_flags[owner_rank];
+  uint32_t* local_flags = params.flags0;
+  if (owner_rank == 1) {
+    local_flags = params.flags1;
+  } else if (owner_rank == 2) {
+    local_flags = params.flags2;
+  } else if (owner_rank == 3) {
+    local_flags = params.flags3;
+  }
 
   // Every block samples the previous epoch before any block can publish the
   // next one: publication requires all resident blocks to reach the arrival
@@ -495,13 +511,15 @@ void tp4_moe_owner_persistent_kernel(
       local_flags + kTp4OwnerFlagProducedEpoch);
   const uint32_t next_epoch = previous_epoch + 1;
 
-  const __nv_bfloat16* inputs[4] = {
-      params.post.input0,
-      params.post.input1,
-      params.post.input2,
-      params.post.input3};
-  __nv_bfloat16* local_output = const_cast<__nv_bfloat16*>(
-      inputs[owner_rank]);
+  __nv_bfloat16* local_output =
+      const_cast<__nv_bfloat16*>(params.post.input0);
+  if (owner_rank == 1) {
+    local_output = const_cast<__nv_bfloat16*>(params.post.input1);
+  } else if (owner_rank == 2) {
+    local_output = const_cast<__nv_bfloat16*>(params.post.input2);
+  } else if (owner_rank == 3) {
+    local_output = const_cast<__nv_bfloat16*>(params.post.input3);
+  }
   const uint64_t owner_elements =
       static_cast<uint64_t>(params.post.num_tokens / 4) *
       kTp4MoeMhcHidden;
@@ -549,13 +567,14 @@ void tp4_moe_owner_persistent_kernel(
     *reinterpret_cast<uint4*>(local_output + element) = reduced_raw;
   }
 
-  // The resident-grid barrier also performs a system-scope publication of
-  // every block's owner-quarter writes.  The final arriving block advances
-  // the epoch only after all blocks have fenced their stores.
+  // A release-system arrival atomically publishes each block's owner-quarter
+  // writes while incrementing the resident-grid counter.  This replaces the
+  // much more expensive threadfence_system + device-scope atomic pair on every
+  // CTA.  The last arriving block advances the epoch after all release atoms
+  // are globally ordered.
   __syncthreads();
   if (tid == 0) {
-    __threadfence_system();
-    const uint32_t ticket = atomicAdd(
+    const uint32_t ticket = tp4_moe_mhc_atomic_add_release_sys(
         local_flags + kTp4OwnerFlagArrived, 1U);
     if (ticket + 1 == gridDim.x) {
       atomicExch(local_flags + kTp4OwnerFlagArrived, 0U);
@@ -564,24 +583,28 @@ void tp4_moe_owner_persistent_kernel(
     }
   }
   __syncthreads();
-  while (tp4_moe_mhc_load_acquire_sys(
-             local_flags + kTp4OwnerFlagProducedEpoch) != next_epoch) {
-    __nanosleep(64);
+  if (tid == 0) {
+    while (tp4_moe_mhc_load_acquire_sys(
+               local_flags + kTp4OwnerFlagProducedEpoch) != next_epoch) {
+      __nanosleep(64);
+    }
   }
+  __syncthreads();
 
   // One CTA polls the four peer epochs.  It releases the local grid with a
   // second system-scope flag, keeping the cross-rank control loop on GPU.
   if (blockIdx.x == 0 && tid == 0) {
     bool ready = false;
     while (!ready) {
-      ready = true;
-#pragma unroll
-      for (uint32_t peer = 0; peer < 4; ++peer) {
-        ready = ready &&
-            tp4_moe_mhc_load_acquire_sys(
-                peer_flags[peer] + kTp4OwnerFlagProducedEpoch) ==
-                next_epoch;
-      }
+      ready =
+          tp4_moe_mhc_load_acquire_sys(
+              params.flags0 + kTp4OwnerFlagProducedEpoch) == next_epoch &&
+          tp4_moe_mhc_load_acquire_sys(
+              params.flags1 + kTp4OwnerFlagProducedEpoch) == next_epoch &&
+          tp4_moe_mhc_load_acquire_sys(
+              params.flags2 + kTp4OwnerFlagProducedEpoch) == next_epoch &&
+          tp4_moe_mhc_load_acquire_sys(
+              params.flags3 + kTp4OwnerFlagProducedEpoch) == next_epoch;
       if (!ready) {
         __nanosleep(128);
       }
@@ -590,9 +613,11 @@ void tp4_moe_owner_persistent_kernel(
         local_flags + kTp4OwnerFlagPeerReadyEpoch, next_epoch);
   }
   __syncthreads();
-  while (tp4_moe_mhc_load_acquire_sys(
-             local_flags + kTp4OwnerFlagPeerReadyEpoch) != next_epoch) {
-    __nanosleep(64);
+  if (tid == 0) {
+    while (tp4_moe_mhc_load_acquire_sys(
+               local_flags + kTp4OwnerFlagPeerReadyEpoch) != next_epoch) {
+      __nanosleep(64);
+    }
   }
   __syncthreads();
 
@@ -601,8 +626,20 @@ void tp4_moe_owner_persistent_kernel(
   constexpr uint32_t kChunksPerToken =
       kTp4MoeMhcHidden / kTp4MoeMhcVec;
   const uint32_t owner_tokens = params.post.num_tokens / 4;
-  for (uint32_t token = blockIdx.x; token < params.post.num_tokens;
-       token += gridDim.x) {
+  const uint32_t post_owner = blockIdx.x & 3;
+  const uint32_t owner_block = blockIdx.x >> 2;
+  const uint32_t owner_block_stride = gridDim.x >> 2;
+  const uint32_t owner_token_end = (post_owner + 1) * owner_tokens;
+  const __nv_bfloat16* owner_input = params.post.input0;
+  if (post_owner == 1) {
+    owner_input = params.post.input1;
+  } else if (post_owner == 2) {
+    owner_input = params.post.input2;
+  } else if (post_owner == 3) {
+    owner_input = params.post.input3;
+  }
+  for (uint32_t token = post_owner * owner_tokens + owner_block;
+       token < owner_token_end; token += owner_block_stride) {
     if (tid < kTp4MoeMhcHC) {
       coefficients[tid] =
           params.post.post_mix[token * kTp4MoeMhcHC + tid];
@@ -614,8 +651,6 @@ void tp4_moe_owner_persistent_kernel(
     }
     __syncthreads();
 
-    const uint32_t token_owner = token / owner_tokens;
-    const __nv_bfloat16* owner_input = inputs[token_owner];
     const uint64_t hidden_base =
         static_cast<uint64_t>(token) * kTp4MoeMhcHidden;
     const uint64_t residual_base =
