@@ -19,6 +19,9 @@ constexpr uint32_t kMhcPostHC = 4;
 constexpr uint32_t kMhcPostHidden = 4096;
 constexpr uint32_t kMhcPostVec = 8;
 constexpr uint32_t kMhcPostThreads = 256;
+constexpr uint32_t kMhcPostTokensPerReadyGroup = 2;
+constexpr uint32_t kMhcPostMaxReadyGroups =
+    131072 / kMhcPostTokensPerReadyGroup;
 
 struct MhcPostVec8Params {
   const __nv_bfloat16* __restrict__ hidden_in;
@@ -26,8 +29,20 @@ struct MhcPostVec8Params {
   const float* __restrict__ post_mix;
   const float* __restrict__ comb_mix;
   __nv_bfloat16* __restrict__ output;
+  const uint32_t* __restrict__ ready_flags;
+  uint32_t ready_epoch;
   uint32_t num_tokens;
 };
+
+SGL_DEVICE uint32_t mhc_post_load_acquire_sys(const uint32_t* pointer) {
+  uint32_t value;
+  asm volatile(
+      "ld.acquire.sys.global.u32 %0, [%1];"
+      : "=r"(value)
+      : "l"(pointer)
+      : "memory");
+  return value;
+}
 
 union MhcPostBf16PairBits {
   uint32_t raw;
@@ -60,6 +75,16 @@ __global__ void mhc_post_vec8_kernel(
 
   const uint32_t token = blockIdx.x;
   const uint32_t tid = threadIdx.x;
+  if (params.ready_flags != nullptr) {
+    if (tid == 0) {
+      const uint32_t group = token / kMhcPostTokensPerReadyGroup;
+      while (mhc_post_load_acquire_sys(params.ready_flags + group) !=
+             params.ready_epoch) {
+        __nanosleep(128);
+      }
+    }
+    __syncthreads();
+  }
   __shared__ float coefficients[kMhcPostHC + kMhcPostHC * kMhcPostHC];
   if (tid < kMhcPostHC) {
     coefficients[tid] = params.post_mix[token * kMhcPostHC + tid];
@@ -184,6 +209,71 @@ struct MhcPostVec8Kernel {
         .post_mix = static_cast<const float*>(post_mix.data_ptr()),
         .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
         .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .ready_flags = nullptr,
+        .ready_epoch = 0,
+        .num_tokens = static_cast<uint32_t>(M.unwrap()),
+    };
+    LaunchKernel(M.unwrap(), kMhcPostThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(mhc_post_vec8_kernel<kUsePDL>, params);
+  }
+
+  static void run_ready(
+      const tvm::ffi::TensorView hidden_in,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView post_mix,
+      const tvm::ffi::TensorView comb_mix,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView ready_flags,
+      int64_t ready_epoch) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto M = SymbolicSize{"num_tokens"};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, kMhcPostHidden})
+        .with_strides({kMhcPostHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(hidden_in);
+    TensorMatcher({M, kMhcPostHC, kMhcPostHidden})
+        .with_strides({kMhcPostHC * kMhcPostHidden, kMhcPostHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(residual);
+    TensorMatcher({M, kMhcPostHC})
+        .with_strides({kMhcPostHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(post_mix);
+    TensorMatcher({M, kMhcPostHC, kMhcPostHC})
+        .with_strides({kMhcPostHC * kMhcPostHC, kMhcPostHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(comb_mix);
+    TensorMatcher({M, kMhcPostHC, kMhcPostHidden})
+        .with_strides({kMhcPostHC * kMhcPostHidden, kMhcPostHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+    TensorMatcher({kMhcPostMaxReadyGroups})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(ready_flags);
+    RuntimeCheck(
+        M.unwrap() == 65536 || M.unwrap() == 131072,
+        "ready-aware mHC post only supports M=65536/131072");
+    RuntimeCheck(
+        ready_epoch > 0 && ready_epoch <= UINT32_MAX,
+        "invalid mHC post ready epoch");
+
+    const auto params = MhcPostVec8Params{
+        .hidden_in = reinterpret_cast<const __nv_bfloat16*>(hidden_in.data_ptr()),
+        .residual = reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        .post_mix = static_cast<const float*>(post_mix.data_ptr()),
+        .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
+        .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .ready_flags = static_cast<const uint32_t*>(ready_flags.data_ptr()),
+        .ready_epoch = static_cast<uint32_t>(ready_epoch),
         .num_tokens = static_cast<uint32_t>(M.unwrap()),
     };
     LaunchKernel(M.unwrap(), kMhcPostThreads, device.unwrap())

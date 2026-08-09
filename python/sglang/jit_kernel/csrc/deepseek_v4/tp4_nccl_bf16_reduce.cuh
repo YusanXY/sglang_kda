@@ -24,6 +24,26 @@ namespace {
 constexpr int64_t kNCCLChannelGroupElements = 1LL << 20;  // 2 MiB BF16
 constexpr int64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 constexpr int kElementsPerThread = 8;
+constexpr int kTokensPerReadyGroup = 2;
+constexpr int64_t kMaxReadyGroups = 131072 / kTokensPerReadyGroup;
+
+SGL_DEVICE uint32_t load_acquire_sys(const uint32_t* pointer) {
+  uint32_t value;
+  asm volatile(
+      "ld.acquire.sys.global.u32 %0, [%1];"
+      : "=r"(value)
+      : "l"(pointer)
+      : "memory");
+  return value;
+}
+
+SGL_DEVICE void store_release_sys(uint32_t* pointer, uint32_t value) {
+  asm volatile(
+      "st.release.sys.global.u32 [%0], %1;" ::
+          "l"(pointer),
+          "r"(value)
+      : "memory");
+}
 
 template <typename T>
 SGL_DEVICE __nv_bfloat162 load_pair(const T* pointer) {
@@ -182,6 +202,102 @@ __global__ void tp4_fused_reduce_push_bf16_gather_kernel(
     output1[copy_index] = reduced;
     output2[copy_index] = reduced;
     output3[copy_index] = reduced;
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+// Token-group specialization for the no-Graph Req16/Req128 path.  One CTA
+// owns two complete tokens, so it can publish a system-scope ready epoch only
+// after every BF16 value for that group has reached all four destination
+// buffers.  The following mHC-post kernel consumes these epochs directly on
+// GPU, replacing the process-wide symmetric-memory barrier with fine-grained
+// producer/consumer pipelining and no extra launch.
+template <typename T, bool kUsePDL>
+__global__ void tp4_fused_reduce_push_bf16_gather_ready_kernel(
+    const T* __restrict__ input0,
+    const T* __restrict__ input1,
+    const T* __restrict__ input2,
+    const T* __restrict__ input3,
+    T* __restrict__ destination0,
+    T* __restrict__ destination1,
+    T* __restrict__ destination2,
+    T* __restrict__ destination3,
+    uint32_t* __restrict__ ready0,
+    uint32_t* __restrict__ ready1,
+    uint32_t* __restrict__ ready2,
+    uint32_t* __restrict__ ready3,
+    int64_t owner_tokens,
+    int64_t output_element_offset,
+    int64_t output_group_offset,
+    uint32_t ready_epoch) {
+  static_assert(sizeof(T) == sizeof(__nv_bfloat16));
+  device::PDLWaitPrimary<kUsePDL>();
+  using Copy = int4;
+  constexpr int kElementsPerCopy = sizeof(Copy) / sizeof(T);
+  constexpr int kPairsPerCopy = kElementsPerCopy / 2;
+  constexpr int kCopiesPerToken = 4096 / kElementsPerCopy;
+  constexpr int kCopyRounds = kCopiesPerToken / 256;
+  static_assert(kCopiesPerToken % 256 == 0);
+
+  const int64_t owner_group = blockIdx.x;
+  const int64_t owner_token_first =
+      owner_group * kTokensPerReadyGroup;
+  const int64_t output_copy_offset =
+      output_element_offset / kElementsPerCopy;
+  const Copy* source0 = reinterpret_cast<const Copy*>(input0);
+  const Copy* source1 = reinterpret_cast<const Copy*>(input1);
+  const Copy* source2 = reinterpret_cast<const Copy*>(input2);
+  const Copy* source3 = reinterpret_cast<const Copy*>(input3);
+  Copy* output0 = reinterpret_cast<Copy*>(destination0) + output_copy_offset;
+  Copy* output1 = reinterpret_cast<Copy*>(destination1) + output_copy_offset;
+  Copy* output2 = reinterpret_cast<Copy*>(destination2) + output_copy_offset;
+  Copy* output3 = reinterpret_cast<Copy*>(destination3) + output_copy_offset;
+
+#pragma unroll
+  for (int token_in_group = 0; token_in_group < kTokensPerReadyGroup;
+       ++token_in_group) {
+    const int64_t owner_token = owner_token_first + token_in_group;
+#pragma unroll
+    for (int round = 0; round < kCopyRounds; ++round) {
+      const int64_t copy_in_token = threadIdx.x + round * blockDim.x;
+      const int64_t copy_index =
+          owner_token * kCopiesPerToken + copy_in_token;
+      const Copy a = source0[copy_index];
+      const Copy b = source1[copy_index];
+      const Copy c = source2[copy_index];
+      const Copy d = source3[copy_index];
+      Copy reduced;
+      const auto* a_pairs = reinterpret_cast<const __nv_bfloat162*>(&a);
+      const auto* b_pairs = reinterpret_cast<const __nv_bfloat162*>(&b);
+      const auto* c_pairs = reinterpret_cast<const __nv_bfloat162*>(&c);
+      const auto* d_pairs = reinterpret_cast<const __nv_bfloat162*>(&d);
+      auto* reduced_pairs = reinterpret_cast<__nv_bfloat162*>(&reduced);
+      const int group = static_cast<int>(
+          ((copy_index * kElementsPerCopy) % kNCCLPeriodElements) /
+          kNCCLChannelGroupElements);
+#pragma unroll
+      for (int pair = 0; pair < kPairsPerCopy; ++pair) {
+        reduced_pairs[pair] = add4_ordered(
+            a_pairs[pair], b_pairs[pair], c_pairs[pair], d_pairs[pair], group);
+      }
+      output0[copy_index] = reduced;
+      output1[copy_index] = reduced;
+      output2[copy_index] = reduced;
+      output3[copy_index] = reduced;
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    // The block barrier establishes happens-before from every writer to the
+    // leader; the system fence plus release stores publish the completed token
+    // group to consumers on all four GPUs.
+    __threadfence_system();
+    const int64_t global_group = output_group_offset + owner_group;
+    store_release_sys(ready0 + global_group, ready_epoch);
+    store_release_sys(ready1 + global_group, ready_epoch);
+    store_release_sys(ready2 + global_group, ready_epoch);
+    store_release_sys(ready3 + global_group, ready_epoch);
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -378,6 +494,68 @@ struct TP4NcclRingBF16ReduceKernel {
             static_cast<T*>(peer3.data_ptr()),
             num_elements,
             source_rank * num_elements);
+  }
+
+  static void fused_reduce_push_gather_ready(
+      tvm::ffi::TensorView input0,
+      tvm::ffi::TensorView input1,
+      tvm::ffi::TensorView input2,
+      tvm::ffi::TensorView input3,
+      tvm::ffi::TensorView peer0,
+      tvm::ffi::TensorView peer1,
+      tvm::ffi::TensorView peer2,
+      tvm::ffi::TensorView peer3,
+      tvm::ffi::TensorView ready0,
+      tvm::ffi::TensorView ready1,
+      tvm::ffi::TensorView ready2,
+      tvm::ffi::TensorView ready3,
+      int64_t source_rank,
+      int64_t ready_epoch) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    auto M = SymbolicSize{"owner_tokens"};
+    constexpr int64_t kHidden = 4096;
+    constexpr int64_t kMaxTokens = 131072;
+    TensorMatcher({M, kHidden}).with_dtype<T>().with_device(device).verify(input0);
+    TensorMatcher({M, kHidden}).with_dtype<T>().with_device(device).verify(input1);
+    TensorMatcher({M, kHidden}).with_dtype<T>().with_device(device).verify(input2);
+    TensorMatcher({M, kHidden}).with_dtype<T>().with_device(device).verify(input3);
+    TensorMatcher({kMaxTokens, kHidden}).with_dtype<T>().with_device(device).verify(peer0);
+    TensorMatcher({kMaxTokens, kHidden}).with_dtype<T>().with_device(device).verify(peer1);
+    TensorMatcher({kMaxTokens, kHidden}).with_dtype<T>().with_device(device).verify(peer2);
+    TensorMatcher({kMaxTokens, kHidden}).with_dtype<T>().with_device(device).verify(peer3);
+    TensorMatcher({kMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready0);
+    TensorMatcher({kMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready1);
+    TensorMatcher({kMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready2);
+    TensorMatcher({kMaxReadyGroups}).with_dtype<int32_t>().with_device(device).verify(ready3);
+    const int64_t owner_tokens = M.unwrap();
+    RuntimeCheck(
+        owner_tokens == 16384 || owner_tokens == 32768,
+        "TP4 token-ready reduce/gather requires Req16/Req128 owner shards");
+    RuntimeCheck(source_rank >= 0 && source_rank < 4, "invalid TP4 source rank");
+    RuntimeCheck(ready_epoch > 0 && ready_epoch <= UINT32_MAX, "invalid ready epoch");
+    const int64_t owner_groups = owner_tokens / kTokensPerReadyGroup;
+    const int64_t owner_elements = owner_tokens * kHidden;
+    LaunchKernel(dim3(owner_groups), dim3(256), device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_fused_reduce_push_bf16_gather_ready_kernel<T, kUsePDL>,
+            static_cast<const T*>(input0.data_ptr()),
+            static_cast<const T*>(input1.data_ptr()),
+            static_cast<const T*>(input2.data_ptr()),
+            static_cast<const T*>(input3.data_ptr()),
+            static_cast<T*>(peer0.data_ptr()),
+            static_cast<T*>(peer1.data_ptr()),
+            static_cast<T*>(peer2.data_ptr()),
+            static_cast<T*>(peer3.data_ptr()),
+            static_cast<uint32_t*>(ready0.data_ptr()),
+            static_cast<uint32_t*>(ready1.data_ptr()),
+            static_cast<uint32_t*>(ready2.data_ptr()),
+            static_cast<uint32_t*>(ready3.data_ptr()),
+            owner_tokens,
+            source_rank * owner_elements,
+            source_rank * owner_groups,
+            static_cast<uint32_t>(ready_epoch));
   }
 };
 

@@ -29,10 +29,13 @@ _QUANT_GROUP_SIZE = 128
 def _jit_mhc_post_vec8_module(use_pdl: bool) -> Module:
     args = make_cpp_args(use_pdl)
     return load_jit(
-        make_name("mhc_post_vec8_hc4_h4096_v3_occupancy"),
+        make_name("mhc_post_vec8_hc4_h4096_v66_token_ready"),
         *args,
         cuda_files=["deepseek_v4/mhc_post_vec8.cuh"],
-        cuda_wrappers=[("run", f"MhcPostVec8Kernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run", f"MhcPostVec8Kernel<{args}>::run"),
+            ("run_ready", f"MhcPostVec8Kernel<{args}>::run_ready"),
+        ],
         extra_cuda_cflags=["--use_fast_math"],
     )
 
@@ -56,6 +59,31 @@ def _mhc_post_vec8_custom_op(
 ) -> None:
     module = _jit_mhc_post_vec8_module(False)
     module.run(hidden_in, residual, post_mix, comb_mix, output)
+
+
+@register_custom_op(
+    op_name="dsv4_mhc_post_vec8_ready",
+    mutates_args=["output"],
+)
+def _mhc_post_vec8_ready_custom_op(
+    hidden_in: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    ready_flags: torch.Tensor,
+    ready_epoch: int,
+) -> None:
+    module = _jit_mhc_post_vec8_module(False)
+    module.run_ready(
+        hidden_in,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        ready_flags,
+        ready_epoch,
+    )
 
 
 @debug_kernel_api
@@ -92,6 +120,52 @@ def mhc_post_vec8(
                 "all DSV4 mHC post tensors must share one CUDA device"
             )
     _mhc_post_vec8_custom_op(hidden_in, residual, post_mix, comb_mix, output)
+    return output
+
+
+@debug_kernel_api
+def mhc_post_vec8_ready(
+    hidden_in: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    ready_flags: torch.Tensor,
+    ready_epoch: int,
+) -> torch.Tensor:
+    """Apply mHC post as token groups become visible from peer WO_B owners."""
+
+    m = hidden_in.shape[0]
+    if m not in (65536, 131072):
+        raise RuntimeError(f"ready-aware mHC post requires M=65536/131072, got {m}")
+    expected = (
+        (hidden_in, (m, 4096), torch.bfloat16),
+        (residual, (m, 4, 4096), torch.bfloat16),
+        (post_mix, (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (output, (m, 4, 4096), torch.bfloat16),
+        (ready_flags, (65536,), torch.int32),
+    )
+    device = hidden_in.device
+    for tensor, shape, dtype in expected:
+        if tensor.shape != shape or tensor.dtype != dtype or not tensor.is_contiguous():
+            raise RuntimeError(
+                f"invalid ready-aware mHC tensor: expected contiguous {shape} "
+                f"{dtype}, got {tuple(tensor.shape)} {tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError("all ready-aware mHC tensors must share one CUDA device")
+    if not 0 < ready_epoch <= 0xFFFFFFFF:
+        raise RuntimeError(f"invalid ready epoch {ready_epoch}")
+    _mhc_post_vec8_ready_custom_op(
+        hidden_in,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        ready_flags,
+        ready_epoch,
+    )
     return output
 
 
@@ -880,7 +954,7 @@ def inverse_rope_fp8_wo_a_ue8m0(
 def _jit_tp4_nccl_ring_bf16_reduce_module(use_pdl: bool) -> Module:
     args = make_cpp_args(torch.bfloat16, use_pdl)
     return load_jit(
-        make_name("tp4_nccl_ring_bf16_reduce_exact_v3"),
+        make_name("tp4_nccl_ring_bf16_reduce_v66_token_ready"),
         *args,
         cuda_files=["deepseek_v4/tp4_nccl_bf16_reduce.cuh"],
         cuda_wrappers=[
@@ -892,6 +966,10 @@ def _jit_tp4_nccl_ring_bf16_reduce_module(use_pdl: bool) -> Module:
             (
                 "fused_reduce_push_gather",
                 f"TP4NcclRingBF16ReduceKernel<{args}>::fused_reduce_push_gather",
+            ),
+            (
+                "fused_reduce_push_gather_ready",
+                f"TP4NcclRingBF16ReduceKernel<{args}>::fused_reduce_push_gather_ready",
             ),
         ],
     )
@@ -961,6 +1039,54 @@ def _tp4_fused_reduce_push_bf16_gather_custom_op(
         peer2,
         peer3,
         source_rank,
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_fused_reduce_push_bf16_gather_ready",
+    mutates_args=[
+        "peer0",
+        "peer1",
+        "peer2",
+        "peer3",
+        "ready0",
+        "ready1",
+        "ready2",
+        "ready3",
+    ],
+)
+def _tp4_fused_reduce_push_bf16_gather_ready_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    peer0: torch.Tensor,
+    peer1: torch.Tensor,
+    peer2: torch.Tensor,
+    peer3: torch.Tensor,
+    ready0: torch.Tensor,
+    ready1: torch.Tensor,
+    ready2: torch.Tensor,
+    ready3: torch.Tensor,
+    source_rank: int,
+    ready_epoch: int,
+) -> None:
+    module = _jit_tp4_nccl_ring_bf16_reduce_module(is_arch_support_pdl())
+    module.fused_reduce_push_gather_ready(
+        input0,
+        input1,
+        input2,
+        input3,
+        peer0,
+        peer1,
+        peer2,
+        peer3,
+        ready0,
+        ready1,
+        ready2,
+        ready3,
+        source_rank,
+        ready_epoch,
     )
 
 
@@ -1081,6 +1207,57 @@ def tp4_fused_reduce_push_bf16_gather(
             )
     _tp4_fused_reduce_push_bf16_gather_custom_op(
         *partials, *peers, source_rank
+    )
+
+
+@debug_kernel_api
+def tp4_fused_reduce_push_bf16_gather_ready(
+    partials: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    peers: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ready_peers: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    source_rank: int,
+    ready_epoch: int,
+) -> None:
+    """Reduce/push two-token groups and publish peer-visible GPU epochs."""
+
+    if len(partials) != 4 or len(peers) != 4 or len(ready_peers) != 4:
+        raise RuntimeError("TP4 token-ready gather requires four partial/output/flag peers")
+    owner_tokens = partials[0].shape[0]
+    if owner_tokens not in (16384, 32768):
+        raise RuntimeError(
+            f"TP4 token-ready gather requires 16384/32768 owner tokens, got {owner_tokens}"
+        )
+    if source_rank not in range(4) or not 0 < ready_epoch <= 0xFFFFFFFF:
+        raise RuntimeError("TP4 token-ready gather received invalid rank or epoch")
+    device = partials[0].device
+    expected_input_shape = (owner_tokens, 4096)
+    for tensor in partials:
+        if (
+            tensor.shape != expected_input_shape
+            or tensor.dtype != torch.bfloat16
+            or tensor.device != device
+            or device.type != "cuda"
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError("invalid TP4 token-ready WO_B partial")
+    for peer in peers:
+        if (
+            peer.shape != (131072, 4096)
+            or peer.dtype != torch.bfloat16
+            or peer.device != device
+            or not peer.is_contiguous()
+        ):
+            raise RuntimeError("invalid TP4 token-ready output peer")
+    for flags in ready_peers:
+        if (
+            flags.shape != (65536,)
+            or flags.dtype != torch.int32
+            or flags.device != device
+            or not flags.is_contiguous()
+        ):
+            raise RuntimeError("invalid TP4 token-ready flag peer")
+    _tp4_fused_reduce_push_bf16_gather_ready_custom_op(
+        *partials, *peers, *ready_peers, source_rank, ready_epoch
     )
 
 
@@ -1592,12 +1769,14 @@ __all__ = [
     "load_tp4_nccl_ring_bf16_reduce_extension",
     "load_tp4_moe_mhc_post_extension",
     "mhc_post_vec8",
+    "mhc_post_vec8_ready",
     "mhc_pre_norm_mxfp8_quant",
     "tp4_pack_attention_output_ue8m0",
     "tp4_pack_wo_b_input_ue8m0",
     "tp4_direct_push_wo_b_input_ue8m0",
     "tp4_direct_push_bf16_gather",
     "tp4_fused_reduce_push_bf16_gather",
+    "tp4_fused_reduce_push_bf16_gather_ready",
     "tp4_moe_mhc_post",
     "tp4_moe_owner_mhc_post",
     "tp4_moe_owner_persistent",

@@ -1522,6 +1522,7 @@ class MQALayer(MqaAttentionBase):
         if tp4_token_shard_attention and e2e_descriptor.tp4_local_wob:
             from sglang.jit_kernel.dsv4.e2e import (
                 tp4_fused_reduce_push_bf16_gather,
+                tp4_fused_reduce_push_bf16_gather_ready,
                 tp4_nccl_ring_bf16_reduce,
                 tp4_quantize_local_wo_b_input_ue8m0,
             )
@@ -1581,12 +1582,28 @@ class MQALayer(MqaAttentionBase):
                     raise RuntimeError(
                         f"layer {self.layer_id}: incomplete direct output buffers"
                     )
-                tp4_fused_reduce_push_bf16_gather(
+                ready_peers = (
+                    e2e_descriptor.attention_wob_ready_peer0,
+                    e2e_descriptor.attention_wob_ready_peer1,
+                    e2e_descriptor.attention_wob_ready_peer2,
+                    e2e_descriptor.attention_wob_ready_peer3,
+                )
+                if any(flags is None for flags in ready_peers):
+                    raise RuntimeError(
+                        f"layer {self.layer_id}: incomplete token-ready flags"
+                    )
+                ready_epoch = (
+                    e2e_descriptor.attention_wob_ready_epoch_base
+                    + self.layer_id
+                    + 1
+                )
+                tp4_fused_reduce_push_bf16_gather_ready(
                     wo_b_partial_chunks,
                     output_peers,
+                    ready_peers,
                     e2e_descriptor.attention_wob_output_rank,
+                    ready_epoch,
                 )
-                output_handle.barrier(channel=self.layer_id & 1)
             else:
                 tp4_nccl_ring_bf16_reduce(wo_b_partial_chunks, projected_local)
                 get_tp_group().all_gather_into_tensor(

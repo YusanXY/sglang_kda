@@ -131,6 +131,12 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_wob_output_peer1: Optional[torch.Tensor]
     attention_wob_output_peer2: Optional[torch.Tensor]
     attention_wob_output_peer3: Optional[torch.Tensor]
+    attention_wob_ready_local: Optional[torch.Tensor]
+    attention_wob_ready_peer0: Optional[torch.Tensor]
+    attention_wob_ready_peer1: Optional[torch.Tensor]
+    attention_wob_ready_peer2: Optional[torch.Tensor]
+    attention_wob_ready_peer3: Optional[torch.Tensor]
+    attention_wob_ready_epoch_base: int
     attention_wob_output_rank: int
     attention_wob_direct_gather: bool
     attention_symm_handle: Any
@@ -280,6 +286,7 @@ class DSV4WholeLayerRuntime:
         self._tp4_symmetric_q_workspace: Optional[tuple] = None
         self._tp4_owner_flags_workspace: Optional[tuple] = None
         self._tp4_local_wob_output_workspace: Optional[tuple] = None
+        self._attention_output_forward_epoch = 0
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
         ] = None
@@ -672,23 +679,40 @@ class DSV4WholeLayerRuntime:
                 "TP4 direct output gather requires TP=4, got "
                 f"{tp_group.world_size}"
             )
-        local_output = symm_mem.empty(
-            (_MAX_FORWARD_TOKENS, 4096),
-            dtype=torch.bfloat16,
-            device=device,
+        output_bytes = _MAX_FORWARD_TOKENS * 4096 * 2
+        ready_groups = _MAX_FORWARD_TOKENS // 2
+        ready_bytes = ready_groups * 4
+        local_storage = symm_mem.empty(
+            (output_bytes + ready_bytes,), dtype=torch.uint8, device=device
         )
-        handle = symm_mem.rendezvous(local_output, tp_group.device_group)
-        peers = tuple(
-            handle.get_buffer(
-                rank, local_output.shape, local_output.dtype
-            )
+        local_output = local_storage[:output_bytes].view(torch.bfloat16).view(
+            _MAX_FORWARD_TOKENS, 4096
+        )
+        local_ready = local_storage[output_bytes:].view(torch.int32)
+        local_ready.zero_()
+        handle = symm_mem.rendezvous(local_storage, tp_group.device_group)
+        peer_storage = tuple(
+            handle.get_buffer(rank, local_storage.shape, local_storage.dtype)
             for rank in range(4)
         )
+        peers = tuple(
+            storage[:output_bytes].view(torch.bfloat16).view(
+                _MAX_FORWARD_TOKENS, 4096
+            )
+            for storage in peer_storage
+        )
+        ready_peers = tuple(
+            storage[output_bytes:].view(torch.int32)
+            for storage in peer_storage
+        )
+        handle.barrier(channel=0)
         self._tp4_local_wob_output_workspace = (
             device,
             handle,
             local_output,
             peers,
+            local_ready,
+            ready_peers,
             tp_group.rank_in_group,
         )
 
@@ -888,8 +912,18 @@ class DSV4WholeLayerRuntime:
                     attention_wob_output_handle,
                     attention_wob_output_storage,
                     attention_wob_output_peers,
+                    attention_wob_ready_local,
+                    attention_wob_ready_peers,
                     attention_wob_output_rank,
                 ) = output_workspace
+                self._attention_output_forward_epoch = (
+                    self._attention_output_forward_epoch + 1
+                ) & 0x03FFFFFF
+                if self._attention_output_forward_epoch == 0:
+                    self._attention_output_forward_epoch = 1
+                attention_wob_ready_epoch_base = (
+                    self._attention_output_forward_epoch << 6
+                )
                 owner_tokens = num_tokens // 4
                 attention_projected_gather = attention_wob_output_storage[
                     :num_tokens
@@ -902,6 +936,10 @@ class DSV4WholeLayerRuntime:
                 attention_wob_output_peer1 = attention_wob_output_peers[1]
                 attention_wob_output_peer2 = attention_wob_output_peers[2]
                 attention_wob_output_peer3 = attention_wob_output_peers[3]
+                attention_wob_ready_peer0 = attention_wob_ready_peers[0]
+                attention_wob_ready_peer1 = attention_wob_ready_peers[1]
+                attention_wob_ready_peer2 = attention_wob_ready_peers[2]
+                attention_wob_ready_peer3 = attention_wob_ready_peers[3]
                 attention_wob_direct_gather = True
             else:
                 attention_wob_output_handle = None
@@ -909,6 +947,12 @@ class DSV4WholeLayerRuntime:
                 attention_wob_output_peer1 = None
                 attention_wob_output_peer2 = None
                 attention_wob_output_peer3 = None
+                attention_wob_ready_local = None
+                attention_wob_ready_peer0 = None
+                attention_wob_ready_peer1 = None
+                attention_wob_ready_peer2 = None
+                attention_wob_ready_peer3 = None
+                attention_wob_ready_epoch_base = 0
                 attention_wob_output_rank = -1
                 attention_wob_direct_gather = False
             if self._use_tp4_symmetric_wob and tp4_token_shard_attention:
@@ -981,6 +1025,12 @@ class DSV4WholeLayerRuntime:
             attention_wob_output_peer1 = None
             attention_wob_output_peer2 = None
             attention_wob_output_peer3 = None
+            attention_wob_ready_local = None
+            attention_wob_ready_peer0 = None
+            attention_wob_ready_peer1 = None
+            attention_wob_ready_peer2 = None
+            attention_wob_ready_peer3 = None
+            attention_wob_ready_epoch_base = 0
             attention_wob_output_rank = -1
             attention_wob_direct_gather = False
             attention_symm_handle = None
@@ -1061,6 +1111,12 @@ class DSV4WholeLayerRuntime:
             attention_wob_output_peer1=attention_wob_output_peer1,
             attention_wob_output_peer2=attention_wob_output_peer2,
             attention_wob_output_peer3=attention_wob_output_peer3,
+            attention_wob_ready_local=attention_wob_ready_local,
+            attention_wob_ready_peer0=attention_wob_ready_peer0,
+            attention_wob_ready_peer1=attention_wob_ready_peer1,
+            attention_wob_ready_peer2=attention_wob_ready_peer2,
+            attention_wob_ready_peer3=attention_wob_ready_peer3,
+            attention_wob_ready_epoch_base=attention_wob_ready_epoch_base,
             attention_wob_output_rank=attention_wob_output_rank,
             attention_wob_direct_gather=attention_wob_direct_gather,
             attention_symm_handle=attention_symm_handle,
@@ -1956,6 +2012,12 @@ def _separate_mhc_post_ffn_pre(
         post=post,
         comb=comb,
         output=descriptor.mhc_residual_mid,
+        ready_flags=descriptor.attention_wob_ready_local,
+        ready_epoch=(
+            descriptor.attention_wob_ready_epoch_base + layer.layer_id + 1
+            if descriptor.attention_wob_ready_local is not None
+            else 0
+        ),
     )
     hidden_states, post, comb, norm_fused = layer.hc_pre(
         residual,
@@ -2003,10 +2065,23 @@ def _huge_mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
     output: torch.Tensor,
+    ready_flags: Optional[torch.Tensor] = None,
+    ready_epoch: int = 0,
 ) -> torch.Tensor:
     """Run the strict CUDA post primitive into graph-stable GPU storage."""
 
-    from sglang.jit_kernel.dsv4.e2e import mhc_post_vec8
+    from sglang.jit_kernel.dsv4.e2e import mhc_post_vec8, mhc_post_vec8_ready
+
+    if ready_flags is not None:
+        return mhc_post_vec8_ready(
+            hidden_states,
+            residual,
+            post,
+            comb,
+            output,
+            ready_flags,
+            ready_epoch,
+        )
 
     return mhc_post_vec8(hidden_states, residual, post, comb, output)
 
