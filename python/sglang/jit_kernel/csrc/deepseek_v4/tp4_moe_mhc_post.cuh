@@ -281,57 +281,44 @@ __global__ void tp4_moe_owner_reduce_kernel(
     uint64_t owner_elements) {
   device::PDLWaitPrimary<kUsePDL>();
   constexpr uint32_t kPairsPerVector = kTp4MoeMhcVec / 2;
-  constexpr uint32_t kVectorsPerThread = 2;
-  const uint64_t vector_group_index =
+  const uint64_t vector_index =
       static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const uint64_t num_vectors = owner_elements / kTp4MoeMhcVec;
-  const uint64_t num_vector_groups = num_vectors / kVectorsPerThread;
-  const uint64_t vector_group_stride =
+  const uint64_t vector_stride =
       static_cast<uint64_t>(gridDim.x) * blockDim.x;
-  for (uint64_t vector_group = vector_group_index;
-       vector_group < num_vector_groups;
-       vector_group += vector_group_stride) {
-    uint4 input0_raw[kVectorsPerThread];
-    uint4 input1_raw[kVectorsPerThread];
-    uint4 input2_raw[kVectorsPerThread];
-    uint4 input3_raw[kVectorsPerThread];
+  for (uint64_t vector = vector_index; vector < num_vectors;
+       vector += vector_stride) {
+    const uint64_t element = owner_first + vector * kTp4MoeMhcVec;
+    const uint4 input0_raw =
+        *reinterpret_cast<const uint4*>(input0 + element);
+    const uint4 input1_raw =
+        *reinterpret_cast<const uint4*>(input1 + element);
+    const uint4 input2_raw =
+        *reinterpret_cast<const uint4*>(input2 + element);
+    const uint4 input3_raw =
+        *reinterpret_cast<const uint4*>(input3 + element);
+    uint4 reduced_raw;
+    const auto* input0_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input0_raw);
+    const auto* input1_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input1_raw);
+    const auto* input2_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input2_raw);
+    const auto* input3_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input3_raw);
+    auto* reduced_pairs = reinterpret_cast<__nv_bfloat162*>(&reduced_raw);
+    const uint32_t group = static_cast<uint32_t>(
+        (element % kNCCLPeriodElements) / kNCCLChannelGroupElements);
 #pragma unroll
-    for (uint32_t lane = 0; lane < kVectorsPerThread; ++lane) {
-      const uint64_t vector = vector_group * kVectorsPerThread + lane;
-      const uint64_t element = owner_first + vector * kTp4MoeMhcVec;
-      input0_raw[lane] = *reinterpret_cast<const uint4*>(input0 + element);
-      input1_raw[lane] = *reinterpret_cast<const uint4*>(input1 + element);
-      input2_raw[lane] = *reinterpret_cast<const uint4*>(input2 + element);
-      input3_raw[lane] = *reinterpret_cast<const uint4*>(input3 + element);
+    for (uint32_t pair = 0; pair < kPairsPerVector; ++pair) {
+      reduced_pairs[pair] = tp4_moe_mhc_add4_ordered(
+          input0_pairs[pair],
+          input1_pairs[pair],
+          input2_pairs[pair],
+          input3_pairs[pair],
+          group);
     }
-#pragma unroll
-    for (uint32_t lane = 0; lane < kVectorsPerThread; ++lane) {
-      const uint64_t vector = vector_group * kVectorsPerThread + lane;
-      const uint64_t element = owner_first + vector * kTp4MoeMhcVec;
-      uint4 reduced_raw;
-      const auto* input0_pairs =
-          reinterpret_cast<const __nv_bfloat162*>(&input0_raw[lane]);
-      const auto* input1_pairs =
-          reinterpret_cast<const __nv_bfloat162*>(&input1_raw[lane]);
-      const auto* input2_pairs =
-          reinterpret_cast<const __nv_bfloat162*>(&input2_raw[lane]);
-      const auto* input3_pairs =
-          reinterpret_cast<const __nv_bfloat162*>(&input3_raw[lane]);
-      auto* reduced_pairs = reinterpret_cast<__nv_bfloat162*>(&reduced_raw);
-      const uint32_t group = static_cast<uint32_t>(
-          (element % kNCCLPeriodElements) /
-          kNCCLChannelGroupElements);
-#pragma unroll
-      for (uint32_t pair = 0; pair < kPairsPerVector; ++pair) {
-        reduced_pairs[pair] = tp4_moe_mhc_add4_ordered(
-            input0_pairs[pair],
-            input1_pairs[pair],
-            input2_pairs[pair],
-            input3_pairs[pair],
-            group);
-      }
-      *reinterpret_cast<uint4*>(local_output + element) = reduced_raw;
-    }
+    *reinterpret_cast<uint4*>(local_output + element) = reduced_raw;
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -614,7 +601,7 @@ struct Tp4MoeMhcPostKernel {
     // reads without paying scheduler overhead for one CTA per 4 KiB.  These
     // are the same empirically stable CTA counts used by the strict Huge
     // attention owner-gather path for 16K/32K owner-token shards.
-    const uint32_t blocks = M.unwrap() == 65536 ? 4096 : 8192;
+    const uint32_t blocks = M.unwrap() == 65536 ? 8192 : 16384;
     LaunchKernel(blocks, kTp4MoeMhcThreads, device.unwrap())
         .enable_pdl(kUsePDL)(
             tp4_moe_owner_reduce_kernel<kUsePDL>,
