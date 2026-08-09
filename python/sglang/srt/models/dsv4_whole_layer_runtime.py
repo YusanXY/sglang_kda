@@ -112,6 +112,10 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     moe_partial_peer1: Optional[torch.Tensor]
     moe_partial_peer2: Optional[torch.Tensor]
     moe_partial_peer3: Optional[torch.Tensor]
+    moe_owner_flag0: Optional[torch.Tensor]
+    moe_owner_flag1: Optional[torch.Tensor]
+    moe_owner_flag2: Optional[torch.Tensor]
+    moe_owner_flag3: Optional[torch.Tensor]
     attention_packed_send: Optional[torch.Tensor]
     attention_packed_recv: Optional[torch.Tensor]
     attention_packed_recv_q: Optional[torch.Tensor]
@@ -274,6 +278,7 @@ class DSV4WholeLayerRuntime:
         ] = None
         self._tp4_symmetric_workspace: Optional[tuple] = None
         self._tp4_symmetric_q_workspace: Optional[tuple] = None
+        self._tp4_owner_flags_workspace: Optional[tuple] = None
         self._tp4_local_wob_output_workspace: Optional[tuple] = None
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
@@ -348,6 +353,7 @@ class DSV4WholeLayerRuntime:
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
         if self._use_tp4_token_shard_attention:
             self._bind_tp4_symmetric_q_workspace(workspace_device)
+            self._bind_tp4_owner_flags_workspace(workspace_device)
         if self._use_tp4_symmetric_wob:
             self._bind_tp4_symmetric_workspace(workspace_device)
         if self._use_tp4_local_wob_direct_gather:
@@ -617,6 +623,38 @@ class DSV4WholeLayerRuntime:
             tp_group.rank_in_group,
         )
 
+    def _bind_tp4_owner_flags_workspace(self, device: torch.device) -> None:
+        """Bind four peer-visible GPU protocol words once for all layers."""
+        from torch.distributed import _symmetric_memory as symm_mem
+
+        from sglang.srt.distributed import get_tp_group
+
+        cached = self._tp4_owner_flags_workspace
+        if cached is not None and cached[0] == device:
+            return
+        tp_group = get_tp_group()
+        if tp_group.world_size != 4:
+            raise RuntimeError(
+                "TP4 owner GPU synchronization requires TP=4, got "
+                f"{tp_group.world_size}"
+            )
+        local_flags = symm_mem.empty((4,), dtype=torch.int32, device=device)
+        local_flags.zero_()
+        handle = symm_mem.rendezvous(local_flags, tp_group.device_group)
+        peers = tuple(
+            handle.get_buffer(rank, local_flags.shape, local_flags.dtype)
+            for rank in range(4)
+        )
+        # Initialization is outside the hot path; publish the zero epoch before
+        # any layer can enter the device-resident protocol.
+        handle.barrier(channel=0)
+        self._tp4_owner_flags_workspace = (
+            device,
+            handle,
+            local_flags,
+            peers,
+        )
+
     def _bind_tp4_local_wob_output_workspace(
         self, device: torch.device
     ) -> None:
@@ -823,6 +861,16 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1 = moe_partial_peers[1]
             moe_partial_peer2 = moe_partial_peers[2]
             moe_partial_peer3 = moe_partial_peers[3]
+            owner_flags = self._tp4_owner_flags_workspace
+            if owner_flags is None or owner_flags[0] != positions.device:
+                raise RuntimeError(
+                    "TP4 owner GPU flags were not bound on this device"
+                )
+            moe_owner_flag_peers = owner_flags[3]
+            moe_owner_flag0 = moe_owner_flag_peers[0]
+            moe_owner_flag1 = moe_owner_flag_peers[1]
+            moe_owner_flag2 = moe_owner_flag_peers[2]
+            moe_owner_flag3 = moe_owner_flag_peers[3]
             if (
                 self._use_tp4_local_wob_direct_gather
                 and tp4_token_shard_attention
@@ -915,6 +963,10 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1 = None
             moe_partial_peer2 = None
             moe_partial_peer3 = None
+            moe_owner_flag0 = None
+            moe_owner_flag1 = None
+            moe_owner_flag2 = None
+            moe_owner_flag3 = None
             attention_packed_send, attention_packed_recv = None, None
             attention_packed_recv_q = None
             attention_projected_local = None
@@ -990,6 +1042,10 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1=moe_partial_peer1,
             moe_partial_peer2=moe_partial_peer2,
             moe_partial_peer3=moe_partial_peer3,
+            moe_owner_flag0=moe_owner_flag0,
+            moe_owner_flag1=moe_owner_flag1,
+            moe_owner_flag2=moe_owner_flag2,
+            moe_owner_flag3=moe_owner_flag3,
             attention_packed_send=attention_packed_send,
             attention_packed_recv=attention_packed_recv,
             attention_packed_recv_q=attention_packed_recv_q,
@@ -1778,9 +1834,16 @@ def _execute_common(
         descriptor.moe_partial_peer2,
         descriptor.moe_partial_peer3,
     )
+    moe_owner_flags = (
+        descriptor.moe_owner_flag0,
+        descriptor.moe_owner_flag1,
+        descriptor.moe_owner_flag2,
+        descriptor.moe_owner_flag3,
+    )
     if (
         moe_partial_local is None
         or any(partial is None for partial in moe_partials)
+        or any(flag is None for flag in moe_owner_flags)
         or descriptor.attention_q_handle is None
     ):
         raise RuntimeError(
@@ -1816,9 +1879,8 @@ def _execute_common(
     descriptor.attention_q_handle.barrier(channel=barrier_channel)
     hidden_states = _huge_tp4_moe_mhc_post(
         partials=moe_partials,
+        flags=moe_owner_flags,
         owner_rank=descriptor.attention_q_rank,
-        symmetric_handle=descriptor.attention_q_handle,
-        barrier_channel=barrier_channel,
         residual=residual,
         post=post,
         comb=comb,
@@ -1952,27 +2014,26 @@ def _huge_mhc_post(
 def _huge_tp4_moe_mhc_post(
     *,
     partials: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    flags: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     owner_rank: int,
-    symmetric_handle: Any,
-    barrier_channel: int,
     residual: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    """Owner-reduce TP4 MoE partials and consume them without replication."""
+    """Run the GPU-synchronized TP4 owner reduction and mHC post."""
 
-    from sglang.jit_kernel.dsv4.e2e import (
-        tp4_moe_owner_mhc_post,
-        tp4_moe_owner_reduce,
+    from sglang.jit_kernel.dsv4.e2e import tp4_moe_owner_persistent
+
+    return tp4_moe_owner_persistent(
+        partials,
+        flags,
+        owner_rank,
+        residual,
+        post,
+        comb,
+        output,
     )
-
-    tp4_moe_owner_reduce(partials, partials[owner_rank], owner_rank)
-    # Publish the four disjoint reduced token quarters.  This is the only new
-    # hard boundary versus the previous direct four-peer kernel; all owner
-    # routing and mHC math remain device-side.
-    symmetric_handle.barrier(channel=barrier_channel)
-    return tp4_moe_owner_mhc_post(partials, residual, post, comb, output)
 
 
 def _execute_c0(

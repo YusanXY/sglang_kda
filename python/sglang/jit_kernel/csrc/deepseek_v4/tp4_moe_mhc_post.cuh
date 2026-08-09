@@ -621,6 +621,12 @@ void tp4_moe_owner_persistent_kernel(
   }
   __syncthreads();
 
+  // v58b split: finish the GPU-resident cross-rank dependency here.  The
+  // wrapper immediately launches the occupancy-tuned owner-post kernel on the
+  // same stream, so no Host synchronization or symmetric barrier is needed.
+  device::PDLTriggerSecondary<kUsePDL>();
+  return;
+
   __shared__ float coefficients[
       kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
   constexpr uint32_t kChunksPerToken =
@@ -1060,6 +1066,12 @@ struct Tp4MoeMhcPostKernel {
         device.unwrap())
         .enable_pdl(kUsePDL)(
             tp4_moe_owner_persistent_kernel<kUsePDL>, params);
+    LaunchKernel(
+        M.unwrap() / kTp4OwnerPostTokensPerCTA,
+        kTp4MoeMhcThreads,
+        device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_moe_owner_mhc_post_kernel<kUsePDL>, post_params);
   }
 };
 
