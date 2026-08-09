@@ -100,16 +100,11 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_q_padded: torch.Tensor
     attention_q_local: Optional[torch.Tensor]
     attention_q_recv: Optional[torch.Tensor]
-    attention_q_recv_alt: Optional[torch.Tensor]
     attention_q_handle: Any
     attention_q_peer0: Optional[torch.Tensor]
     attention_q_peer1: Optional[torch.Tensor]
     attention_q_peer2: Optional[torch.Tensor]
     attention_q_peer3: Optional[torch.Tensor]
-    attention_q_peer0_alt: Optional[torch.Tensor]
-    attention_q_peer1_alt: Optional[torch.Tensor]
-    attention_q_peer2_alt: Optional[torch.Tensor]
-    attention_q_peer3_alt: Optional[torch.Tensor]
     attention_q_rank: int
     attention_q_direct_route: bool
     moe_partial_local: Optional[torch.Tensor]
@@ -117,11 +112,6 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     moe_partial_peer1: Optional[torch.Tensor]
     moe_partial_peer2: Optional[torch.Tensor]
     moe_partial_peer3: Optional[torch.Tensor]
-    moe_partial_local_alt: Optional[torch.Tensor]
-    moe_partial_peer0_alt: Optional[torch.Tensor]
-    moe_partial_peer1_alt: Optional[torch.Tensor]
-    moe_partial_peer2_alt: Optional[torch.Tensor]
-    moe_partial_peer3_alt: Optional[torch.Tensor]
     attention_packed_send: Optional[torch.Tensor]
     attention_packed_recv: Optional[torch.Tensor]
     attention_packed_recv_q: Optional[torch.Tensor]
@@ -610,7 +600,7 @@ class DSV4WholeLayerRuntime:
                 f"{tp_group.world_size}"
             )
         local_q_recv = symm_mem.empty(
-            (2, _MAX_FORWARD_TOKENS, 16, 512),
+            (_MAX_FORWARD_TOKENS, 16, 512),
             dtype=torch.bfloat16,
             device=device,
         )
@@ -619,15 +609,11 @@ class DSV4WholeLayerRuntime:
             handle.get_buffer(rank, local_q_recv.shape, local_q_recv.dtype)
             for rank in range(4)
         )
-        local_slots = (local_q_recv[0], local_q_recv[1])
-        peer_slots = tuple(
-            tuple(peer[slot] for peer in peers) for slot in range(2)
-        )
         self._tp4_symmetric_q_workspace = (
             device,
             handle,
-            local_slots,
-            peer_slots,
+            local_q_recv,
+            peers,
             tp_group.rank_in_group,
         )
 
@@ -818,22 +804,15 @@ class DSV4WholeLayerRuntime:
             (
                 _,
                 attention_q_handle,
-                attention_q_slots,
-                attention_q_peer_slots,
+                attention_q_storage,
+                attention_q_peers,
                 attention_q_rank,
             ) = symmetric_q
-            attention_q_recv = attention_q_slots[0][:num_tokens]
-            attention_q_recv_alt = attention_q_slots[1][:num_tokens]
-            attention_q_peers = attention_q_peer_slots[0]
-            attention_q_peers_alt = attention_q_peer_slots[1]
+            del attention_q_storage
             attention_q_peer0 = attention_q_peers[0]
             attention_q_peer1 = attention_q_peers[1]
             attention_q_peer2 = attention_q_peers[2]
             attention_q_peer3 = attention_q_peers[3]
-            attention_q_peer0_alt = attention_q_peers_alt[0]
-            attention_q_peer1_alt = attention_q_peers_alt[1]
-            attention_q_peer2_alt = attention_q_peers_alt[2]
-            attention_q_peer3_alt = attention_q_peers_alt[3]
             attention_q_direct_route = tp4_token_shard_attention
             moe_partial_peers = tuple(
                 peer.view(-1)[: num_tokens * 4096].view(num_tokens, 4096)
@@ -844,15 +823,6 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1 = moe_partial_peers[1]
             moe_partial_peer2 = moe_partial_peers[2]
             moe_partial_peer3 = moe_partial_peers[3]
-            moe_partial_peers_alt = tuple(
-                peer.view(-1)[: num_tokens * 4096].view(num_tokens, 4096)
-                for peer in attention_q_peers_alt
-            )
-            moe_partial_local_alt = moe_partial_peers_alt[attention_q_rank]
-            moe_partial_peer0_alt = moe_partial_peers_alt[0]
-            moe_partial_peer1_alt = moe_partial_peers_alt[1]
-            moe_partial_peer2_alt = moe_partial_peers_alt[2]
-            moe_partial_peer3_alt = moe_partial_peers_alt[3]
             if (
                 self._use_tp4_local_wob_direct_gather
                 and tp4_token_shard_attention
@@ -933,16 +903,11 @@ class DSV4WholeLayerRuntime:
                 attention_symm_direct_push = False
         else:
             attention_q_local, attention_q_recv = None, None
-            attention_q_recv_alt = None
             attention_q_handle = None
             attention_q_peer0 = None
             attention_q_peer1 = None
             attention_q_peer2 = None
             attention_q_peer3 = None
-            attention_q_peer0_alt = None
-            attention_q_peer1_alt = None
-            attention_q_peer2_alt = None
-            attention_q_peer3_alt = None
             attention_q_rank = -1
             attention_q_direct_route = False
             moe_partial_local = None
@@ -950,11 +915,6 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1 = None
             moe_partial_peer2 = None
             moe_partial_peer3 = None
-            moe_partial_local_alt = None
-            moe_partial_peer0_alt = None
-            moe_partial_peer1_alt = None
-            moe_partial_peer2_alt = None
-            moe_partial_peer3_alt = None
             attention_packed_send, attention_packed_recv = None, None
             attention_packed_recv_q = None
             attention_projected_local = None
@@ -1018,16 +978,11 @@ class DSV4WholeLayerRuntime:
             attention_q_padded=attention_q_padded,
             attention_q_local=attention_q_local,
             attention_q_recv=attention_q_recv,
-            attention_q_recv_alt=attention_q_recv_alt,
             attention_q_handle=attention_q_handle,
             attention_q_peer0=attention_q_peer0,
             attention_q_peer1=attention_q_peer1,
             attention_q_peer2=attention_q_peer2,
             attention_q_peer3=attention_q_peer3,
-            attention_q_peer0_alt=attention_q_peer0_alt,
-            attention_q_peer1_alt=attention_q_peer1_alt,
-            attention_q_peer2_alt=attention_q_peer2_alt,
-            attention_q_peer3_alt=attention_q_peer3_alt,
             attention_q_rank=attention_q_rank,
             attention_q_direct_route=attention_q_direct_route,
             moe_partial_local=moe_partial_local,
@@ -1035,11 +990,6 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1=moe_partial_peer1,
             moe_partial_peer2=moe_partial_peer2,
             moe_partial_peer3=moe_partial_peer3,
-            moe_partial_local_alt=moe_partial_local_alt,
-            moe_partial_peer0_alt=moe_partial_peer0_alt,
-            moe_partial_peer1_alt=moe_partial_peer1_alt,
-            moe_partial_peer2_alt=moe_partial_peer2_alt,
-            moe_partial_peer3_alt=moe_partial_peer3_alt,
             attention_packed_send=attention_packed_send,
             attention_packed_recv=attention_packed_recv,
             attention_packed_recv_q=attention_packed_recv_q,
@@ -1200,7 +1150,7 @@ class DSV4WholeLayerRuntime:
                 raise RuntimeError(
                     "TP4 symmetric Q workspace was not bound on this device"
                 )
-            q_recv = symmetric_q[2][0]
+            q_recv = symmetric_q[2]
             # Peer-Q FlashMLA reads q_recv remotely.  Keep that symmetric
             # producer buffer immutable until the layer's TP4 output-gather
             # barrier orders the next layer, and put all post-attention aliases
@@ -1732,6 +1682,7 @@ def _execute_common(
     whole-layer native call.
     """
 
+    del runtime
     layer = handle.layer
     if layer.use_fused_mhc_post_pre:
         raise RuntimeError(
@@ -1820,26 +1771,12 @@ def _execute_common(
         )
         return hidden_states, None, None, None
 
-    use_alt_symmetric_slot = bool(handle.layer_id & 1)
-    moe_partial_local = (
-        descriptor.moe_partial_local_alt
-        if use_alt_symmetric_slot
-        else descriptor.moe_partial_local
-    )
+    moe_partial_local = descriptor.moe_partial_local
     moe_partials = (
-        (
-            descriptor.moe_partial_peer0_alt,
-            descriptor.moe_partial_peer1_alt,
-            descriptor.moe_partial_peer2_alt,
-            descriptor.moe_partial_peer3_alt,
-        )
-        if use_alt_symmetric_slot
-        else (
-            descriptor.moe_partial_peer0,
-            descriptor.moe_partial_peer1,
-            descriptor.moe_partial_peer2,
-            descriptor.moe_partial_peer3,
-        )
+        descriptor.moe_partial_peer0,
+        descriptor.moe_partial_peer1,
+        descriptor.moe_partial_peer2,
+        descriptor.moe_partial_peer3,
     )
     if (
         moe_partial_local is None
@@ -1872,7 +1809,9 @@ def _execute_common(
             f"result_ptr=0x{moe_result.data_ptr():x}, "
             f"provided_ptr=0x{moe_partial_local.data_ptr():x}"
         )
-    # Publish all four FlashInfer MoE partials before owner reduction.
+    # The first GPU barrier publishes all four FlashInfer MoE partials.  The
+    # second prevents the next layer's Q producer from reusing this symmetric
+    # storage while another rank is still reading it.
     barrier_channel = handle.layer_id & 1
     descriptor.attention_q_handle.barrier(channel=barrier_channel)
     hidden_states = _huge_tp4_moe_mhc_post(
@@ -1885,11 +1824,7 @@ def _execute_common(
         comb=comb,
         output=descriptor.mhc_residual_out,
     )
-    # Two peer-visible Q/MoE slots alternate by layer. The next layer's
-    # publish barrier orders completion before this slot is reused two layers
-    # later. Keep an explicit fence only at the end of the whole forward.
-    if handle.layer_id == len(runtime._handles) - 1:
-        descriptor.attention_q_handle.barrier(channel=barrier_channel)
+    descriptor.attention_q_handle.barrier(channel=barrier_channel)
     return hidden_states, None, None, None
 
 
