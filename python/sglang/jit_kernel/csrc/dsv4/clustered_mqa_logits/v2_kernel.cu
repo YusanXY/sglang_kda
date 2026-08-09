@@ -164,7 +164,15 @@ void launch_topk512_sparse_prefill(
     // the real clustered MQA+TopK launch boundary: the standalone TVM-FFI
     // transform wrapper is not used by this path.  Keep lower-load Huge
     // configurations on their existing CUDA specialization.
+    // TP4 query sharding turns the strict global Req16/Req32 scheduler waves
+    // into request-aligned Req4/Req8 local launches.  Keep those launches on
+    // the same combined-only epilogue as their unsharded counterparts: sparse
+    // attention consumes only combined_indices, so publishing page_indices
+    // and raw_indices would add two full [M,512] global stores plus a reload.
+    // Retain the pre-sharding shapes for standalone callers and frozen paths.
     const bool combined_only =
+        (num_reqs == 4 && batch_size == 4 * 4096) ||
+        (num_reqs == 8 && batch_size == 8 * 4096) ||
         (num_reqs == 16 && batch_size == 16 * 4096) ||
         (num_reqs == 32 && batch_size == 32 * 4096) ||
         (num_reqs == 128 && batch_size == 128 * 4096);
