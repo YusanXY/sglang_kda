@@ -335,7 +335,7 @@ class DSV4WholeLayerRuntime:
                 f"{fp8_backend}"
             )
         if self._use_tp4_token_shard_attention:
-            self._bind_c4_token_projection_weights(
+            self._bind_tp4_token_projection_weights(
                 layers, start_layer=start_layer, end_layer=end_layer
             )
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
@@ -393,16 +393,16 @@ class DSV4WholeLayerRuntime:
                 shared_experts.bind_dsv4_huge_runtime(self)
         return self._handles
 
-    def _bind_c4_token_projection_weights(
+    def _bind_tp4_token_projection_weights(
         self, layers: Sequence[Any], *, start_layer: int, end_layer: int
     ) -> None:
-        """Replicate C4 WO weights once so projection stays token sharded.
+        """Replicate every attention layer's WO weights for token sharding.
 
-        The first C4 all-to-all makes every rank the owner of one contiguous
+        The Q exchange makes every rank the owner of one contiguous
         token quarter and all eight attention output groups. Replicating WO_A
-        at load time lets that owner project before a 4x-smaller packed return
-        all-to-all. WO_B remains locally sharded and keeps its original
-        all-reduce numerical contract.
+        and the four WO_B shards at load time lets that owner finish projection
+        locally, then directly gather the completed token quarters. This same
+        layout is valid for C0, C4, and C128.
 
         DeepGEMM scale tensors are logical transposes over contiguous physical
         storage.  Gather the physical words and restore the documented strides
@@ -413,16 +413,13 @@ class DSV4WholeLayerRuntime:
         tp_group = get_tp_group()
         if tp_group.world_size != 4:
             raise RuntimeError(
-                "C4 token-projection specialization requires TP=4, got "
+                "TP4 token-projection specialization requires TP=4, got "
                 f"{tp_group.world_size}"
             )
 
         with torch.no_grad():
             for layer_id in range(start_layer, end_layer):
                 attn = layers[layer_id].self_attn
-                if int(attn.compress_ratio) != 4:
-                    continue
-
                 local_wo_a_weight = attn.wo_a.weight.data
                 local_wo_a_scale = attn.wo_a.weight_scale_inv.data
                 local_wo_b_weight = attn.wo_b.weight.data
@@ -510,7 +507,7 @@ class DSV4WholeLayerRuntime:
                     != (8192, 1, 1024)
                 ):
                     raise RuntimeError(
-                        f"layer {layer_id}: failed to construct full C4 WO_A layout"
+                        f"layer {layer_id}: failed to construct full TP4 WO_A layout"
                     )
                 if self._use_tp4_local_wob and (
                     any(
@@ -525,7 +522,7 @@ class DSV4WholeLayerRuntime:
                     )
                 ):
                     raise RuntimeError(
-                        f"layer {layer_id}: failed to construct full C4 WO_B layouts"
+                        f"layer {layer_id}: failed to construct full TP4 WO_B layouts"
                     )
 
     def _bind_tp4_symmetric_workspace(self, device: torch.device) -> None:

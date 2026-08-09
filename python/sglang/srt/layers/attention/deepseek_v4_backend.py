@@ -2128,9 +2128,9 @@ class DeepseekV4AttnBackend(
         kv = workspace
 
         if tp4_token_shard_workspace is not None:
-            if not self.dsv4_huge_mode or compress_ratio != 4:
+            if not self.dsv4_huge_mode:
                 raise RuntimeError(
-                    "TP4 token-sharded attention is valid only for Huge C4 layers"
+                    "TP4 token-sharded attention is valid only for Huge layers"
                 )
             if q_flat.ndim != 3 or tuple(q_flat.shape[1:]) != (16, 512):
                 raise RuntimeError(
@@ -2176,7 +2176,7 @@ class DeepseekV4AttnBackend(
                 q_symmetric_handle.barrier(channel=layer_id & 1)
             else:
                 raise RuntimeError(
-                    "Huge C4 token sharding requires fused symmetric Q routing"
+                    "Huge TP4 token sharding requires fused symmetric Q routing"
                 )
             shard_tokens = num_tokens // 4
             shard_begin = tp_group.rank_in_group * shard_tokens

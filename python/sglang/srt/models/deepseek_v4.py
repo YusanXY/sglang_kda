@@ -1208,7 +1208,6 @@ class MQALayer(MqaAttentionBase):
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
             tp4_token_shard_attention = bool(
                 huge_mode
-                and self.compress_ratio == 4
                 and e2e_descriptor.tp4_token_shard_attention
             )
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
@@ -1421,7 +1420,7 @@ class MQALayer(MqaAttentionBase):
                 shard_tokens = o.shape[0]
                 if e2e_descriptor.num_tokens != shard_tokens * 4:
                     raise RuntimeError(
-                        f"layer {self.layer_id}: C4 token shard mismatch "
+                        f"layer {self.layer_id}: TP4 token shard mismatch "
                         f"{shard_tokens} * 4 != {e2e_descriptor.num_tokens}"
                     )
                 aligned_shard_tokens = (shard_tokens + 3) // 4 * 4
@@ -1521,7 +1520,7 @@ class MQALayer(MqaAttentionBase):
                 wo_a_scale = getattr(self, "_dsv4_huge_full_wo_a_scale", None)
                 if wo_a_weight is None or wo_a_scale is None:
                     raise RuntimeError(
-                        f"layer {self.layer_id}: full C4 WO_A weights were not bound"
+                        f"layer {self.layer_id}: full TP4 WO_A weights were not bound"
                     )
             else:
                 wo_a_weight = self.wo_a.weight
@@ -1569,7 +1568,7 @@ class MQALayer(MqaAttentionBase):
                 or wo_b_partial_chunks is None
             ):
                 raise RuntimeError(
-                    f"layer {self.layer_id}: local C4 WO_B buffers were not bound"
+                    f"layer {self.layer_id}: local TP4 WO_B buffers were not bound"
                 )
             tp4_quantize_local_wo_b_input_ue8m0(
                 o, wo_b_q, wo_b_s_storage
