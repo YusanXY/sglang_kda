@@ -26,11 +26,16 @@ if TYPE_CHECKING:
     )
 
 
-def moe_output_buffer_ctx(buf: torch.Tensor):
+def moe_output_buffer_ctx(
+    buf: torch.Tensor, *, external_symmetric: bool = False
+):
     """Provide the MoE output buffer for the current forward scope."""
     from sglang.srt.runtime_context import get_forward
 
-    return get_forward().scoped(moe_output_buffer=buf)
+    return get_forward().scoped(
+        moe_output_buffer=buf,
+        moe_output_buffer_external_symmetric=external_symmetric,
+    )
 
 
 @dataclass

@@ -70,7 +70,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -1265,6 +1265,15 @@ class FusedMoE(torch.nn.Module):
     ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
+        external_symmetric_output = (
+            get_forward().moe_output_buffer_external_symmetric
+            and get_server_args().dsv4_worker_backend == "huge_kernel"
+        )
+        provided_output = (
+            get_forward().moe_output_buffer
+            if external_symmetric_output
+            else None
+        )
 
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
@@ -1283,9 +1292,33 @@ class FusedMoE(torch.nn.Module):
             # TODO: should we add some conditions here?
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
-            ].contiguous()
+            ]
+            if external_symmetric_output:
+                if (
+                    provided_output is None
+                    or final_hidden_states.data_ptr() != provided_output.data_ptr()
+                    or final_hidden_states.shape != provided_output.shape
+                    or not final_hidden_states.is_contiguous()
+                ):
+                    raise RuntimeError(
+                        "DSV4 Huge MoE combine did not preserve the explicit "
+                        "external symmetric output: "
+                        f"result_shape={tuple(final_hidden_states.shape)}, "
+                        f"result_stride={tuple(final_hidden_states.stride())}, "
+                        f"result_ptr=0x{final_hidden_states.data_ptr():x}, "
+                        f"provided_shape={tuple(provided_output.shape)}, "
+                        f"provided_stride={tuple(provided_output.stride())}, "
+                        f"provided_ptr=0x{provided_output.data_ptr():x}, "
+                        f"origin_hidden={origin_hidden_states_dim}"
+                    )
+            else:
+                final_hidden_states = final_hidden_states.contiguous()
 
-        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+        if (
+            self.reduce_results
+            and (self.moe_tp_size > 1 or self.moe_ep_size > 1)
+            and not external_symmetric_output
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states

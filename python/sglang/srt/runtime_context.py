@@ -424,6 +424,10 @@ class ForwardFlags:
     _DEFAULTS = {
         "multi_stream": False,
         "moe_output_buffer": None,
+        # Explicit caller-owned torch.distributed symmetric-memory output.
+        # This is distinct from PyNCCL's allocator and defaults to untrusted;
+        # only the strict DSV4 Huge owner protocol enters this scope.
+        "moe_output_buffer_external_symmetric": False,
         # Attention-TP input-scattering (set per forward by
         # AttnTpContext.maybe_input_scattered / set_attn_inputs).
         "attn_input_scattered": False,

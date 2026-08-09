@@ -1741,6 +1741,36 @@ def _execute_common(
         )
     )
 
+    # Prefix construction arrives as legal 1..4096-token EXTEND chunks.  The
+    # owner protocol is specialized for the two measured aggregate buckets;
+    # keep smaller chunks on the existing Huge CUDA/NCCL path so cache build
+    # semantics remain unchanged.  This is not a native-layer fallback: both
+    # branches stay inside the Huge whole-layer executor and unsupported
+    # aggregate shapes still fail below.
+    num_tokens = hidden_states.shape[0]
+    if num_tokens not in (65536, 131072):
+        if num_tokens > 4096:
+            raise RuntimeError(
+                "DSV4 Huge owner MoE/mHC supports aggregate M=65536/131072; "
+                f"prefix construction is limited to M<=4096, got M={num_tokens}"
+            )
+        hidden_states = layer._run_moe_ffn_dp_sync(
+            hidden_states,
+            descriptor.forward_batch,
+            input_ids=descriptor.input_ids,
+            input_ids_global=descriptor.input_ids_global,
+            shared_x_quant=shared_x_quant,
+            routed_x_quant=routed_x_quant,
+        )
+        hidden_states = _huge_mhc_post(
+            hidden_states=hidden_states,
+            residual=residual,
+            post=post,
+            comb=comb,
+            output=descriptor.mhc_residual_out,
+        )
+        return hidden_states, None, None, None
+
     moe_partial_local = descriptor.moe_partial_local
     moe_partials = (
         descriptor.moe_partial_peer0,
@@ -1758,7 +1788,9 @@ def _execute_common(
         )
     from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
-    with moe_output_buffer_ctx(moe_partial_local):
+    with moe_output_buffer_ctx(
+        moe_partial_local, external_symmetric=True
+    ):
         moe_result = layer._run_moe_ffn_dp_sync(
             hidden_states,
             descriptor.forward_batch,
@@ -1770,7 +1802,12 @@ def _execute_common(
         )
     if moe_result.data_ptr() != moe_partial_local.data_ptr():
         raise RuntimeError(
-            "FlashInfer MoE did not honor the Huge symmetric output buffer"
+            "FlashInfer MoE did not honor the Huge symmetric output buffer: "
+            f"result_shape={tuple(moe_result.shape)}, "
+            f"provided_shape={tuple(moe_partial_local.shape)}, "
+            f"result_dtype={moe_result.dtype}, provided_dtype={moe_partial_local.dtype}, "
+            f"result_ptr=0x{moe_result.data_ptr():x}, "
+            f"provided_ptr=0x{moe_partial_local.data_ptr():x}"
         )
     # The first GPU barrier publishes all four FlashInfer MoE partials.  The
     # second prevents the next layer's Q producer from reusing this symmetric

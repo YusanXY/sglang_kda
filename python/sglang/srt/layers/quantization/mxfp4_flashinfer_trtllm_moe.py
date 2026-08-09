@@ -15,7 +15,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_forward, get_server_args
 from sglang.srt.utils import (
     is_flashinfer_available,
     log_info_on_rank0,
@@ -420,18 +420,39 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         else:
             raise NotImplementedError(f"Unsupported mxfp4 moe precision: {precision}")
 
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            num_tokens = x_quant.shape[0]
-            out_hidden_size = (
-                x_quant.shape[-1] * 2
-                if x_quant.dtype == torch.uint8
-                else x_quant.shape[-1]
-            )
-            symm_output = torch.empty(
-                num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
-            )
+        num_tokens = x_quant.shape[0]
+        out_hidden_size = (
+            x_quant.shape[-1] * 2
+            if x_quant.dtype == torch.uint8
+            else x_quant.shape[-1]
+        )
+        external_symmetric_output = (
+            get_forward().moe_output_buffer_external_symmetric
+            and get_server_args().dsv4_worker_backend == "huge_kernel"
+        )
+        if external_symmetric_output:
+            symm_output = get_forward().moe_output_buffer
+            if (
+                symm_output is None
+                or symm_output.shape != (num_tokens, out_hidden_size)
+                or symm_output.dtype != torch.bfloat16
+                or symm_output.device != x_quant.device
+                or not symm_output.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge MXFP4 MoE requires an exact contiguous "
+                    "external symmetric BF16 output buffer"
+                )
+        else:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty(
+                    num_tokens,
+                    out_hidden_size,
+                    dtype=torch.bfloat16,
+                    device=x_quant.device,
+                )
 
         if prequant is not None and shared_output is not None:
             if (

@@ -29,7 +29,11 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
@@ -225,6 +229,25 @@ class StandardDispatcher(BaseDispatcher):
 
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
+        external_symmetric_output = (
+            get_forward().moe_output_buffer_external_symmetric
+            and get_server_args().dsv4_worker_backend == "huge_kernel"
+        )
+        if external_symmetric_output:
+            provided_output = get_forward().moe_output_buffer
+            if (
+                provided_output is None
+                or hidden_states.data_ptr() != provided_output.data_ptr()
+                or hidden_states.shape != provided_output.shape
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge StandardDispatcher did not receive the explicit "
+                    "external symmetric MoE output"
+                )
+            # The Huge owner protocol replaces the generic FP4 reduce-scatter:
+            # each rank reduces one disjoint token quarter, then every rank
+            # consumes the four owner quarters directly in mHC post.
+            return hidden_states
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
