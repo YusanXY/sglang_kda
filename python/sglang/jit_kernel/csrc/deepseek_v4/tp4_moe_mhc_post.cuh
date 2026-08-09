@@ -324,7 +324,8 @@ __global__ void tp4_moe_owner_reduce_kernel(
 }
 
 template <bool kUsePDL>
-__global__ void tp4_moe_owner_mhc_post_kernel(
+__global__ __launch_bounds__(kTp4MoeMhcThreads, 4)
+void tp4_moe_owner_mhc_post_kernel(
     const Tp4MoeMhcPostParams __grid_constant__ params) {
   device::PDLWaitPrimary<kUsePDL>();
   const uint32_t tid = threadIdx.x;
