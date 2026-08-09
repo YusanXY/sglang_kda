@@ -20,6 +20,16 @@ constexpr uint32_t kTp4MoeMhcHidden = 4096;
 constexpr uint32_t kTp4MoeMhcVec = 8;
 constexpr uint32_t kTp4MoeMhcThreads = 256;
 constexpr uint32_t kTp4OwnerPostTokensPerCTA = 4;
+// B300/SM103 has 148 SMs.  Four 256-thread CTAs per SM matches the
+// launch-bounds constrained owner-post occupancy and guarantees that the
+// whole persistent grid can remain resident while it performs a software
+// grid barrier.  This path is intentionally specialized to the strict B300
+// deployment matrix.
+constexpr uint32_t kTp4OwnerPersistentBlocks = 148 * 4;
+constexpr uint32_t kTp4OwnerFlagArrived = 0;
+constexpr uint32_t kTp4OwnerFlagProducedEpoch = 1;
+constexpr uint32_t kTp4OwnerFlagPeerReadyEpoch = 2;
+constexpr uint32_t kTp4OwnerFlagCount = 4;
 constexpr uint64_t kNCCLChannelGroupElements = 1ULL << 20;
 constexpr uint64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 
@@ -34,6 +44,15 @@ struct Tp4MoeMhcPostParams {
   const float* __restrict__ comb_mix;
   __nv_bfloat16* __restrict__ output;
   uint32_t num_tokens;
+};
+
+struct Tp4MoeOwnerPersistentParams {
+  Tp4MoeMhcPostParams post;
+  uint32_t* flags0;
+  uint32_t* flags1;
+  uint32_t* flags2;
+  uint32_t* flags3;
+  uint32_t owner_rank;
 };
 
 union Tp4MoeMhcBf16PairBits {
@@ -106,6 +125,26 @@ SGL_DEVICE void tp4_moe_mhc_cp_async_16(
 
 SGL_DEVICE void tp4_moe_mhc_cp_async_commit() {
   asm volatile("cp.async.commit_group;\n" ::);
+}
+
+SGL_DEVICE uint32_t tp4_moe_mhc_load_acquire_sys(
+    const uint32_t* ptr) {
+  uint32_t value;
+  asm volatile(
+      "ld.acquire.sys.global.u32 %0, [%1];"
+      : "=r"(value)
+      : "l"(ptr)
+      : "memory");
+  return value;
+}
+
+SGL_DEVICE void tp4_moe_mhc_store_release_sys(
+    uint32_t* ptr, const uint32_t value) {
+  asm volatile(
+      "st.release.sys.global.u32 [%0], %1;" ::
+          "l"(ptr),
+      "r"(value)
+      : "memory");
 }
 
 template <int kPending>
@@ -431,6 +470,223 @@ void tp4_moe_owner_mhc_post_kernel(
   device::PDLTriggerSecondary<kUsePDL>();
 }
 
+// Persistent owner protocol.  The first phase reduces the rank-owned token
+// quarter.  A software grid barrier publishes completion through peer-visible
+// system-scope flags.  Once all four ranks have published the same epoch, the
+// resident grid consumes the owner quarters and applies mHC post.  The caller
+// retains the barriers before and after this kernel for producer publication
+// and workspace-reuse safety; the expensive middle symmetric-memory barrier
+// and one launch boundary disappear.
+template <bool kUsePDL>
+__global__ __launch_bounds__(kTp4MoeMhcThreads, 4)
+void tp4_moe_owner_persistent_kernel(
+    const Tp4MoeOwnerPersistentParams __grid_constant__ params) {
+  device::PDLWaitPrimary<kUsePDL>();
+  const uint32_t tid = threadIdx.x;
+  const uint32_t owner_rank = params.owner_rank;
+  uint32_t* peer_flags[4] = {
+      params.flags0, params.flags1, params.flags2, params.flags3};
+  uint32_t* local_flags = peer_flags[owner_rank];
+
+  // Every block samples the previous epoch before any block can publish the
+  // next one: publication requires all resident blocks to reach the arrival
+  // counter below.
+  const uint32_t previous_epoch = tp4_moe_mhc_load_acquire_sys(
+      local_flags + kTp4OwnerFlagProducedEpoch);
+  const uint32_t next_epoch = previous_epoch + 1;
+
+  const __nv_bfloat16* inputs[4] = {
+      params.post.input0,
+      params.post.input1,
+      params.post.input2,
+      params.post.input3};
+  __nv_bfloat16* local_output = const_cast<__nv_bfloat16*>(
+      inputs[owner_rank]);
+  const uint64_t owner_elements =
+      static_cast<uint64_t>(params.post.num_tokens / 4) *
+      kTp4MoeMhcHidden;
+  const uint64_t owner_first =
+      static_cast<uint64_t>(owner_rank) * owner_elements;
+  const uint64_t num_vectors = owner_elements / kTp4MoeMhcVec;
+  const uint64_t vector_index =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + tid;
+  const uint64_t vector_stride =
+      static_cast<uint64_t>(gridDim.x) * blockDim.x;
+  constexpr uint32_t kPairsPerVector = kTp4MoeMhcVec / 2;
+
+  for (uint64_t vector = vector_index; vector < num_vectors;
+       vector += vector_stride) {
+    const uint64_t element = owner_first + vector * kTp4MoeMhcVec;
+    const uint4 input0_raw =
+        *reinterpret_cast<const uint4*>(params.post.input0 + element);
+    const uint4 input1_raw =
+        *reinterpret_cast<const uint4*>(params.post.input1 + element);
+    const uint4 input2_raw =
+        *reinterpret_cast<const uint4*>(params.post.input2 + element);
+    const uint4 input3_raw =
+        *reinterpret_cast<const uint4*>(params.post.input3 + element);
+    uint4 reduced_raw;
+    const auto* input0_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input0_raw);
+    const auto* input1_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input1_raw);
+    const auto* input2_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input2_raw);
+    const auto* input3_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input3_raw);
+    auto* reduced_pairs = reinterpret_cast<__nv_bfloat162*>(&reduced_raw);
+    const uint32_t group = static_cast<uint32_t>(
+        (element % kNCCLPeriodElements) / kNCCLChannelGroupElements);
+#pragma unroll
+    for (uint32_t pair = 0; pair < kPairsPerVector; ++pair) {
+      reduced_pairs[pair] = tp4_moe_mhc_add4_ordered(
+          input0_pairs[pair],
+          input1_pairs[pair],
+          input2_pairs[pair],
+          input3_pairs[pair],
+          group);
+    }
+    *reinterpret_cast<uint4*>(local_output + element) = reduced_raw;
+  }
+
+  // The resident-grid barrier also performs a system-scope publication of
+  // every block's owner-quarter writes.  The final arriving block advances
+  // the epoch only after all blocks have fenced their stores.
+  __syncthreads();
+  if (tid == 0) {
+    __threadfence_system();
+    const uint32_t ticket = atomicAdd(
+        local_flags + kTp4OwnerFlagArrived, 1U);
+    if (ticket + 1 == gridDim.x) {
+      atomicExch(local_flags + kTp4OwnerFlagArrived, 0U);
+      tp4_moe_mhc_store_release_sys(
+          local_flags + kTp4OwnerFlagProducedEpoch, next_epoch);
+    }
+  }
+  __syncthreads();
+  while (tp4_moe_mhc_load_acquire_sys(
+             local_flags + kTp4OwnerFlagProducedEpoch) != next_epoch) {
+    __nanosleep(64);
+  }
+
+  // One CTA polls the four peer epochs.  It releases the local grid with a
+  // second system-scope flag, keeping the cross-rank control loop on GPU.
+  if (blockIdx.x == 0 && tid == 0) {
+    bool ready = false;
+    while (!ready) {
+      ready = true;
+#pragma unroll
+      for (uint32_t peer = 0; peer < 4; ++peer) {
+        ready = ready &&
+            tp4_moe_mhc_load_acquire_sys(
+                peer_flags[peer] + kTp4OwnerFlagProducedEpoch) ==
+                next_epoch;
+      }
+      if (!ready) {
+        __nanosleep(128);
+      }
+    }
+    tp4_moe_mhc_store_release_sys(
+        local_flags + kTp4OwnerFlagPeerReadyEpoch, next_epoch);
+  }
+  __syncthreads();
+  while (tp4_moe_mhc_load_acquire_sys(
+             local_flags + kTp4OwnerFlagPeerReadyEpoch) != next_epoch) {
+    __nanosleep(64);
+  }
+  __syncthreads();
+
+  __shared__ float coefficients[
+      kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
+  constexpr uint32_t kChunksPerToken =
+      kTp4MoeMhcHidden / kTp4MoeMhcVec;
+  const uint32_t owner_tokens = params.post.num_tokens / 4;
+  for (uint32_t token = blockIdx.x; token < params.post.num_tokens;
+       token += gridDim.x) {
+    if (tid < kTp4MoeMhcHC) {
+      coefficients[tid] =
+          params.post.post_mix[token * kTp4MoeMhcHC + tid];
+    }
+    if (tid < kTp4MoeMhcHC * kTp4MoeMhcHC) {
+      coefficients[kTp4MoeMhcHC + tid] =
+          params.post.comb_mix[
+              token * kTp4MoeMhcHC * kTp4MoeMhcHC + tid];
+    }
+    __syncthreads();
+
+    const uint32_t token_owner = token / owner_tokens;
+    const __nv_bfloat16* owner_input = inputs[token_owner];
+    const uint64_t hidden_base =
+        static_cast<uint64_t>(token) * kTp4MoeMhcHidden;
+    const uint64_t residual_base =
+        static_cast<uint64_t>(token) * kTp4MoeMhcHC * kTp4MoeMhcHidden;
+    auto* output_chunks = reinterpret_cast<uint4*>(
+        params.post.output + residual_base);
+
+    for (uint32_t chunk = tid; chunk < kChunksPerToken;
+         chunk += kTp4MoeMhcThreads) {
+      const uint4 hidden_raw = *reinterpret_cast<const uint4*>(
+          owner_input + hidden_base +
+          static_cast<uint64_t>(chunk) * kTp4MoeMhcVec);
+      const auto* hidden_pairs =
+          reinterpret_cast<const __nv_bfloat162*>(&hidden_raw);
+      float2 hidden_values[kTp4MoeMhcVec / 2];
+#pragma unroll
+      for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+        hidden_values[pair] = __bfloat1622float2(hidden_pairs[pair]);
+      }
+
+      float2 residual_values[kTp4MoeMhcHC][kTp4MoeMhcVec / 2];
+#pragma unroll
+      for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+           ++input_route) {
+        const auto* route_chunks = reinterpret_cast<const uint4*>(
+            params.post.residual + residual_base +
+            static_cast<uint64_t>(input_route) * kTp4MoeMhcHidden);
+        const uint4 residual_raw = route_chunks[chunk];
+        residual_values[input_route][0] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.x));
+        residual_values[input_route][1] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.y));
+        residual_values[input_route][2] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.z));
+        residual_values[input_route][3] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.w));
+      }
+
+#pragma unroll
+      for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
+           ++output_route) {
+        __nv_bfloat162 rounded[kTp4MoeMhcVec / 2];
+#pragma unroll
+        for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+          float2 value = make_float2(
+              coefficients[output_route] * hidden_values[pair].x,
+              coefficients[output_route] * hidden_values[pair].y);
+#pragma unroll
+          for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+               ++input_route) {
+            value = tp4_moe_mhc_fma2(
+                coefficients[
+                    kTp4MoeMhcHC +
+                    input_route * kTp4MoeMhcHC + output_route],
+                residual_values[input_route][pair],
+                value);
+          }
+          rounded[pair] = __float22bfloat162_rn(value);
+        }
+        output_chunks[output_route * kChunksPerToken + chunk] = make_uint4(
+            tp4_moe_mhc_bf16x2_to_uint(rounded[0]),
+            tp4_moe_mhc_bf16x2_to_uint(rounded[1]),
+            tp4_moe_mhc_bf16x2_to_uint(rounded[2]),
+            tp4_moe_mhc_bf16x2_to_uint(rounded[3]));
+      }
+    }
+    __syncthreads();
+  }
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 template <bool kUsePDL>
 struct Tp4MoeMhcPostKernel {
   static void run(
@@ -679,6 +935,96 @@ struct Tp4MoeMhcPostKernel {
         device.unwrap())
         .enable_pdl(kUsePDL)(
             tp4_moe_owner_mhc_post_kernel<kUsePDL>, params);
+  }
+
+  static void run_owner_persistent(
+      const tvm::ffi::TensorView input0,
+      const tvm::ffi::TensorView input1,
+      const tvm::ffi::TensorView input2,
+      const tvm::ffi::TensorView input3,
+      const tvm::ffi::TensorView flags0,
+      const tvm::ffi::TensorView flags1,
+      const tvm::ffi::TensorView flags2,
+      const tvm::ffi::TensorView flags3,
+      int64_t owner_rank,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView post_mix,
+      const tvm::ffi::TensorView comb_mix,
+      const tvm::ffi::TensorView output) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto M = SymbolicSize{"num_tokens"};
+    device.set_options<kDLCUDA>();
+    for (const auto tensor : {input0, input1, input2, input3}) {
+      TensorMatcher({M, kTp4MoeMhcHidden})
+          .with_strides({kTp4MoeMhcHidden, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .verify(tensor);
+    }
+    for (const auto tensor : {flags0, flags1, flags2, flags3}) {
+      TensorMatcher({kTp4OwnerFlagCount})
+          .with_strides({1})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(tensor);
+    }
+    TensorMatcher({M, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(residual);
+    TensorMatcher({M, kTp4MoeMhcHC})
+        .with_strides({kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(post_mix);
+    TensorMatcher({M, kTp4MoeMhcHC, kTp4MoeMhcHC})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHC, kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(comb_mix);
+    TensorMatcher({M, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+    RuntimeCheck(
+        M.unwrap() == 65536 || M.unwrap() == 131072,
+        "TP4 persistent owner protocol only supports M=65536 or M=131072");
+    RuntimeCheck(
+        owner_rank >= 0 && owner_rank < 4,
+        "TP4 persistent owner protocol requires owner_rank in [0,4)");
+
+    const auto post_params = Tp4MoeMhcPostParams{
+        .input0 = reinterpret_cast<const __nv_bfloat16*>(input0.data_ptr()),
+        .input1 = reinterpret_cast<const __nv_bfloat16*>(input1.data_ptr()),
+        .input2 = reinterpret_cast<const __nv_bfloat16*>(input2.data_ptr()),
+        .input3 = reinterpret_cast<const __nv_bfloat16*>(input3.data_ptr()),
+        .multicast_input = nullptr,
+        .residual = reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        .post_mix = static_cast<const float*>(post_mix.data_ptr()),
+        .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
+        .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .num_tokens = static_cast<uint32_t>(M.unwrap()),
+    };
+    const auto params = Tp4MoeOwnerPersistentParams{
+        .post = post_params,
+        .flags0 = reinterpret_cast<uint32_t*>(flags0.data_ptr()),
+        .flags1 = reinterpret_cast<uint32_t*>(flags1.data_ptr()),
+        .flags2 = reinterpret_cast<uint32_t*>(flags2.data_ptr()),
+        .flags3 = reinterpret_cast<uint32_t*>(flags3.data_ptr()),
+        .owner_rank = static_cast<uint32_t>(owner_rank),
+    };
+    LaunchKernel(
+        kTp4OwnerPersistentBlocks,
+        kTp4MoeMhcThreads,
+        device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_moe_owner_persistent_kernel<kUsePDL>, params);
   }
 };
 

@@ -99,7 +99,7 @@ def mhc_post_vec8(
 def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
     args = make_cpp_args(use_pdl)
     return load_jit(
-        make_name("tp4_moe_mhc_post_hc4_h4096_owner_v56_launch_bounds4"),
+        make_name("tp4_moe_mhc_post_hc4_h4096_owner_v57_persistent"),
         *args,
         cuda_files=["deepseek_v4/tp4_moe_mhc_post.cuh"],
         cuda_wrappers=[
@@ -115,6 +115,10 @@ def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
             (
                 "run_owner_post",
                 f"Tp4MoeMhcPostKernel<{args}>::run_owner_post",
+            ),
+            (
+                "run_owner_persistent",
+                f"Tp4MoeMhcPostKernel<{args}>::run_owner_persistent",
             ),
         ],
         extra_cuda_cflags=["--use_fast_math"],
@@ -213,6 +217,43 @@ def _tp4_moe_owner_mhc_post_custom_op(
         input1,
         input2,
         input3,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_moe_owner_persistent",
+    mutates_args=["flags0", "flags1", "flags2", "flags3", "output"],
+)
+def _tp4_moe_owner_persistent_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    flags0: torch.Tensor,
+    flags1: torch.Tensor,
+    flags2: torch.Tensor,
+    flags3: torch.Tensor,
+    owner_rank: int,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_owner_persistent(
+        input0,
+        input1,
+        input2,
+        input3,
+        flags0,
+        flags1,
+        flags2,
+        flags3,
+        owner_rank,
         residual,
         post_mix,
         comb_mix,
@@ -347,6 +388,69 @@ def tp4_moe_owner_mhc_post(
             raise RuntimeError(f"invalid TP4 owner mHC tensor, expected {shape} {dtype}")
     _tp4_moe_owner_mhc_post_custom_op(
         *owners, residual, post_mix, comb_mix, output
+    )
+    return output
+
+
+@debug_kernel_api
+def tp4_moe_owner_persistent(
+    owners: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    flags: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    owner_rank: int,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse owner reduction, GPU peer synchronization and mHC post."""
+
+    if len(owners) != 4 or len(flags) != 4 or owner_rank not in range(4):
+        raise RuntimeError(
+            "TP4 persistent owner protocol requires four owners/flags and rank 0..3"
+        )
+    m = residual.shape[0]
+    expected = (
+        *((tensor, (m, 4096), torch.bfloat16) for tensor in owners),
+        *((tensor, (4,), torch.int32) for tensor in flags),
+        (residual, (m, 4, 4096), torch.bfloat16),
+        (post_mix, (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (output, (m, 4, 4096), torch.bfloat16),
+    )
+    if m not in (65536, 131072):
+        raise RuntimeError(
+            "TP4 persistent owner protocol requires M=65536 or M=131072"
+        )
+    device = residual.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or tensor.device != device
+            or device.type != "cuda"
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"invalid TP4 persistent owner tensor, expected {shape} {dtype}"
+            )
+    _tp4_moe_owner_persistent_custom_op(
+        *owners,
+        *flags,
+        owner_rank,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
     )
     return output
 
@@ -1496,6 +1600,7 @@ __all__ = [
     "tp4_fused_reduce_push_bf16_gather",
     "tp4_moe_mhc_post",
     "tp4_moe_owner_mhc_post",
+    "tp4_moe_owner_persistent",
     "tp4_moe_owner_reduce",
     "tp4_moe_mhc_post_multimem",
     "tp4_nccl_ring_bf16_reduce",
