@@ -112,11 +112,6 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     moe_partial_peer1: Optional[torch.Tensor]
     moe_partial_peer2: Optional[torch.Tensor]
     moe_partial_peer3: Optional[torch.Tensor]
-    moe_sync_peer0: Optional[torch.Tensor]
-    moe_sync_peer1: Optional[torch.Tensor]
-    moe_sync_peer2: Optional[torch.Tensor]
-    moe_sync_peer3: Optional[torch.Tensor]
-    moe_sync_epoch: int
     attention_packed_send: Optional[torch.Tensor]
     attention_packed_recv: Optional[torch.Tensor]
     attention_packed_recv_q: Optional[torch.Tensor]
@@ -247,7 +242,6 @@ class DSV4WholeLayerRuntime:
                 "TP4 direct output gather requires the local WO_B path"
             )
         self._generation = 0
-        self._forward_serial = 0
         self._handles: tuple[DSV4LayerHandle, ...] = ()
         self._active: Optional[DSV4ForwardDescriptor] = None
         self._clustered_logits_workspace: Optional[torch.Tensor] = None
@@ -672,8 +666,6 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError("nested DSV4 huge-runtime forwards are unsupported")
         if not self._handles:
             raise RuntimeError("DSV4 huge runtime was not bound after weight loading")
-        self._forward_serial = self._forward_serial % 0x7FFFFFFF + 1
-        moe_sync_epoch = self._forward_serial
         is_graph_capture = get_is_capture_mode()
         mode = forward_batch.forward_mode
         if not mode.is_extend_without_speculative():
@@ -831,21 +823,6 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1 = moe_partial_peers[1]
             moe_partial_peer2 = moe_partial_peers[2]
             moe_partial_peer3 = moe_partial_peers[3]
-            # FlashInfer only writes the first M*4096 BF16 values.  Reuse 1 KiB
-            # immediately after that MoE output as per-forward stream-mem-op
-            # signals; the earlier attention consumer has already finished,
-            # and the final per-layer barrier protects the next Q producer.
-            moe_sync_offset = num_tokens * 2048
-            moe_sync_peers = tuple(
-                peer.view(-1).view(torch.int32)[
-                    moe_sync_offset : moe_sync_offset + 256
-                ]
-                for peer in attention_q_peers
-            )
-            moe_sync_peer0 = moe_sync_peers[0]
-            moe_sync_peer1 = moe_sync_peers[1]
-            moe_sync_peer2 = moe_sync_peers[2]
-            moe_sync_peer3 = moe_sync_peers[3]
             if (
                 self._use_tp4_local_wob_direct_gather
                 and tp4_token_shard_attention
@@ -938,10 +915,6 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1 = None
             moe_partial_peer2 = None
             moe_partial_peer3 = None
-            moe_sync_peer0 = None
-            moe_sync_peer1 = None
-            moe_sync_peer2 = None
-            moe_sync_peer3 = None
             attention_packed_send, attention_packed_recv = None, None
             attention_packed_recv_q = None
             attention_projected_local = None
@@ -1017,11 +990,6 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1=moe_partial_peer1,
             moe_partial_peer2=moe_partial_peer2,
             moe_partial_peer3=moe_partial_peer3,
-            moe_sync_peer0=moe_sync_peer0,
-            moe_sync_peer1=moe_sync_peer1,
-            moe_sync_peer2=moe_sync_peer2,
-            moe_sync_peer3=moe_sync_peer3,
-            moe_sync_epoch=moe_sync_epoch,
             attention_packed_send=attention_packed_send,
             attention_packed_recv=attention_packed_recv,
             attention_packed_recv_q=attention_packed_recv_q,
@@ -1810,16 +1778,9 @@ def _execute_common(
         descriptor.moe_partial_peer2,
         descriptor.moe_partial_peer3,
     )
-    moe_syncs = (
-        descriptor.moe_sync_peer0,
-        descriptor.moe_sync_peer1,
-        descriptor.moe_sync_peer2,
-        descriptor.moe_sync_peer3,
-    )
     if (
         moe_partial_local is None
         or any(partial is None for partial in moe_partials)
-        or any(sync is None for sync in moe_syncs)
         or descriptor.attention_q_handle is None
     ):
         raise RuntimeError(
@@ -1855,10 +1816,9 @@ def _execute_common(
     descriptor.attention_q_handle.barrier(channel=barrier_channel)
     hidden_states = _huge_tp4_moe_mhc_post(
         partials=moe_partials,
-        syncs=moe_syncs,
         owner_rank=descriptor.attention_q_rank,
-        layer_id=handle.layer_id,
-        epoch=descriptor.moe_sync_epoch,
+        symmetric_handle=descriptor.attention_q_handle,
+        barrier_channel=barrier_channel,
         residual=residual,
         post=post,
         comb=comb,
@@ -1992,10 +1952,9 @@ def _huge_mhc_post(
 def _huge_tp4_moe_mhc_post(
     *,
     partials: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    syncs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     owner_rank: int,
-    layer_id: int,
-    epoch: int,
+    symmetric_handle: Any,
+    barrier_channel: int,
     residual: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
@@ -2006,15 +1965,13 @@ def _huge_tp4_moe_mhc_post(
     from sglang.jit_kernel.dsv4.e2e import (
         tp4_moe_owner_mhc_post,
         tp4_moe_owner_reduce,
-        tp4_stream_mem_barrier,
     )
 
     tp4_moe_owner_reduce(partials, partials[owner_rank], owner_rank)
-    # Publish and wait for the four disjoint owner quarters without launching
-    # a barrier kernel.  The driver enqueues one fenced local signal and three
-    # remote waits on the current CUDA stream; mHC starts only after the peer
-    # writes become visible.
-    tp4_stream_mem_barrier(syncs, owner_rank, layer_id * 3 + 1, epoch)
+    # Publish the four disjoint reduced token quarters.  This is the only new
+    # hard boundary versus the previous direct four-peer kernel; all owner
+    # routing and mHC math remain device-side.
+    symmetric_handle.barrier(channel=barrier_channel)
     return tp4_moe_owner_mhc_post(partials, residual, post, comb, output)
 
 

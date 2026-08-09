@@ -11,7 +11,6 @@
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
-#include <cuda.h>
 #include <cuda_bf16.h>
 
 namespace {
@@ -20,7 +19,6 @@ constexpr uint32_t kTp4MoeMhcHC = 4;
 constexpr uint32_t kTp4MoeMhcHidden = 4096;
 constexpr uint32_t kTp4MoeMhcVec = 8;
 constexpr uint32_t kTp4MoeMhcThreads = 256;
-constexpr uint32_t kTp4MoeSyncSlots = 256;
 constexpr uint64_t kNCCLChannelGroupElements = 1ULL << 20;
 constexpr uint64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 
@@ -668,68 +666,6 @@ struct Tp4MoeMhcPostKernel {
     LaunchKernel(M.unwrap(), kTp4MoeMhcThreads, device.unwrap())
         .enable_pdl(kUsePDL)(
             tp4_moe_owner_mhc_post_kernel<kUsePDL>, params);
-  }
-
-  static void run_stream_barrier(
-      const tvm::ffi::TensorView sync0,
-      const tvm::ffi::TensorView sync1,
-      const tvm::ffi::TensorView sync2,
-      const tvm::ffi::TensorView sync3,
-      int64_t local_rank,
-      int64_t slot,
-      int64_t epoch) {
-    using namespace host;
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
-    for (const auto tensor : {sync0, sync1, sync2, sync3}) {
-      TensorMatcher({kTp4MoeSyncSlots})
-          .with_strides({1})
-          .with_dtype<int32_t>()
-          .with_device(device)
-          .verify(tensor);
-    }
-    RuntimeCheck(
-        local_rank >= 0 && local_rank < 4,
-        "TP4 stream barrier requires local_rank in [0,4)");
-    RuntimeCheck(
-        slot >= 0 && slot < kTp4MoeSyncSlots,
-        "TP4 stream barrier slot is out of range");
-    RuntimeCheck(
-        epoch > 0 && epoch <= 0x7fffffff,
-        "TP4 stream barrier epoch must be in [1,2^31-1]");
-
-    const tvm::ffi::TensorView syncs[4] = {sync0, sync1, sync2, sync3};
-    CUstreamBatchMemOpParams operations[4]{};
-    operations[0].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_32;
-    operations[0].writeValue.address = reinterpret_cast<CUdeviceptr>(
-        static_cast<int32_t*>(syncs[local_rank].data_ptr()) + slot);
-    operations[0].writeValue.value = static_cast<cuuint32_t>(epoch);
-    operations[0].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
-
-    uint32_t operation_count = 1;
-    for (int rank = 0; rank < 4; ++rank) {
-      if (rank == local_rank) {
-        continue;
-      }
-      auto& wait = operations[operation_count++].waitValue;
-      wait.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
-      wait.address = reinterpret_cast<CUdeviceptr>(
-          static_cast<int32_t*>(syncs[rank].data_ptr()) + slot);
-      wait.value = static_cast<cuuint32_t>(epoch);
-      wait.flags = CU_STREAM_WAIT_VALUE_EQ;
-    }
-
-    const cudaStream_t runtime_stream =
-        LaunchKernel::resolve_device(device.unwrap());
-    const CUresult result = cuStreamBatchMemOp(
-        reinterpret_cast<CUstream>(runtime_stream),
-        operation_count,
-        operations,
-        0);
-    RuntimeCheck(
-        result == CUDA_SUCCESS,
-        "TP4 stream-ordered symmetric barrier requires CUDA stream mem-op "
-        "support for the symmetric peer mapping");
   }
 };
 
