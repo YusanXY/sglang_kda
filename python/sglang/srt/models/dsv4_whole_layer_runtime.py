@@ -2012,10 +2012,15 @@ def _separate_mhc_post_ffn_pre(
         post=post,
         comb=comb,
         output=descriptor.mhc_residual_mid,
-        ready_flags=descriptor.attention_wob_ready_local,
+        ready_flags=(
+            descriptor.attention_wob_ready_local
+            if descriptor.num_tokens == 65536
+            else None
+        ),
         ready_epoch=(
             descriptor.attention_wob_ready_epoch_base + layer.layer_id + 1
-            if descriptor.attention_wob_ready_local is not None
+            if descriptor.num_tokens == 65536
+            and descriptor.attention_wob_ready_local is not None
             else 0
         ),
     )

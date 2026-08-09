@@ -1582,28 +1582,36 @@ class MQALayer(MqaAttentionBase):
                     raise RuntimeError(
                         f"layer {self.layer_id}: incomplete direct output buffers"
                     )
-                ready_peers = (
-                    e2e_descriptor.attention_wob_ready_peer0,
-                    e2e_descriptor.attention_wob_ready_peer1,
-                    e2e_descriptor.attention_wob_ready_peer2,
-                    e2e_descriptor.attention_wob_ready_peer3,
-                )
-                if any(flags is None for flags in ready_peers):
-                    raise RuntimeError(
-                        f"layer {self.layer_id}: incomplete token-ready flags"
+                if e2e_descriptor.num_tokens == 65536:
+                    ready_peers = (
+                        e2e_descriptor.attention_wob_ready_peer0,
+                        e2e_descriptor.attention_wob_ready_peer1,
+                        e2e_descriptor.attention_wob_ready_peer2,
+                        e2e_descriptor.attention_wob_ready_peer3,
                     )
-                ready_epoch = (
-                    e2e_descriptor.attention_wob_ready_epoch_base
-                    + self.layer_id
-                    + 1
-                )
-                tp4_fused_reduce_push_bf16_gather_ready(
-                    wo_b_partial_chunks,
-                    output_peers,
-                    ready_peers,
-                    e2e_descriptor.attention_wob_output_rank,
-                    ready_epoch,
-                )
+                    if any(flags is None for flags in ready_peers):
+                        raise RuntimeError(
+                            f"layer {self.layer_id}: incomplete token-ready flags"
+                        )
+                    ready_epoch = (
+                        e2e_descriptor.attention_wob_ready_epoch_base
+                        + self.layer_id
+                        + 1
+                    )
+                    tp4_fused_reduce_push_bf16_gather_ready(
+                        wo_b_partial_chunks,
+                        output_peers,
+                        ready_peers,
+                        e2e_descriptor.attention_wob_output_rank,
+                        ready_epoch,
+                    )
+                else:
+                    tp4_fused_reduce_push_bf16_gather(
+                        wo_b_partial_chunks,
+                        output_peers,
+                        e2e_descriptor.attention_wob_output_rank,
+                    )
+                    output_handle.barrier(channel=self.layer_id & 1)
             else:
                 tp4_nccl_ring_bf16_reduce(wo_b_partial_chunks, projected_local)
                 get_tp_group().all_gather_into_tensor(
