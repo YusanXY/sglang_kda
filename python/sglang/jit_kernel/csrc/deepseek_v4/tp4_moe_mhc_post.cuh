@@ -21,6 +21,7 @@ constexpr uint32_t kTp4MoeMhcHidden = 4096;
 constexpr uint32_t kTp4MoeMhcVec = 8;
 constexpr uint32_t kTp4MoeMhcThreads = 256;
 constexpr uint32_t kTp4MoeSyncSlots = 256;
+constexpr uint32_t kTp4OwnerPostTokensPerCTA = 4;
 constexpr uint64_t kNCCLChannelGroupElements = 1ULL << 20;
 constexpr uint64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 
@@ -35,6 +36,12 @@ struct Tp4MoeMhcPostParams {
   const float* __restrict__ comb_mix;
   __nv_bfloat16* __restrict__ output;
   uint32_t num_tokens;
+  const int32_t* __restrict__ sync0;
+  const int32_t* __restrict__ sync1;
+  const int32_t* __restrict__ sync2;
+  const int32_t* __restrict__ sync3;
+  uint32_t sync_slot;
+  uint32_t sync_epoch;
 };
 
 union Tp4MoeMhcBf16PairBits {
@@ -328,22 +335,43 @@ template <bool kUsePDL>
 __global__ void tp4_moe_owner_mhc_post_kernel(
     const Tp4MoeMhcPostParams __grid_constant__ params) {
   device::PDLWaitPrimary<kUsePDL>();
-  const uint32_t token = blockIdx.x;
   const uint32_t tid = threadIdx.x;
-  __shared__ float coefficients[
-      kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
-  if (tid < kTp4MoeMhcHC) {
-    coefficients[tid] = params.post_mix[token * kTp4MoeMhcHC + tid];
+  const uint32_t owner_tokens = params.num_tokens / 4;
+  // Interleave owners in launch order so the scheduler always has work for
+  // every ready quarter.  One CTA handles four adjacent tokens from one owner
+  // and amortizes the system-scope acquire and CTA scheduling overhead.
+  const uint32_t owner = blockIdx.x & 3;
+  const uint32_t owner_block = blockIdx.x >> 2;
+  const uint32_t first_token =
+      owner * owner_tokens + owner_block * kTp4OwnerPostTokensPerCTA;
+  const int32_t* owner_sync = params.sync0;
+  if (owner == 1) {
+    owner_sync = params.sync1;
+  } else if (owner == 2) {
+    owner_sync = params.sync2;
+  } else if (owner == 3) {
+    owner_sync = params.sync3;
   }
-  if (tid < kTp4MoeMhcHC * kTp4MoeMhcHC) {
-    coefficients[kTp4MoeMhcHC + tid] =
-        params.comb_mix[
-            token * kTp4MoeMhcHC * kTp4MoeMhcHC + tid];
+  // The owner rank enqueues a system-fenced cuStreamWriteValue32 after its
+  // reduction kernel.  Polling the owner-specific flag inside the already
+  // required post kernel removes the global stream wait: ready quarters can
+  // start independently and no extra barrier kernel is launched.
+  if (tid == 0) {
+    uint32_t ready = 0;
+    do {
+      asm volatile(
+          "ld.acquire.sys.global.u32 %0, [%1];"
+          : "=r"(ready)
+          : "l"(owner_sync + params.sync_slot)
+          : "memory");
+      if (ready != params.sync_epoch) {
+        __nanosleep(64);
+      }
+    } while (ready != params.sync_epoch);
   }
   __syncthreads();
-
-  const uint32_t owner_tokens = params.num_tokens / 4;
-  const uint32_t owner = token / owner_tokens;
+  __shared__ float coefficients[
+      kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
   const __nv_bfloat16* owner_input = params.input0;
   if (owner == 1) {
     owner_input = params.input1;
@@ -354,71 +382,88 @@ __global__ void tp4_moe_owner_mhc_post_kernel(
   }
   constexpr uint32_t kChunksPerToken =
       kTp4MoeMhcHidden / kTp4MoeMhcVec;
-  const uint64_t hidden_base =
-      static_cast<uint64_t>(token) * kTp4MoeMhcHidden;
-  const uint64_t residual_base =
-      static_cast<uint64_t>(token) * kTp4MoeMhcHC * kTp4MoeMhcHidden;
-  auto* output_chunks = reinterpret_cast<uint4*>(
-      params.output + residual_base);
-
-  for (uint32_t chunk = tid; chunk < kChunksPerToken;
-       chunk += kTp4MoeMhcThreads) {
-    const uint4 hidden_raw = *reinterpret_cast<const uint4*>(
-        owner_input + hidden_base +
-        static_cast<uint64_t>(chunk) * kTp4MoeMhcVec);
-    const auto* hidden_pairs =
-        reinterpret_cast<const __nv_bfloat162*>(&hidden_raw);
-    float2 hidden_values[kTp4MoeMhcVec / 2];
-#pragma unroll
-    for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
-      hidden_values[pair] = __bfloat1622float2(hidden_pairs[pair]);
+  for (uint32_t token_offset = 0;
+       token_offset < kTp4OwnerPostTokensPerCTA;
+       ++token_offset) {
+    const uint32_t token = first_token + token_offset;
+    if (tid < kTp4MoeMhcHC) {
+      coefficients[tid] =
+          params.post_mix[token * kTp4MoeMhcHC + tid];
     }
-
-    float2 residual_values[kTp4MoeMhcHC][kTp4MoeMhcVec / 2];
-#pragma unroll
-    for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
-         ++input_route) {
-      const auto* route_chunks = reinterpret_cast<const uint4*>(
-          params.residual + residual_base +
-          static_cast<uint64_t>(input_route) * kTp4MoeMhcHidden);
-      const uint4 residual_raw = route_chunks[chunk];
-      residual_values[input_route][0] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.x));
-      residual_values[input_route][1] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.y));
-      residual_values[input_route][2] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.z));
-      residual_values[input_route][3] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.w));
+    if (tid < kTp4MoeMhcHC * kTp4MoeMhcHC) {
+      coefficients[kTp4MoeMhcHC + tid] =
+          params.comb_mix[
+              token * kTp4MoeMhcHC * kTp4MoeMhcHC + tid];
     }
+    __syncthreads();
 
-#pragma unroll
-    for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
-         ++output_route) {
-      __nv_bfloat162 rounded[kTp4MoeMhcVec / 2];
+    const uint64_t hidden_base =
+        static_cast<uint64_t>(token) * kTp4MoeMhcHidden;
+    const uint64_t residual_base =
+        static_cast<uint64_t>(token) * kTp4MoeMhcHC * kTp4MoeMhcHidden;
+    auto* output_chunks = reinterpret_cast<uint4*>(
+        params.output + residual_base);
+
+    for (uint32_t chunk = tid; chunk < kChunksPerToken;
+         chunk += kTp4MoeMhcThreads) {
+      const uint4 hidden_raw = *reinterpret_cast<const uint4*>(
+          owner_input + hidden_base +
+          static_cast<uint64_t>(chunk) * kTp4MoeMhcVec);
+      const auto* hidden_pairs =
+          reinterpret_cast<const __nv_bfloat162*>(&hidden_raw);
+      float2 hidden_values[kTp4MoeMhcVec / 2];
 #pragma unroll
       for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
-        float2 value = make_float2(
-            coefficients[output_route] * hidden_values[pair].x,
-            coefficients[output_route] * hidden_values[pair].y);
-#pragma unroll
-        for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
-             ++input_route) {
-          value = tp4_moe_mhc_fma2(
-              coefficients[
-                  kTp4MoeMhcHC +
-                  input_route * kTp4MoeMhcHC + output_route],
-              residual_values[input_route][pair],
-              value);
-        }
-        rounded[pair] = __float22bfloat162_rn(value);
+        hidden_values[pair] = __bfloat1622float2(hidden_pairs[pair]);
       }
-      output_chunks[output_route * kChunksPerToken + chunk] = make_uint4(
-          tp4_moe_mhc_bf16x2_to_uint(rounded[0]),
-          tp4_moe_mhc_bf16x2_to_uint(rounded[1]),
-          tp4_moe_mhc_bf16x2_to_uint(rounded[2]),
-          tp4_moe_mhc_bf16x2_to_uint(rounded[3]));
+
+      float2 residual_values[kTp4MoeMhcHC][kTp4MoeMhcVec / 2];
+#pragma unroll
+      for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+           ++input_route) {
+        const auto* route_chunks = reinterpret_cast<const uint4*>(
+            params.residual + residual_base +
+            static_cast<uint64_t>(input_route) * kTp4MoeMhcHidden);
+        const uint4 residual_raw = route_chunks[chunk];
+        residual_values[input_route][0] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.x));
+        residual_values[input_route][1] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.y));
+        residual_values[input_route][2] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.z));
+        residual_values[input_route][3] = __bfloat1622float2(
+            tp4_moe_mhc_uint_to_bf16x2(residual_raw.w));
+      }
+
+#pragma unroll
+      for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
+           ++output_route) {
+        __nv_bfloat162 rounded[kTp4MoeMhcVec / 2];
+#pragma unroll
+        for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+          float2 value = make_float2(
+              coefficients[output_route] * hidden_values[pair].x,
+              coefficients[output_route] * hidden_values[pair].y);
+#pragma unroll
+          for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+               ++input_route) {
+            value = tp4_moe_mhc_fma2(
+                coefficients[
+                    kTp4MoeMhcHC +
+                    input_route * kTp4MoeMhcHC + output_route],
+                residual_values[input_route][pair],
+                value);
+          }
+          rounded[pair] = __float22bfloat162_rn(value);
+        }
+        output_chunks[output_route * kChunksPerToken + chunk] = make_uint4(
+            tp4_moe_mhc_bf16x2_to_uint(rounded[0]),
+            tp4_moe_mhc_bf16x2_to_uint(rounded[1]),
+            tp4_moe_mhc_bf16x2_to_uint(rounded[2]),
+            tp4_moe_mhc_bf16x2_to_uint(rounded[3]));
+      }
     }
+    __syncthreads();
   }
   device::PDLTriggerSecondary<kUsePDL>();
 }
@@ -612,6 +657,12 @@ struct Tp4MoeMhcPostKernel {
       const tvm::ffi::TensorView input1,
       const tvm::ffi::TensorView input2,
       const tvm::ffi::TensorView input3,
+      const tvm::ffi::TensorView sync0,
+      const tvm::ffi::TensorView sync1,
+      const tvm::ffi::TensorView sync2,
+      const tvm::ffi::TensorView sync3,
+      int64_t sync_slot,
+      int64_t sync_epoch,
       const tvm::ffi::TensorView residual,
       const tvm::ffi::TensorView post_mix,
       const tvm::ffi::TensorView comb_mix,
@@ -627,6 +678,19 @@ struct Tp4MoeMhcPostKernel {
           .with_device(device)
           .verify(tensor);
     }
+    for (const auto tensor : {sync0, sync1, sync2, sync3}) {
+      TensorMatcher({kTp4MoeSyncSlots})
+          .with_strides({1})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(tensor);
+    }
+    RuntimeCheck(
+        sync_slot >= 0 && sync_slot < kTp4MoeSyncSlots,
+        "TP4 owner post sync slot is out of range");
+    RuntimeCheck(
+        sync_epoch > 0 && sync_epoch <= 0x7fffffff,
+        "TP4 owner post sync epoch must be in [1,2^31-1]");
     TensorMatcher({M, kTp4MoeMhcHC, kTp4MoeMhcHidden})
         .with_strides(
             {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
@@ -664,33 +728,33 @@ struct Tp4MoeMhcPostKernel {
         .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
         .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
         .num_tokens = static_cast<uint32_t>(M.unwrap()),
+        .sync0 = static_cast<const int32_t*>(sync0.data_ptr()),
+        .sync1 = static_cast<const int32_t*>(sync1.data_ptr()),
+        .sync2 = static_cast<const int32_t*>(sync2.data_ptr()),
+        .sync3 = static_cast<const int32_t*>(sync3.data_ptr()),
+        .sync_slot = static_cast<uint32_t>(sync_slot),
+        .sync_epoch = static_cast<uint32_t>(sync_epoch),
     };
-    LaunchKernel(M.unwrap(), kTp4MoeMhcThreads, device.unwrap())
+    LaunchKernel(
+        M.unwrap() / kTp4OwnerPostTokensPerCTA,
+        kTp4MoeMhcThreads,
+        device.unwrap())
         .enable_pdl(kUsePDL)(
             tp4_moe_owner_mhc_post_kernel<kUsePDL>, params);
   }
 
-  static void run_stream_barrier(
-      const tvm::ffi::TensorView sync0,
-      const tvm::ffi::TensorView sync1,
-      const tvm::ffi::TensorView sync2,
-      const tvm::ffi::TensorView sync3,
-      int64_t local_rank,
+  static void run_stream_signal(
+      const tvm::ffi::TensorView local_sync,
       int64_t slot,
       int64_t epoch) {
     using namespace host;
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    for (const auto tensor : {sync0, sync1, sync2, sync3}) {
-      TensorMatcher({kTp4MoeSyncSlots})
-          .with_strides({1})
-          .with_dtype<int32_t>()
-          .with_device(device)
-          .verify(tensor);
-    }
-    RuntimeCheck(
-        local_rank >= 0 && local_rank < 4,
-        "TP4 stream barrier requires local_rank in [0,4)");
+    TensorMatcher({kTp4MoeSyncSlots})
+        .with_strides({1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(local_sync);
     RuntimeCheck(
         slot >= 0 && slot < kTp4MoeSyncSlots,
         "TP4 stream barrier slot is out of range");
@@ -698,38 +762,17 @@ struct Tp4MoeMhcPostKernel {
         epoch > 0 && epoch <= 0x7fffffff,
         "TP4 stream barrier epoch must be in [1,2^31-1]");
 
-    const tvm::ffi::TensorView syncs[4] = {sync0, sync1, sync2, sync3};
-    CUstreamBatchMemOpParams operations[4]{};
-    operations[0].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_32;
-    operations[0].writeValue.address = reinterpret_cast<CUdeviceptr>(
-        static_cast<int32_t*>(syncs[local_rank].data_ptr()) + slot);
-    operations[0].writeValue.value = static_cast<cuuint32_t>(epoch);
-    operations[0].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
-
-    uint32_t operation_count = 1;
-    for (int rank = 0; rank < 4; ++rank) {
-      if (rank == local_rank) {
-        continue;
-      }
-      auto& wait = operations[operation_count++].waitValue;
-      wait.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
-      wait.address = reinterpret_cast<CUdeviceptr>(
-          static_cast<int32_t*>(syncs[rank].data_ptr()) + slot);
-      wait.value = static_cast<cuuint32_t>(epoch);
-      wait.flags = CU_STREAM_WAIT_VALUE_EQ;
-    }
-
     const cudaStream_t runtime_stream =
         LaunchKernel::resolve_device(device.unwrap());
-    const CUresult result = cuStreamBatchMemOp(
+    const CUresult result = cuStreamWriteValue32(
         reinterpret_cast<CUstream>(runtime_stream),
-        operation_count,
-        operations,
-        0);
+        reinterpret_cast<CUdeviceptr>(
+            static_cast<int32_t*>(local_sync.data_ptr()) + slot),
+        static_cast<cuuint32_t>(epoch),
+        CU_STREAM_WRITE_VALUE_DEFAULT);
     RuntimeCheck(
         result == CUDA_SUCCESS,
-        "TP4 stream-ordered symmetric barrier requires CUDA stream mem-op "
-        "support for the symmetric peer mapping");
+        "TP4 owner-ready signal requires CUDA stream write-value support");
   }
 };
 
