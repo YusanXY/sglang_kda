@@ -290,9 +290,8 @@ __global__ void tp4_fused_reduce_push_bf16_gather_ready_kernel(
   __syncthreads();
   if (threadIdx.x == 0) {
     // The block barrier establishes happens-before from every writer to the
-    // leader; the system fence plus release stores publish the completed token
-    // group to consumers on all four GPUs.
-    __threadfence_system();
+    // leader.  The following system-scope release stores publish that complete
+    // block of remote writes without a redundant explicit system fence.
     const int64_t global_group = output_group_offset + owner_group;
     store_release_sys(ready0 + global_group, ready_epoch);
     store_release_sys(ready1 + global_group, ready_epoch);

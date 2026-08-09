@@ -954,7 +954,7 @@ def inverse_rope_fp8_wo_a_ue8m0(
 def _jit_tp4_nccl_ring_bf16_reduce_module(use_pdl: bool) -> Module:
     args = make_cpp_args(torch.bfloat16, use_pdl)
     return load_jit(
-        make_name("tp4_nccl_ring_bf16_reduce_v66_token_ready"),
+        make_name("tp4_nccl_ring_bf16_reduce_v66b_release_only"),
         *args,
         cuda_files=["deepseek_v4/tp4_nccl_bf16_reduce.cuh"],
         cuda_wrappers=[
