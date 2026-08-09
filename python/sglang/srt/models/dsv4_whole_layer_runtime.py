@@ -280,7 +280,6 @@ class DSV4WholeLayerRuntime:
         ] = None
         self._tp4_symmetric_workspace: Optional[tuple] = None
         self._tp4_symmetric_q_workspace: Optional[tuple] = None
-        self._tp4_moe_sync_workspace: Optional[tuple] = None
         self._tp4_local_wob_output_workspace: Optional[tuple] = None
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
@@ -355,7 +354,6 @@ class DSV4WholeLayerRuntime:
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
         if self._use_tp4_token_shard_attention:
             self._bind_tp4_symmetric_q_workspace(workspace_device)
-            self._bind_tp4_moe_sync_workspace(workspace_device)
         if self._use_tp4_symmetric_wob:
             self._bind_tp4_symmetric_workspace(workspace_device)
         if self._use_tp4_local_wob_direct_gather:
@@ -625,39 +623,6 @@ class DSV4WholeLayerRuntime:
             tp_group.rank_in_group,
         )
 
-    def _bind_tp4_moe_sync_workspace(self, device: torch.device) -> None:
-        """Bind persistent peer-visible GPU control state for owner readiness."""
-        from torch.distributed import _symmetric_memory as symm_mem
-
-        from sglang.srt.distributed import get_tp_group
-
-        cached = self._tp4_moe_sync_workspace
-        if cached is not None and cached[0] == device:
-            return
-        tp_group = get_tp_group()
-        if tp_group.world_size != 4:
-            raise RuntimeError(
-                "TP4 MoE owner signals require TP=4, got "
-                f"{tp_group.world_size}"
-            )
-        local_sync = symm_mem.empty(
-            (256,), dtype=torch.int32, device=device
-        )
-        handle = symm_mem.rendezvous(local_sync, tp_group.device_group)
-        peers = tuple(
-            handle.get_buffer(rank, local_sync.shape, local_sync.dtype)
-            for rank in range(4)
-        )
-        local_sync.zero_()
-        handle.barrier(channel=0)
-        self._tp4_moe_sync_workspace = (
-            device,
-            handle,
-            local_sync,
-            peers,
-            tp_group.rank_in_group,
-        )
-
     def _bind_tp4_local_wob_output_workspace(
         self, device: torch.device
     ) -> None:
@@ -866,19 +831,17 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1 = moe_partial_peers[1]
             moe_partial_peer2 = moe_partial_peers[2]
             moe_partial_peer3 = moe_partial_peers[3]
-            # Keep cross-GPU control state out of the Q/MoE data workspace.
-            # Attention implementations may retain internal stream users of
-            # the latter; this dedicated 1 KiB allocation is rendezvoused once
-            # at bind time and reused without any hot-path allocation.
-            moe_sync_workspace = self._tp4_moe_sync_workspace
-            if (
-                moe_sync_workspace is None
-                or moe_sync_workspace[0] != positions.device
-            ):
-                raise RuntimeError(
-                    "TP4 MoE owner signal workspace was not bound"
-                )
-            moe_sync_peers = moe_sync_workspace[3]
+            # FlashInfer only writes the first M*4096 BF16 values.  Reuse 1 KiB
+            # immediately after that MoE output as per-forward stream-mem-op
+            # signals; the earlier attention consumer has already finished,
+            # and the final per-layer barrier protects the next Q producer.
+            moe_sync_offset = num_tokens * 2048
+            moe_sync_peers = tuple(
+                peer.view(-1).view(torch.int32)[
+                    moe_sync_offset : moe_sync_offset + 256
+                ]
+                for peer in attention_q_peers
+            )
             moe_sync_peer0 = moe_sync_peers[0]
             moe_sync_peer1 = moe_sync_peers[1]
             moe_sync_peer2 = moe_sync_peers[2]
@@ -2043,25 +2006,16 @@ def _huge_tp4_moe_mhc_post(
     from sglang.jit_kernel.dsv4.e2e import (
         tp4_moe_owner_mhc_post,
         tp4_moe_owner_reduce,
-        tp4_stream_mem_signal,
+        tp4_stream_mem_barrier,
     )
 
     tp4_moe_owner_reduce(partials, partials[owner_rank], owner_rank)
-    # Publish only the local owner quarter.  The existing owner-post kernel
-    # performs owner-specific acquire waits on GPU, so ready quarters can run
-    # without a stream-wide head-of-line barrier.
-    sync_slot = layer_id * 3 + 1
-    tp4_stream_mem_signal(syncs[owner_rank], sync_slot, epoch)
-    return tp4_moe_owner_mhc_post(
-        partials,
-        syncs,
-        sync_slot,
-        epoch,
-        residual,
-        post,
-        comb,
-        output,
-    )
+    # Publish and wait for the four disjoint owner quarters without launching
+    # a barrier kernel.  The driver enqueues one fenced local signal and three
+    # remote waits on the current CUDA stream; mHC starts only after the peer
+    # writes become visible.
+    tp4_stream_mem_barrier(syncs, owner_rank, layer_id * 3 + 1, epoch)
+    return tp4_moe_owner_mhc_post(partials, residual, post, comb, output)
 
 
 def _execute_c0(
