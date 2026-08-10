@@ -56,7 +56,10 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.kda import GLM52_ARCHITECTURE, get_kda_operator_for_architecture
 from sglang.srt.layers import deep_gemm_wrapper
@@ -941,6 +944,48 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
+        self._use_prebound_static_dispatch = False
+        self._prebound_static_dispatch_info = None
+        server_args = get_server_args()
+        if (
+            server_args.dsv4_worker_backend == "huge_kernel"
+            and server_args.init_expert_location != "trivial"
+            and not self.is_nextn
+        ):
+            if server_args.enable_eplb:
+                raise RuntimeError(
+                    "DSV4 Huge static expert placement is incompatible with dynamic EPLB"
+                )
+            if server_args.ep_dispatch_algorithm != "static":
+                raise RuntimeError(
+                    "DSV4 Huge nontrivial expert placement requires static dispatch"
+                )
+            metadata = get_global_expert_location_metadata()
+            if metadata is None:
+                raise RuntimeError("DSV4 Huge static expert metadata is not initialized")
+            layer_map = metadata.physical_to_logical_map_cpu[self.layer_id]
+            identity = torch.arange(
+                layer_map.numel(), dtype=layer_map.dtype, device="cpu"
+            )
+            self._use_prebound_static_dispatch = True
+            if not torch.equal(layer_map, identity):
+                self._prebound_static_dispatch_info = (
+                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                )
+
+    def _get_expert_location_dispatch_info(self):
+        if self._use_prebound_static_dispatch:
+            return self._prebound_static_dispatch_info
+        server_args = get_server_args()
+        return (
+            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+            if (
+                server_args.enable_eplb
+                or server_args.init_expert_location != "trivial"
+            )
+            and not self.is_nextn
+            else None
+        )
 
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
@@ -1077,12 +1122,7 @@ class DeepseekV2MoE(nn.Module):
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
-        server_args = get_server_args()
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb and not self.is_nextn
-            else None
-        )
+        dispatch_info = self._get_expert_location_dispatch_info()
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
         if use_flashinfer_trtllm_bypass:
@@ -1174,12 +1214,7 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
-        server_args = get_server_args()
-        dispatch_info = (
-            ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-            if server_args.enable_eplb and not self.is_nextn
-            else None
-        )
+        dispatch_info = self._get_expert_location_dispatch_info()
         defer_shared = not self.experts.moe_runner_config.inplace
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
@@ -1409,13 +1444,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
+                expert_location_dispatch_info=self._get_expert_location_dispatch_info(),
                 **topk_kwargs,
             )
         else:
@@ -1652,13 +1681,7 @@ class DeepseekV2MoE(nn.Module):
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=(
-                        ExpertLocationDispatchInfo.init_new(
-                            layer_id=self.layer_id,
-                        )
-                        if not self.is_nextn
-                        else None
-                    ),
+                    expert_location_dispatch_info=self._get_expert_location_dispatch_info(),
                     **topk_kwargs,
                 )
         else:

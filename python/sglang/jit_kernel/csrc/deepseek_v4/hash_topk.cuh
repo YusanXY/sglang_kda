@@ -24,6 +24,7 @@ struct MoEHashTopKParams {
   const float* __restrict__ router_logits;
   const int64_t* __restrict__ input_id;
   const int32_t* __restrict__ tid2eid;
+  const int64_t* __restrict__ logical_to_physical;
   int32_t* __restrict__ topk_ids;
   float* __restrict__ topk_weights;
   int32_t* __restrict__ packed_topk;
@@ -38,7 +39,7 @@ template <auto Fn, bool kUsePDL>
 __global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ params) {
   using namespace device;
   const auto& [
-    router_logits, input_id, tid2eid, topk_ids, topk_weights, packed_topk, // pointers
+    router_logits, input_id, tid2eid, logical_to_physical, topk_ids, topk_weights, packed_topk, // pointers
     num_tokens, topk, num_routed_experts, num_shared_experts, routed_scaling_factor] =
       params;
 
@@ -63,8 +64,11 @@ __global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ pa
   if (lane_id < topk_fused) {
     const bool is_shared = lane_id >= topk;
     const auto output_offset = warp_id * topk_fused + lane_id;
-    const int32_t output_id =
-        is_shared ? num_routed_experts + lane_id - topk : expert_id;
+    const int32_t output_id = is_shared
+        ? num_routed_experts + lane_id - topk
+        : (logical_to_physical == nullptr
+               ? expert_id
+               : static_cast<int32_t>(logical_to_physical[expert_id]));
     const float output_weight =
         is_shared ? 1.0f / routed_scaling_factor : routed_weight / routed_sum;
     topk_ids[output_offset] = output_id;
@@ -124,6 +128,7 @@ struct HashTopKKernel {
         topk_weights,
         topk_ids,
         routed_scaling_factor,
+        nullptr,
         nullptr);
   }
 
@@ -134,7 +139,8 @@ struct HashTopKKernel {
       const tvm::ffi::TensorView topk_weights,
       const tvm::ffi::TensorView topk_ids,
       float routed_scaling_factor,
-      int32_t* packed_topk) {
+      int32_t* packed_topk,
+      const int64_t* logical_to_physical) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -175,6 +181,7 @@ struct HashTopKKernel {
         .router_logits = static_cast<const float*>(router_logits.data_ptr()),
         .input_id = static_cast<const int64_t*>(input_id.data_ptr()),
         .tid2eid = static_cast<const int32_t*>(tid2eid.data_ptr()),
+        .logical_to_physical = logical_to_physical,
         .topk_ids = static_cast<int32_t*>(topk_ids.data_ptr()),
         .topk_weights = static_cast<float*>(topk_weights.data_ptr()),
         .packed_topk = packed_topk,
@@ -222,7 +229,55 @@ struct HashTopKPackedKernel {
         topk_weights,
         topk_ids,
         routed_scaling_factor,
-        static_cast<int32_t*>(packed_topk.data_ptr()));
+        static_cast<int32_t*>(packed_topk.data_ptr()),
+        nullptr);
+  }
+};
+
+template <auto Fn, bool kUsePDL>
+struct HashTopKPackedMappedKernel {
+  static void
+  run(const tvm::ffi::TensorView router_logits,
+      const tvm::ffi::TensorView input_id,
+      const tvm::ffi::TensorView tid2eid,
+      const tvm::ffi::TensorView topk_weights,
+      const tvm::ffi::TensorView topk_ids,
+      const tvm::ffi::TensorView packed_topk,
+      const tvm::ffi::TensorView logical_to_physical,
+      float routed_scaling_factor) {
+    using namespace host;
+    RuntimeCheck(packed_topk.ndim() == 2, "packed HashTopK output must be 2D");
+    RuntimeCheck(
+        packed_topk.size(0) == topk_ids.size(0) &&
+            packed_topk.size(1) == topk_ids.size(1),
+        "packed HashTopK output shape mismatch");
+    RuntimeCheck(
+        packed_topk.dtype() == DLDataType{kDLInt, 32, 1},
+        "packed HashTopK output must be int32");
+    RuntimeCheck(
+        packed_topk.device().device_type == topk_ids.device().device_type &&
+            packed_topk.device().device_id == topk_ids.device().device_id,
+        "packed HashTopK output device mismatch");
+    RuntimeCheck(logical_to_physical.ndim() == 1, "logical-to-physical map must be 1D");
+    RuntimeCheck(
+        logical_to_physical.size(0) == router_logits.size(1),
+        "logical-to-physical map size mismatch");
+    RuntimeCheck(
+        logical_to_physical.dtype() == DLDataType{kDLInt, 64, 1},
+        "logical-to-physical map must be int64");
+    RuntimeCheck(
+        logical_to_physical.device().device_type == topk_ids.device().device_type &&
+            logical_to_physical.device().device_id == topk_ids.device().device_id,
+        "logical-to-physical map device mismatch");
+    HashTopKKernel<Fn, kUsePDL>::run_impl(
+        router_logits,
+        input_id,
+        tid2eid,
+        topk_weights,
+        topk_ids,
+        routed_scaling_factor,
+        static_cast<int32_t*>(packed_topk.data_ptr()),
+        static_cast<const int64_t*>(logical_to_physical.data_ptr()));
   }
 };
 

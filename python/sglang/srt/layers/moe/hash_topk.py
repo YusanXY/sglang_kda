@@ -197,15 +197,30 @@ class HashTopK(nn.Module):
             from sglang.jit_kernel.dsv4 import hash_topk
 
             packed_topk = None
+            fused_static_map = None
             if self.fuse_packed_routing:
                 if (
                     self.num_fused_shared_experts != 0
                     or num_token_non_padded is not None
-                    or expert_location_dispatch_info is not None
                 ):
                     raise RuntimeError(
                         "DSV4 Huge fused HashTopK packing received unsupported metadata"
                     )
+                if expert_location_dispatch_info is not None:
+                    if (
+                        expert_location_dispatch_info.ep_dispatch_algorithm
+                        != "static"
+                    ):
+                        raise RuntimeError(
+                            "DSV4 Huge fused HashTopK only supports static expert dispatch"
+                        )
+                    fused_static_map = (
+                        expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
+                    )
+                    if fused_static_map is None:
+                        raise RuntimeError(
+                            "DSV4 Huge static expert dispatch requires a rank dispatch map"
+                        )
                 packed_topk = torch.empty(
                     (router_logits.shape[0], self.topk),
                     dtype=torch.int32,
@@ -220,11 +235,13 @@ class HashTopK(nn.Module):
                 routed_scaling_factor=self.routed_scaling_factor,
                 scoring_func=self.score_func,
                 packed_out=packed_topk,
+                logical_to_physical_map=fused_static_map,
             )
         else:
             if self.fuse_packed_routing:
                 raise RuntimeError("DSV4 Huge requires the fused CUDA HashTopK path")
             packed_topk = None
+            fused_static_map = None
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)
         if _is_hip or _is_npu:
             topk_weights = topk_weights.to(torch.float32)
@@ -274,9 +291,10 @@ class HashTopK(nn.Module):
                 ),
             )
         else:
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info, log2phy_prob
-            )
+            if fused_static_map is None:
+                topk_ids = topk_ids_logical_to_physical(
+                    topk_ids, expert_location_dispatch_info, log2phy_prob
+                )
         if is_hip():
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
         else:

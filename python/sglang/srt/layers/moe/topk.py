@@ -1143,6 +1143,20 @@ def biased_topk_jit_kernel_impl(
     else:
         from sglang.jit_kernel.moe_fused_gate import moe_fused_gate
 
+        fused_static_map = None
+        if packed_out is not None and expert_location_dispatch_info is not None:
+            if expert_location_dispatch_info.ep_dispatch_algorithm != "static":
+                raise RuntimeError(
+                    "DSV4 Huge fused routing only supports static expert dispatch"
+                )
+            fused_static_map = (
+                expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
+            )
+            if fused_static_map is None:
+                raise RuntimeError(
+                    "DSV4 Huge static expert dispatch requires a rank dispatch map"
+                )
+
         topk_weights, topk_ids = moe_fused_gate(
             gating_output,
             correction_bias,
@@ -1153,6 +1167,7 @@ def biased_topk_jit_kernel_impl(
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             packed_out=packed_out,
+            logical_to_physical_map=fused_static_map,
         )
         topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(
             torch.int32
@@ -1911,9 +1926,14 @@ def select_experts(
 
     use_dsv4_huge_packed = topk_config.fuse_packed_routing
     if use_dsv4_huge_packed:
+        unsupported_dispatch = expert_location_dispatch_info is not None and (
+            expert_location_dispatch_info.ep_dispatch_algorithm != "static"
+            or expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
+            is None
+        )
         if (
             topk_config.torch_native
-            or expert_location_dispatch_info is not None
+            or unsupported_dispatch
             or num_fused_shared_experts != 0
             or num_token_non_padded is not None
             or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
@@ -2117,6 +2137,11 @@ def select_experts(
         if k > 0:
             topk_weights = torch.full_like(topk_weights, 1.0 / k)
 
+    postprocess_dispatch_info = (
+        None
+        if packed_topk is not None and expert_location_dispatch_info is not None
+        else expert_location_dispatch_info
+    )
     topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
@@ -2124,7 +2149,7 @@ def select_experts(
         router_logits=router_logits,
         num_token_non_padded=num_token_non_padded,
         layer_id=layer_id,
-        expert_location_dispatch_info=expert_location_dispatch_info,
+        expert_location_dispatch_info=postprocess_dispatch_info,
     )
 
     get_global_expert_distribution_recorder().on_select_experts(

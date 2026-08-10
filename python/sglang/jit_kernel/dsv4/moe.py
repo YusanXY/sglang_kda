@@ -29,12 +29,16 @@ def _jit_mask_topk_module():
 def _jit_hash_topk_module():
     args = make_cpp_args("act_sqrt_softplus", is_arch_support_pdl())
     return load_jit(
-        make_name("hash_topk"),
+        make_name("hash_topk_static_map_v70i"),
         *args,
         cuda_files=["deepseek_v4/hash_topk.cuh"],
         cuda_wrappers=[
             ("hash_topk", f"HashTopKKernel<{args}>::run"),
             ("hash_topk_packed", f"HashTopKPackedKernel<{args}>::run"),
+            (
+                "hash_topk_packed_mapped",
+                f"HashTopKPackedMappedKernel<{args}>::run",
+            ),
         ],
     )
 
@@ -122,9 +126,16 @@ def hash_topk(
     routed_scaling_factor: float = 1.0,
     scoring_func: str = "sqrtsoftplus",
     packed_out: Optional[torch.Tensor] = None,
+    logical_to_physical_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert scoring_func == "sqrtsoftplus"
+    if logical_to_physical_map is not None and packed_out is None:
+        raise RuntimeError(
+            "Fused HashTopK static remap requires packed routing output"
+        )
     if is_hip_runtime():
+        if logical_to_physical_map is not None:
+            raise RuntimeError("Fused HashTopK static remap requires CUDA")
         from sglang.jit_kernel.triton.hash_topk import hash_topk_triton
 
         return hash_topk_triton(
@@ -155,7 +166,7 @@ def hash_topk(
                 topk_ids,
                 routed_scaling_factor,
             )
-        else:
+        elif logical_to_physical_map is None:
             module.hash_topk_packed(
                 router_logits,
                 input_ids,
@@ -163,6 +174,17 @@ def hash_topk(
                 topk_weights,
                 topk_ids,
                 packed_out,
+                routed_scaling_factor,
+            )
+        else:
+            module.hash_topk_packed_mapped(
+                router_logits,
+                input_ids,
+                tid2eid,
+                topk_weights,
+                topk_ids,
+                packed_out,
+                logical_to_physical_map,
                 routed_scaling_factor,
             )
         return topk_weights, topk_ids

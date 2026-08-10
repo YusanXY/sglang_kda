@@ -93,6 +93,7 @@ def _router_triton_kernel(
     out_weights_ptr,  # [M, K] fp32 or bf16
     out_indices_ptr,  # [M, K] int32
     packed_out_ptr,  # [M, K] int32, optional fused FlashInfer carrier
+    logical_to_physical_ptr,  # [N] int64, optional static expert map
     M,
     routed_scaling_factor,
     moe_softcapping,
@@ -112,6 +113,7 @@ def _router_triton_kernel(
     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
     USE_PDL: tl.constexpr,
     HAS_PACKED_OUT: tl.constexpr,
+    HAS_STATIC_MAP: tl.constexpr,
     stride_sm,
     stride_sn,
     stride_wm,
@@ -244,6 +246,15 @@ def _router_triton_kernel(
     if APPLY_SCALE:
         selected_vals = selected_vals * routed_scaling_factor
 
+    if HAS_STATIC_MAP:
+        map_mask = mask_m[:, None] & mask_k_routed[None, :]
+        physical_idx = tl.load(
+            logical_to_physical_ptr + selected_idx,
+            mask=map_mask,
+            other=0,
+        ).to(tl.int32)
+        selected_idx = tl.where(mask_k_routed[None, :], physical_idx, selected_idx)
+
     out_w_ptr = (
         out_weights_ptr + offs_m[:, None] * stride_wm + offs_k[None, :] * stride_wk
     )
@@ -282,6 +293,7 @@ def moe_fused_gate(
     num_expert_group: int = 1,
     topk_group: int = 1,
     packed_out: torch.Tensor | None = None,
+    logical_to_physical_map: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
@@ -324,7 +336,14 @@ def moe_fused_gate(
         assert packed_out.dtype == torch.int32
         assert packed_out.device == scores.device
         assert packed_out.is_contiguous()
+    if logical_to_physical_map is not None:
+        assert logical_to_physical_map.shape == (N,)
+        assert logical_to_physical_map.dtype == torch.int64
+        assert logical_to_physical_map.device == scores.device
+        assert logical_to_physical_map.is_contiguous()
+        assert packed_out is not None, "static map fusion requires packed output"
     packed_arg = indices if packed_out is None else packed_out
+    map_arg = indices if logical_to_physical_map is None else logical_to_physical_map
 
     BLOCK_N = triton.next_power_of_2(N)  # 256 -> 256, 384 -> 512
     BLOCK_K = triton.next_power_of_2(K)  # 6 -> 8, 8 -> 8
@@ -343,6 +362,7 @@ def moe_fused_gate(
         weights,
         indices,
         packed_arg,
+        map_arg,
         M,
         float(routed_scaling_factor),
         float(moe_softcapping),
@@ -362,6 +382,7 @@ def moe_fused_gate(
         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
         USE_PDL=use_pdl,
         HAS_PACKED_OUT=packed_out is not None,
+        HAS_STATIC_MAP=logical_to_physical_map is not None,
         stride_sm=scores.stride(0),
         stride_sn=scores.stride(1),
         stride_wm=weights.stride(0),
