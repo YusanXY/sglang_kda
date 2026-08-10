@@ -2019,12 +2019,12 @@ def _separate_mhc_post_ffn_pre(
                 descriptor.attention_wob_ready_peer2,
                 descriptor.attention_wob_ready_peer3,
             )
-            if descriptor.num_tokens == 65536
+            if descriptor.num_tokens in (65536, 131072)
             else None
         ),
         ready_epoch=(
             descriptor.attention_wob_ready_epoch_base + layer.layer_id + 1
-            if descriptor.num_tokens == 65536
+            if descriptor.num_tokens in (65536, 131072)
             and descriptor.attention_wob_ready_local is not None
             else 0
         ),

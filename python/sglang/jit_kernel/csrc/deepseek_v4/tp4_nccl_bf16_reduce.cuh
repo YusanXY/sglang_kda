@@ -284,11 +284,15 @@ __global__ void tp4_fused_reduce_push_bf16_gather_ready_kernel(
     }
   }
 
+  // Every lane writes a disjoint part of all four peer mappings.  A CTA
+  // barrier alone does not guarantee that those peer-memory writes have
+  // reached system scope before lane 0 publishes the ready epoch.  Fence each
+  // writer first; the following barrier and release store then form the
+  // producer side of the consumer's acquire polling protocol.
+  __threadfence_system();
   __syncthreads();
   if (threadIdx.x == 0) {
-    // The block barrier establishes happens-before from every writer to the
-    // leader.  The following system-scope release stores publish that complete
-    // block of remote writes without a redundant explicit system fence.
+    // The release store publishes the fully system-visible token group.
     const int64_t global_group = output_group_offset + owner_group;
     store_release_sys(ready_owner + global_group, ready_epoch);
   }

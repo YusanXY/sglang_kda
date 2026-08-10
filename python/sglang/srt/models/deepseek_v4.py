@@ -1582,7 +1582,7 @@ class MQALayer(MqaAttentionBase):
                     raise RuntimeError(
                         f"layer {self.layer_id}: incomplete direct output buffers"
                     )
-                if e2e_descriptor.num_tokens == 65536:
+                if e2e_descriptor.num_tokens in (65536, 131072):
                     ready_peers = (
                         e2e_descriptor.attention_wob_ready_peer0,
                         e2e_descriptor.attention_wob_ready_peer1,
