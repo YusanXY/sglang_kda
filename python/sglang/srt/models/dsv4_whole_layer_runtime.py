@@ -107,6 +107,7 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     attention_q_peer3: Optional[torch.Tensor]
     attention_q_rank: int
     attention_q_direct_route: bool
+    moe_partial_handle: Any
     moe_partial_local: Optional[torch.Tensor]
     moe_partial_peer0: Optional[torch.Tensor]
     moe_partial_peer1: Optional[torch.Tensor]
@@ -284,6 +285,7 @@ class DSV4WholeLayerRuntime:
         ] = None
         self._tp4_symmetric_workspace: Optional[tuple] = None
         self._tp4_symmetric_q_workspace: Optional[tuple] = None
+        self._tp4_symmetric_moe_workspace: Optional[tuple] = None
         self._tp4_owner_flags_workspace: Optional[tuple] = None
         self._tp4_local_wob_output_workspace: Optional[tuple] = None
         self._attention_output_forward_epoch = 0
@@ -360,6 +362,7 @@ class DSV4WholeLayerRuntime:
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
         if self._use_tp4_token_shard_attention:
             self._bind_tp4_symmetric_q_workspace(workspace_device)
+            self._bind_tp4_symmetric_moe_workspace(workspace_device)
             self._bind_tp4_owner_flags_workspace(workspace_device)
         if self._use_tp4_symmetric_wob:
             self._bind_tp4_symmetric_workspace(workspace_device)
@@ -630,6 +633,49 @@ class DSV4WholeLayerRuntime:
             tp_group.rank_in_group,
         )
 
+    def _bind_tp4_symmetric_moe_workspace(self, device: torch.device) -> None:
+        """Bind a peer-visible MoE partial buffer disjoint from peer-Q.
+
+        The old path aliased FlashInfer's [M, 4096] partial with the first
+        half of the [M, 16, 512] peer-Q receive tensor.  That forced every
+        decoder layer to end with a cross-rank barrier before the next Q
+        producer could overwrite the allocation.  A dedicated max-capacity
+        buffer removes that alias.  The existing peer-Q barrier in the next
+        layer then orders reuse of this MoE buffer after all ranks have
+        completed the previous owner-post read, without another hot-path
+        launch.
+        """
+        from torch.distributed import _symmetric_memory as symm_mem
+
+        from sglang.srt.distributed import get_tp_group
+
+        cached = self._tp4_symmetric_moe_workspace
+        if cached is not None and cached[0] == device:
+            return
+        tp_group = get_tp_group()
+        if tp_group.world_size != 4:
+            raise RuntimeError(
+                "TP4 fused MoE partial workspace requires TP=4, got "
+                f"{tp_group.world_size}"
+            )
+        local_partial = symm_mem.empty(
+            (_MAX_FORWARD_TOKENS, 4096),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        handle = symm_mem.rendezvous(local_partial, tp_group.device_group)
+        peers = tuple(
+            handle.get_buffer(rank, local_partial.shape, local_partial.dtype)
+            for rank in range(4)
+        )
+        self._tp4_symmetric_moe_workspace = (
+            device,
+            handle,
+            local_partial,
+            peers,
+            tp_group.rank_in_group,
+        )
+
     def _bind_tp4_owner_flags_workspace(self, device: torch.device) -> None:
         """Bind four peer-visible GPU protocol words once for all layers."""
         from torch.distributed import _symmetric_memory as symm_mem
@@ -876,11 +922,28 @@ class DSV4WholeLayerRuntime:
             attention_q_peer2 = attention_q_peers[2]
             attention_q_peer3 = attention_q_peers[3]
             attention_q_direct_route = tp4_token_shard_attention
+            symmetric_moe = self._tp4_symmetric_moe_workspace
+            if symmetric_moe is None or symmetric_moe[0] != positions.device:
+                raise RuntimeError(
+                    "TP4 symmetric MoE workspace was not bound on this device"
+                )
+            (
+                _,
+                moe_partial_handle,
+                moe_partial_storage,
+                moe_partial_peers,
+                moe_partial_rank,
+            ) = symmetric_moe
+            del moe_partial_storage
+            if moe_partial_rank != attention_q_rank:
+                raise RuntimeError(
+                    "TP4 symmetric Q/MoE rank mismatch: "
+                    f"q={attention_q_rank}, moe={moe_partial_rank}"
+                )
             moe_partial_peers = tuple(
-                peer.view(-1)[: num_tokens * 4096].view(num_tokens, 4096)
-                for peer in attention_q_peers
+                peer[:num_tokens] for peer in moe_partial_peers
             )
-            moe_partial_local = moe_partial_peers[attention_q_rank]
+            moe_partial_local = moe_partial_peers[moe_partial_rank]
             moe_partial_peer0 = moe_partial_peers[0]
             moe_partial_peer1 = moe_partial_peers[1]
             moe_partial_peer2 = moe_partial_peers[2]
@@ -1002,6 +1065,7 @@ class DSV4WholeLayerRuntime:
             attention_q_peer3 = None
             attention_q_rank = -1
             attention_q_direct_route = False
+            moe_partial_handle = None
             moe_partial_local = None
             moe_partial_peer0 = None
             moe_partial_peer1 = None
@@ -1087,6 +1151,7 @@ class DSV4WholeLayerRuntime:
             attention_q_peer3=attention_q_peer3,
             attention_q_rank=attention_q_rank,
             attention_q_direct_route=attention_q_direct_route,
+            moe_partial_handle=moe_partial_handle,
             moe_partial_local=moe_partial_local,
             moe_partial_peer0=moe_partial_peer0,
             moe_partial_peer1=moe_partial_peer1,
@@ -1900,7 +1965,7 @@ def _execute_common(
         moe_partial_local is None
         or any(partial is None for partial in moe_partials)
         or any(flag is None for flag in moe_owner_flags)
-        or descriptor.attention_q_handle is None
+        or descriptor.moe_partial_handle is None
     ):
         raise RuntimeError(
             "DSV4 fused MoE/mHC post requires the TP4 symmetric workspace"
@@ -1928,11 +1993,13 @@ def _execute_common(
             f"result_ptr=0x{moe_result.data_ptr():x}, "
             f"provided_ptr=0x{moe_partial_local.data_ptr():x}"
         )
-    # The first GPU barrier publishes all four FlashInfer MoE partials.  The
-    # second prevents the next layer's Q producer from reusing this symmetric
-    # storage while another rank is still reading it.
+    # Publish all four FlashInfer MoE partials.  The partials live in a
+    # dedicated symmetric allocation, so this layer no longer needs a second
+    # barrier after owner-post.  Before any rank can write the allocation for
+    # the next layer, that layer's existing peer-Q barrier is reached in stream
+    # order by all ranks and therefore proves every previous remote read done.
     barrier_channel = handle.layer_id & 1
-    descriptor.attention_q_handle.barrier(channel=barrier_channel)
+    descriptor.moe_partial_handle.barrier(channel=barrier_channel)
     hidden_states = _huge_tp4_moe_mhc_post(
         partials=moe_partials,
         flags=moe_owner_flags,
@@ -1942,7 +2009,6 @@ def _execute_common(
         comb=comb,
         output=descriptor.mhc_residual_out,
     )
-    descriptor.attention_q_handle.barrier(channel=barrier_channel)
     return hidden_states, None, None, None
 
 
