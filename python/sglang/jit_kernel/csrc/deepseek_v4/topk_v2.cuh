@@ -32,6 +32,7 @@ namespace impl = device::topk;
 using impl::TopKProblem;
 
 using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
+using Register2Hist11 = impl::TopKRegister<2, 11>;  // strict high-load path
 using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
 using Register5 = impl::TopKRegister<5>;  // <= 20480, register-resident, 1 read
 using Streaming = impl::TopKStreaming;
@@ -466,13 +467,18 @@ SGL_DEVICE void problem_transform(
  * - Level 2: max_seq_len <= cluster_floor  -> trivial + register<4/5> + streaming
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
-template <bool kPDL, int kLevel, bool kCombinedOnly = false>
+template <
+    bool kPDL,
+    int kLevel,
+    bool kCombinedOnly = false,
+    bool kUseHist11 = false>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
   auto problem = params.problem(blockIdx.x);
   constexpr uint32_t kU32Max = std::numeric_limits<uint32_t>::max();
   __shared__ impl::MaxSmem<
       Register2::Smem,
+      Register2Hist11::Smem,
       Register4::Smem,
       Register5::Smem,
       Streaming::Smem,
@@ -508,7 +514,11 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   const auto cluster_threshold = kHandleCluster ? params.cluster_threshold() : kU32Max;
   if constexpr (kLevel == 0) {
     __builtin_assume(problem.seq_len <= kReg2MaxSeqLen);
-    Register2::forward<kPDL>(problem, &smem);
+    if constexpr (kUseHist11) {
+      Register2Hist11::forward<kPDL>(problem, &smem);
+    } else {
+      Register2::forward<kPDL>(problem, &smem);
+    }
   } else if constexpr (kLevel == 1) {
     __builtin_assume(problem.seq_len <= kReg4MaxSeqLen);
     Register4::forward<kPDL>(problem, &smem);  // max_seq_len <= 16384 guarantees seq <= 16384
@@ -536,7 +546,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
     device::PDLWaitPrimary<kPDLFinal>();
   }
 
-  // The strict req16 Huge path consumes only combined_indices.  Emit the
+  // The strict high-load Huge path consumes only combined_indices.  Emit the
   // sorted compressed coordinates directly into that final attention input:
   // this removes page-table gathers plus the page_indices/raw_indices stores
   // and their subsequent global reload.  All other paths retain the original
@@ -916,22 +926,27 @@ struct TopKKernel {
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
 #ifdef SGLANG_DSV4_TOPK_WARP_BITSET_SORT
-    // Strict no-Graph Huge req16 is validated before model execution: 16
-    // requests each contribute 4096 new tokens after a 16384-token prefix, so
-    // every C4 row is in [4097, 5120] and Eager sizes the score stride to
-    // exactly 5120.  Dispatch only from immutable host-visible shape fields;
-    // no seq_lens device-to-host read or runtime fallback is permitted.
-    const bool strict_req16_incremental =
-        batch_size == 16 * 4096 && num_reqs == 16 && topk == 512 &&
+    // Strict no-Graph Huge high-load prefill is validated before model
+    // execution: each request contributes 4096 new tokens after a 16384-token
+    // prefix, so every C4 row is in [4097, 5120] and Eager sizes the score
+    // stride to exactly 5120.  Req128 with a 131072-token scheduler budget is
+    // executed as four 32-request waves, so it has the same final-output-only
+    // contract as the 16-request case.  Dispatch only from immutable
+    // host-visible shape fields; no seq_lens device-to-host read or runtime
+    // fallback is permitted.
+    const bool strict_high_load_incremental =
+        (num_reqs == 16 || num_reqs == 32) &&
+        batch_size == num_reqs * 4096 && topk == 512 &&
         page_bits == 6 && max_seq_len == (16384 + 4096) / 4;
-    if (strict_req16_incremental) {
+    if (strict_high_load_incremental) {
       LaunchKernel(batch_size, kBlockSize, device)
           .config({.use_pdl = kUsePDL})
           .launch(
               topk_main_kernel<
                   kUsePDL,
                   /*kLevel=*/0,
-                  /*kCombinedOnly=*/true>,
+                  /*kCombinedOnly=*/true,
+                  /*kUseHist11=*/true>,
               params);
     } else
 #endif

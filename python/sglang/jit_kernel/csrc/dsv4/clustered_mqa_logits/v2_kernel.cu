@@ -12,6 +12,9 @@
 #include "../../deepseek_v4/topk_v2.cuh"
 #undef SGLANG_DSV4_TOPK_DEVICE_ONLY
 
+// JIT build epoch v70b: force the extension content key to include the strict
+// Req16/Req32 11-bit register Top-k specialization from the transitive header.
+
 void launch_blockq8_tmem2(
     int grid_size,
     int num_q_tokens_total,
@@ -180,7 +183,7 @@ void launch_topk512_sparse_prefill(
     if (combined_only) {
         if (max_context_len <= static_cast<int>(kReg2MaxSeqLen)) {
             status = cudaLaunchKernelEx(
-                &config, topk_main_kernel<true, 0, true>, params);
+                &config, topk_main_kernel<true, 0, true, true>, params);
         } else if (max_context_len <= static_cast<int>(kReg4MaxSeqLen)) {
             status = cudaLaunchKernelEx(
                 &config, topk_main_kernel<true, 1, true>, params);

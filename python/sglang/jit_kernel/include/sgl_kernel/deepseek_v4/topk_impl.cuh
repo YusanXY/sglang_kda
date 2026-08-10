@@ -520,11 +520,19 @@ struct TopKRadixBase : TopKConfig {
 // wastes work on shorter sequences.
 // ---------------------------------------------------------------------------
 
-template <uint32_t kLocalVecs_>
-struct TopKRegister : TopKRadixBase<12> {
+template <uint32_t kLocalVecs_, uint32_t kHistBits_ = 12>
+struct TopKRegister : TopKRadixBase<kHistBits_> {
+  using Base = TopKRadixBase<kHistBits_>;
   static constexpr uint32_t kLocalVecs = kLocalVecs_;
+  static constexpr uint32_t kBlockSize = Base::kBlockSize;
+  static constexpr uint32_t kVecSize = Base::kVecSize;
+  static constexpr uint32_t kHistBits = Base::kHistBits;
+  static constexpr uint32_t kMaxNumTie = Base::kMaxNumTie;
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
-  using Smem = typename TopKRadixBase<12>::Smem;
+  using vec_t = typename Base::vec_t;
+  using Smem = typename Base::Smem;
+  using Base::find_threshold;
+  using Base::handle_tie;
 
   template <bool kUsePDL>
   SGL_DEVICE static void forward(const TopKProblem problem, void* _smem) {
@@ -532,7 +540,7 @@ struct TopKRegister : TopKRadixBase<12> {
     const auto smem = static_cast<Smem*>(_smem);
 
     {
-      Smem::kHistVec hist_vec;
+      typename Smem::kHistVec hist_vec;
       hist_vec.fill(0);
       smem->hist_vecs[tx] = hist_vec;
     }
