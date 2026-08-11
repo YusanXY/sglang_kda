@@ -411,11 +411,14 @@ class DeepseekV2MLP(nn.Module):
                         "DSV4 Huge shared workspace requires the DeepGEMM "
                         "group-128 activation ABI, not FlashInfer 128x4"
                     )
-                if hidden_dim != 512 or quant_group_size != 128:
+                expected_hidden_dim = (
+                    2048 if huge_runtime._attention_dp4 else 512
+                )
+                if hidden_dim != expected_hidden_dim or quant_group_size != 128:
                     raise RuntimeError(
-                        "DSV4 Huge shared workspace requires hidden_dim=512 "
-                        f"and group_size=128, got {hidden_dim} and "
-                        f"{quant_group_size}"
+                        "DSV4 Huge shared workspace requires hidden_dim="
+                        f"{expected_hidden_dim} and group_size=128, got "
+                        f"{hidden_dim} and {quant_group_size}"
                     )
                 descriptor = huge_runtime.active_descriptor
                 down_input_fp8 = descriptor.shared_down_fp8
@@ -842,6 +845,11 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_megamoe()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
+                or (
+                    is_deepseek_v4
+                    and get_server_args().dsv4_worker_backend == "huge_kernel"
+                    and get_server_args().enable_dp_attention
+                )
             )
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,

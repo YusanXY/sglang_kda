@@ -1206,8 +1206,14 @@ class DSV4WholeLayerRuntime:
                     "MoE buffer length in [local_M, 131072], got "
                     f"local_M={num_tokens}, global_M={moe_num_tokens!r}"
                 )
+        # Huge attention-DP evaluates a replicated TP1 shared expert on this
+        # rank's local tokens. Keep its 2048-wide activation workspace local;
+        # the gathered token count is only for the TP-sharded routed experts.
+        shared_workspace_tokens = (
+            num_tokens if self._attention_dp4 else moe_num_tokens
+        )
         shared_down_fp8, shared_down_scale = self._get_shared_down_workspace(
-            moe_num_tokens,
+            shared_workspace_tokens,
             positions.device,
         )
         descriptor = DSV4ForwardDescriptor(
@@ -1692,15 +1698,18 @@ class DSV4WholeLayerRuntime:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         workspace = self._shared_down_workspace
         if workspace is None or workspace[0] != device:
-            # DSV4-Flash has one 512-wide shared expert.  Its group-128 scale
-            # row contains four UE8M0 bytes, hence exactly one packed int32.
+            # TP4 uses a 512-wide shared-expert shard. Huge attention-DP uses
+            # a replicated TP1 shared expert on local tokens, so its activation
+            # is 2048-wide. Pack every four UE8M0 group scales into one int32.
+            hidden_dim = 2048 if self._attention_dp4 else 512
+            packed_scale_cols = hidden_dim // (128 * 4)
             shared_down_fp8 = torch.empty(
-                (_MAX_FORWARD_TOKENS, 512),
+                (_MAX_FORWARD_TOKENS, hidden_dim),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
             shared_down_scale_storage = torch.empty(
-                (_MAX_FORWARD_TOKENS,),
+                (_MAX_FORWARD_TOKENS * packed_scale_cols,),
                 dtype=torch.int32,
                 device=device,
             )
@@ -1712,9 +1721,11 @@ class DSV4WholeLayerRuntime:
             self._shared_down_workspace = workspace
         _, shared_down_fp8, shared_down_scale_storage = workspace
         aligned_m = (num_tokens + 3) // 4 * 4
+        hidden_dim = 2048 if self._attention_dp4 else 512
+        packed_scale_cols = hidden_dim // (128 * 4)
         shared_down_scale = (
-            shared_down_scale_storage[:aligned_m]
-            .view(1, aligned_m)
+            shared_down_scale_storage[: packed_scale_cols * aligned_m]
+            .view(packed_scale_cols, aligned_m)
             .transpose(0, 1)[:num_tokens]
         )
         return shared_down_fp8[:num_tokens], shared_down_scale
