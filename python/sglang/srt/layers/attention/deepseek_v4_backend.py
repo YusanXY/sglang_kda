@@ -2221,12 +2221,13 @@ class DeepseekV4AttnBackend(
             ):
                 # Attention-DP owns a disjoint token shard but replicates all
                 # 64 query heads on that rank. The TP-only Huge output-only
-                # specialization deliberately stores just local16, so use the
-                # all-head FlashMLA entry until the output-only CUDA epilogue
-                # below is generalized to a 64-head specialization.
-                from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+                # specialization deliberately stores just local16, so select
+                # the separate 64-head output-only CUDA specialization.
+                from sgl_kernel.flash_mla import (
+                    flash_mla_sparse_fwd_all_heads_output,
+                )
 
-                o, _, _ = flash_mla_sparse_fwd(
+                o = flash_mla_sparse_fwd_all_heads_output(
                     q=q_flat,
                     kv=kv,
                     indices=combined_indices.unsqueeze(1),

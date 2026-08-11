@@ -81,6 +81,7 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
+    is_dsv4_huge_dp_balanced_max_len_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -2226,15 +2227,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             and forward_batch.dp_padding_mode is not None
             and not forward_batch.dp_padding_mode.is_max_len()
         )
-        # SGLANG_DP_USE_REDUCE_SCATTER: in the MAX_LEN decode path (equal per-rank
-        # padding, gatherv inactive, no EP), replace the MoE-internal post-experts
+        # In the Huge small-balanced MAX_LEN path (or the generic opt-in path),
+        # replace the MoE-internal post-experts
         # all_reduce + dp_scatter with an equal-chunk reduce_scatter. On ROCm this
         # uses the aiter custom kernel (so BOTH gather and combine are aiter custom),
         # elsewhere RCCL reduce_scatter; either way it cuts combine traffic ~2x vs
         # all_reduce. tp_size==attn_dp_size required so the global buffer splits
         # evenly into per-rank chunks.
         _use_reduce_scatter = (
-            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            (
+                envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+                or is_dsv4_huge_dp_balanced_max_len_enabled()
+            )
             and _use_tp_moe_gather
             and not _use_reduce_scatterv
             and not should_use_dp_reduce_scatterv()
@@ -2259,7 +2263,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         # M_global * dim/tp), so decode no longer pays the ~dp_size x penalty.
         _shared_local = None
         _do_shared_local = (
-            _SHARED_EXPERT_LOCAL
+            (
+                _SHARED_EXPERT_LOCAL
+                or getattr(self, "_dsv4_huge_dp_shared_expert_local", False)
+            )
             and _use_tp_moe_gather
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
@@ -2471,7 +2478,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         # back after the combine (same as the non-fused forward). Skipped in the
         # global MoE via skip_shared_experts.
         do_shared_local = (
-            _SHARED_EXPERT_LOCAL
+            (
+                _SHARED_EXPERT_LOCAL
+                or getattr(self, "_dsv4_huge_dp_shared_expert_local", False)
+            )
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )

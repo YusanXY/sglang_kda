@@ -8,6 +8,7 @@ import torch
 import triton
 from sgl_kernel.flash_mla import (
     flash_mla_sparse_fwd,
+    flash_mla_sparse_fwd_all_heads_output,
     flash_mla_sparse_fwd_output,
     flash_mla_with_kvcache,
     get_mla_metadata,
@@ -413,8 +414,17 @@ def test_flashmla_prefill_output_only(indices_pattern):
         attn_sink=attn_sink,
         topk_length=topk_length,
     )
+    actual_all_heads = flash_mla_sparse_fwd_all_heads_output(
+        q,
+        kv,
+        indices,
+        sm_scale=sm_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
 
     torch.testing.assert_close(actual, expected[:, :16, :], atol=0, rtol=0)
+    torch.testing.assert_close(actual_all_heads, expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")

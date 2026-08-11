@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.srt.layers import dp_attention
 from sglang.srt.model_executor.dsv4_huge_kernel_model_runner import (
     DSV4_HUGE_MAX_TOTAL_TOKENS,
     validate_dsv4_huge_kernel_bench_args,
@@ -13,6 +14,29 @@ from sglang.srt.model_executor.dsv4_huge_kernel_whole_layer_runner import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner_factory import get_model_runner_class
+
+
+@pytest.mark.parametrize(
+    ("token_counts", "expected_mode"),
+    [
+        ([16384, 16384, 16384, 16384], dp_attention.DpPaddingMode.MAX_LEN),
+        ([32768, 32768, 32768, 32768], dp_attention.DpPaddingMode.SUM_LEN),
+        ([8192, 16384, 8192, 16384], dp_attention.DpPaddingMode.SUM_LEN),
+        ([4096, 0, 0, 0], dp_attention.DpPaddingMode.SUM_LEN),
+    ],
+)
+def test_huge_attention_dp_collective_shape_routing(
+    monkeypatch, token_counts, expected_mode
+):
+    monkeypatch.setattr(dp_attention, "_ATTN_DP_SIZE", 4)
+    monkeypatch.setattr(dp_attention, "_FORCE_DSV4_HUGE_BALANCED_MAX_LEN", True)
+    monkeypatch.setattr(
+        dp_attention, "_DSV4_HUGE_BALANCED_MAX_LEN_MAX_TOKENS", 16384
+    )
+    assert (
+        dp_attention.DpPaddingMode.get_dp_padding_mode(True, token_counts)
+        == expected_mode
+    )
 
 
 def _flash_model_config():

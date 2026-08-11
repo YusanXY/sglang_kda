@@ -1,0 +1,36 @@
+--- a/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
++++ b/csrc/sm100/prefill/sparse/fwd/head64/phase1.cuh
+@@ -893,6 +893,11 @@ void run_fwd_phase1_output_kernel(const SparseAttnFwdParams& params) {
+     run_fwd_phase1_kernel_impl<D_QK, false, 16>(params);
+ }
+ 
++template<int D_QK>
++void run_fwd_phase1_all_heads_output_kernel(const SparseAttnFwdParams& params) {
++    run_fwd_phase1_kernel_impl<D_QK, false, B_H>(params);
++}
++
+ // TP4 C4-prefill specialization.  NCCL receives Q as
+ // [source_rank, token_shard, local_head, dim].  Describe the source-rank and
+ // local-head modes as one hierarchical 64-head TMA mode, avoiding a 1--2 GiB
+--- a/csrc/sm100/prefill/sparse/fwd/head64/phase1.h
++++ b/csrc/sm100/prefill/sparse/fwd/head64/phase1.h
+@@ -10,6 +10,9 @@ template<int D_QK>
+ void run_fwd_phase1_output_kernel(const SparseAttnFwdParams& params);
+ 
+ template<int D_QK>
++void run_fwd_phase1_all_heads_output_kernel(const SparseAttnFwdParams& params);
++
++template<int D_QK>
+ void run_fwd_phase1_tp4_sharded_output_kernel(
+     const SparseAttnFwdParams& params);
+ 
+--- a/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
++++ b/csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu
+@@ -5,6 +5,7 @@ namespace sm100::fwd::head64 {
+ 
+ template void run_fwd_phase1_kernel<512>(const SparseAttnFwdParams& params);
+ template void run_fwd_phase1_output_kernel<512>(const SparseAttnFwdParams& params);
++template void run_fwd_phase1_all_heads_output_kernel<512>(const SparseAttnFwdParams& params);
+ template void run_fwd_phase1_tp4_sharded_output_kernel<512>(
+     const SparseAttnFwdParams& params);
+ template void run_fwd_phase1_tp4_peer_q_output_kernel<512>(

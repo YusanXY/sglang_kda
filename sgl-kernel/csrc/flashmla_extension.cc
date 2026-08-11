@@ -76,14 +76,15 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
 // with two pointwise kernels, even when both tensors are immediately dropped.
 // Enter the FlashMLA interface directly so Huge mode can omit that dead work
 // while keeping the existing three-output API unchanged for all other users.
-static at::Tensor sgl_sparse_prefill_fwd_output(
+static at::Tensor sgl_sparse_prefill_fwd_output_impl(
     const at::Tensor& q,
     const at::Tensor& kv,
     const at::Tensor& indices,
     double sm_scale,
     int64_t d_v,
     const std::optional<at::Tensor>& attn_sink,
-    const std::optional<at::Tensor>& topk_length) {
+    const std::optional<at::Tensor>& topk_length,
+    bool all_heads) {
   using bf16 = cutlass::bfloat16_t;
 
   Arch arch;
@@ -100,7 +101,7 @@ static at::Tensor sgl_sparse_prefill_fwd_output(
   const int h_kv = kv.size(1);
   const int d_qk = q.size(2);
   const int topk = indices.size(2);
-  constexpr int kLocalOutputHeads = 16;
+  const int output_heads = all_heads ? h_q : 16;
   TORCH_CHECK(h_q == 64 && h_kv == 1, "sparse_prefill_fwd_output requires h_q=64 and h_kv=1");
   TORCH_CHECK(d_qk == 512 && d_v == 512, "sparse_prefill_fwd_output requires d_qk=d_v=512");
 
@@ -126,7 +127,7 @@ static at::Tensor sgl_sparse_prefill_fwd_output(
   KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
 
   at::cuda::CUDAGuard device_guard{static_cast<char>(q.get_device())};
-  auto out = torch::empty({s_q, kLocalOutputHeads, d_v}, q.options());
+  auto out = torch::empty({s_q, output_heads, d_v}, q.options());
   KU_CHECK_CONTIGUOUS(out);
   SparseAttnFwdParams params = {
       s_q,
@@ -155,8 +156,34 @@ static at::Tensor sgl_sparse_prefill_fwd_output(
       arch.num_sms,
       at::cuda::getCurrentCUDAStream().stream(),
   };
-  sm100::fwd::head64::run_fwd_phase1_output_kernel<512>(params);
+  if (all_heads) {
+    sm100::fwd::head64::run_fwd_phase1_all_heads_output_kernel<512>(params);
+  } else {
+    sm100::fwd::head64::run_fwd_phase1_output_kernel<512>(params);
+  }
   return out;
+}
+
+static at::Tensor sgl_sparse_prefill_fwd_output(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length) {
+  return sgl_sparse_prefill_fwd_output_impl(q, kv, indices, sm_scale, d_v, attn_sink, topk_length, false);
+}
+
+static at::Tensor sgl_sparse_prefill_fwd_all_heads_output(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<at::Tensor>& attn_sink,
+    const std::optional<at::Tensor>& topk_length) {
+  return sgl_sparse_prefill_fwd_output_impl(q, kv, indices, sm_scale, d_v, attn_sink, topk_length, true);
 }
 
 // Eager TP4 C4-prefill path.  q_sources is the direct NCCL all-to-all receive
@@ -431,6 +458,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "sparse_prefill_fwd_output(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? "
       "attn_sink=None, Tensor? topk_length=None) -> Tensor");
   m.impl("sparse_prefill_fwd_output", torch::kCUDA, &sgl_sparse_prefill_fwd_output);
+
+  m.def(
+      "sparse_prefill_fwd_all_heads_output(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v, Tensor? "
+      "attn_sink=None, Tensor? topk_length=None) -> Tensor");
+  m.impl("sparse_prefill_fwd_all_heads_output", torch::kCUDA, &sgl_sparse_prefill_fwd_all_heads_output);
 
   m.def(
       "sparse_prefill_fwd_tp4_sharded_output(Tensor q_sources, Tensor kv, Tensor indices, float sm_scale, int d_v, "

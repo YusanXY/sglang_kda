@@ -204,6 +204,15 @@ class DSV4WholeLayerRuntime:
         self._config = config
         self._server_args = server_args
         self._attention_dp4 = bool(server_args.enable_dp_attention)
+        if self._attention_dp4:
+            # Select the validated SUM_LEN all_gatherv + reduce_scatterv pair
+            # once at worker construction.  Avoid getenv and policy decisions
+            # in every layer's hot path.
+            from sglang.srt.layers.dp_attention import (
+                enable_dp_gatherv_for_dsv4_huge,
+            )
+
+            enable_dp_gatherv_for_dsv4_huge()
         self._attention_groups = 8 if self._attention_dp4 else 2
         self._max_local_tokens = (
             _MAX_FORWARD_TOKENS // 4
@@ -428,6 +437,7 @@ class DSV4WholeLayerRuntime:
         for handle in self._handles:
             # The DecoderLayer.forward boundary owns dispatch.  Re-loading
             # weights refreshes all generation-tagged handles in one pass.
+            handle.layer._dsv4_huge_dp_shared_expert_local = self._attention_dp4
             handle.layer.enable_huge_kernel_runner(self, handle)
             shared_experts = getattr(handle.layer.mlp, "shared_experts", None)
             if shared_experts is not None:

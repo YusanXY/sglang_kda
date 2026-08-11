@@ -192,6 +192,36 @@ if(FLASHMLA_ENABLE_SM100)
     else()
         message(STATUS "FlashMLA SM100 h64 TP4 peer-Q sparse prefill v30b already patched")
     endif()
+
+    # Attention-DP4 executes all 64 query heads locally and consumes only the
+    # attention output.  Add this after the TP4 patches so each specialization
+    # remains independently reproducible and the frozen TP path is unchanged.
+    set(FLASHMLA_ALL_HEADS_OUTPUT_MARKER
+        "run_fwd_phase1_all_heads_output_kernel")
+    file(READ "${FLASHMLA_HEAD64_PHASE1}"
+        FLASHMLA_HEAD64_PHASE1_CONTENT_AFTER_TP4_PEER_Q)
+    string(FIND "${FLASHMLA_HEAD64_PHASE1_CONTENT_AFTER_TP4_PEER_Q}"
+        "${FLASHMLA_ALL_HEADS_OUTPUT_MARKER}"
+        FLASHMLA_ALL_HEADS_OUTPUT_PATCHED)
+    if(FLASHMLA_ALL_HEADS_OUTPUT_PATCHED EQUAL -1)
+        find_program(FLASHMLA_PATCH_EXECUTABLE patch REQUIRED)
+        execute_process(
+            COMMAND "${FLASHMLA_PATCH_EXECUTABLE}" -p1 -i
+                "${CMAKE_CURRENT_LIST_DIR}/patches/flashmla-sm100-head64-all-heads-output-only.patch"
+            WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+            RESULT_VARIABLE FLASHMLA_ALL_HEADS_OUTPUT_PATCH_RESULT
+            OUTPUT_VARIABLE FLASHMLA_ALL_HEADS_OUTPUT_PATCH_STDOUT
+            ERROR_VARIABLE FLASHMLA_ALL_HEADS_OUTPUT_PATCH_STDERR)
+        if(NOT FLASHMLA_ALL_HEADS_OUTPUT_PATCH_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to patch pinned FlashMLA all-heads output-only kernel:\n"
+                "${FLASHMLA_ALL_HEADS_OUTPUT_PATCH_STDOUT}\n"
+                "${FLASHMLA_ALL_HEADS_OUTPUT_PATCH_STDERR}")
+        endif()
+        message(STATUS "Patched FlashMLA SM100 h64 all-heads output-only sparse prefill")
+    else()
+        message(STATUS "FlashMLA SM100 h64 all-heads output-only sparse prefill already patched")
+    endif()
 endif()
 
 

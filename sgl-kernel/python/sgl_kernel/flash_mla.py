@@ -360,6 +360,24 @@ def flash_mla_sparse_fwd_output(
     )
 
 
+def flash_mla_sparse_fwd_all_heads_output(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run 64-head sparse prefill without computing discarded statistics."""
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+
+    return torch.ops.sgl_kernel.sparse_prefill_fwd_all_heads_output.default(
+        q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+    )
+
+
 def flash_mla_sparse_fwd_tp4_sharded_output(
     q_sources: torch.Tensor,
     kv: torch.Tensor,

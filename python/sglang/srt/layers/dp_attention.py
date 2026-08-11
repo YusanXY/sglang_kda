@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -41,6 +42,12 @@ _ATTN_DP_SIZE: Optional[int] = None
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_FORCE_DSV4_HUGE_BALANCED_MAX_LEN = get_bool_env_var(
+    "SGLANG_DSV4_HUGE_DP_BALANCED_MAX_LEN"
+)
+_DSV4_HUGE_BALANCED_MAX_LEN_MAX_TOKENS = int(
+    os.environ.get("SGLANG_DSV4_HUGE_DP_BALANCED_MAX_LEN_MAX_TOKENS", "16384")
+)
 
 
 class DpPaddingMode(IntEnum):
@@ -67,6 +74,20 @@ class DpPaddingMode(IntEnum):
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
         # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
+            # Experimental Huge attention-DP fast path for the formally tested
+            # req16/req128 workloads.  Equal small per-rank chunks use NCCL
+            # all_gather + equal-chunk reduce_scatter without padding.  Larger
+            # or unbalanced chunks remain on SUM_LEN/gatherv inside the same
+            # Huge backend because the whole-layer executor requires real
+            # sequence lengths to sum exactly to M.
+            if _FORCE_DSV4_HUGE_BALANCED_MAX_LEN:
+                if (
+                    global_num_tokens
+                    and all(n == global_num_tokens[0] for n in global_num_tokens)
+                    and global_num_tokens[0]
+                    <= _DSV4_HUGE_BALANCED_MAX_LEN_MAX_TOKENS
+                ):
+                    return DpPaddingMode.MAX_LEN
             # Hybrid-SSM models materialize idle ranks via the MAX_LEN
             # fabricated-row conversion; other models keep mainline SUM_LEN.
             if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
@@ -446,6 +467,26 @@ def _dp_gather_via_all_gather(
 # gather exactly sum(per-rank tokens) via all_gatherv. Env-gated; only the simple
 # tp_size==dp_size (attn_tp_size==1) case is supported for now (e.g. tp8dp8).
 _USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
+
+
+def enable_dp_gatherv_for_dsv4_huge() -> None:
+    """Enable the validated DP collective specializations once per worker.
+
+    The Huge runner calls this during model-scoped runtime construction.  The
+    hot-path applicability checks in :func:`is_dp_gatherv_active` still enforce
+    attention-TP1, TP==DP, and SUM_LEN, so unsupported layouts fail to select
+    this path instead of changing generic DP behavior.  Small balanced prefill
+    chunks use MAX_LEN/equal-chunk reduce-scatter; larger or unbalanced chunks
+    retain the SUM_LEN all-gatherv/reduce-scatterv pair.
+    """
+
+    global _FORCE_DSV4_HUGE_BALANCED_MAX_LEN, _USE_DP_GATHERV
+    _USE_DP_GATHERV = True
+    _FORCE_DSV4_HUGE_BALANCED_MAX_LEN = True
+
+
+def is_dsv4_huge_dp_balanced_max_len_enabled() -> bool:
+    return _FORCE_DSV4_HUGE_BALANCED_MAX_LEN
 
 
 def is_dp_gatherv_active() -> bool:
