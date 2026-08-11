@@ -437,7 +437,7 @@ def test_counter_epoch_cuda_protocol_is_noncooperative_and_self_reusing() -> Non
 def test_nvls_counter_cuda_path_replaces_peer_staging_and_fences_aliases() -> None:
     source = CUDA_SOURCE.read_text(encoding="utf-8")
     token_begin = source.index(
-        "SGL_DEVICE void "
+        "SGL_DEVICE uint32_t "
         "tp4_moe_local_slice_multimem_shared_mhc_post_pair"
     )
     token_end = source.index(
@@ -451,6 +451,7 @@ def test_nvls_counter_cuda_path_replaces_peer_staging_and_fences_aliases() -> No
     assert "rounded_sum = __float22bfloat162_rn" in token
     assert "float2 residual_values" not in token
     assert "#pragma unroll 1" in token
+    assert "output_chunks[output_route * kChunksPerToken + chunk] = output_raw" in token
 
     counter_begin = source.index(
         "void tp4_moe_local_slice_shared_mhc_post_epoch_counter_kernel"
@@ -478,7 +479,7 @@ def test_nvls_counter_cuda_path_replaces_peer_staging_and_fences_aliases() -> No
     )
 
     jit_source = Path(e2e.__file__).read_text(encoding="utf-8")
-    assert "owner_v66_nvls_packed_pair" in jit_source
+    assert "owner_v67_nvls_packed_vector_store" in jit_source
     assert "run_local_slice_shared_epoch_counter_multimem" in jit_source
 
 
