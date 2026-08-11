@@ -56,7 +56,7 @@ def test_patch_moves_prepare_before_routing() -> None:
     assert "launchers_map" not in patched
     assert patched.count("std::make_unique<FP4BlockScaleLauncher>") == 1
     assert patched.count("dsv4MoeFinalizeSharedKernel") >= 2
-    assert patched.count("dsv4MoeFinalizeDpRoutedKernel") >= 2
+    assert patched.count("dsv4MoeFinalizeDpRoutedTopK6Kernel") >= 2
     assert patched.count("dsv4_set_shared_finalize") >= 3
     assert patched.count("dsv4_set_dp_routed_finalize") >= 3
     assert (
@@ -75,24 +75,71 @@ def test_patch_moves_prepare_before_routing() -> None:
     assert "result[0], topk_weights, result[2]" not in patched
     assert (
         _DSV4_JIT_MODULE_NAME
-        == "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v74"
+        == "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v75"
     )
 
 
 def test_dp_routed_finalize_packs_two_bf16_rounds_without_shared_add() -> None:
     patched = _patch_launcher(_source())
-    kernel_start = patched.index("__global__ void dsv4MoeFinalizeDpRoutedKernel")
+    kernel_start = patched.index(
+        "__global__ void dsv4MoeFinalizeDpRoutedTopK6Kernel"
+    )
     kernel_end = patched.index("void dsv4_launch_dp_routed_finalize", kernel_start)
     kernel = patched[kernel_start:kernel_end]
 
-    first_round = kernel.index("__floats2bfloat162_rn(")
+    first_round = kernel.index(
+        "__nv_bfloat162 const finalized = __floats2bfloat162_rn("
+    )
     scale = kernel.index("__hmul2_rn(finalized, scale2)")
-    output_store = kernel.index("output_vec[token * hidden_vecs + vec] = result")
+    output_store = kernel.index("output_vec[token * kHiddenVecs + vec] = result")
     assert first_round < scale < output_store
     assert "for (int pair = 0; pair < 4; ++pair)" in kernel
     assert "__float2bfloat16_rn(accum[element])" not in kernel
     assert "shared_output" not in kernel
     assert "shared_vec" not in kernel
+
+
+def test_dp_routed_topk6_compaction_preserves_route_order() -> None:
+    patched = _patch_launcher(_source())
+    kernel_start = patched.index(
+        "__global__ void dsv4MoeFinalizeDpRoutedTopK6Kernel"
+    )
+    kernel_end = patched.index("void dsv4_launch_dp_routed_finalize", kernel_start)
+    kernel = patched[kernel_start:kernel_end]
+
+    assert "constexpr int kTopK = 6" in kernel
+    assert "__shared__ int compact_sources[kTopK]" in kernel
+    assert "__shared__ float compact_weights[kTopK]" in kernel
+    ballot = kernel.index("__ballot_sync(0xffffffffu")
+    stable_slot = kernel.index(
+        "__popc(valid_mask & ((1u << lane) - 1u))"
+    )
+    barrier = kernel.index("__syncthreads()")
+    serial_loop = kernel.index(
+        "for (int slot = 0; slot < valid_count; ++slot)"
+    )
+    first_read = kernel.index("gemm_vec[source * padded_vecs + vec]")
+    assert ballot < stable_slot < barrier < serial_loop < first_read
+    assert "#pragma unroll 1" in kernel
+    assert "if (source < 0) continue" not in kernel
+
+
+def test_dp_routed_topk6_strict_contract_and_thread_dispatch() -> None:
+    patched = _patch_launcher(_source())
+    launch_start = patched.index("void dsv4_launch_dp_routed_finalize")
+    launch = patched[launch_start:]
+
+    assert "TVM_FFI_ICHECK_GT(state.num_tokens, 0)" in launch
+    assert "TVM_FFI_ICHECK_LE(state.num_tokens, 131072)" in launch
+    assert "TVM_FFI_ICHECK_EQ(top_k, 6)" in launch
+    assert "TVM_FFI_ICHECK_EQ(state.hidden_dim, 4096)" in launch
+    assert "TVM_FFI_ICHECK_EQ(gemm2_output.size(1), 4096)" in launch
+    assert "TVM_FFI_ICHECK_EQ(state.routed_scale, 1.5f)" in launch
+    dispatch = launch.index("state.num_tokens <= 4096 ? 256u : 128u")
+    kernel_launch = launch.index(
+        "dsv4MoeFinalizeDpRoutedTopK6Kernel<<<state.num_tokens, threads"
+    )
+    assert dispatch < kernel_launch
 
 
 def test_dp_routed_finalize_rejects_non_dsv4_or_non_bf16_scale() -> None:
@@ -124,6 +171,9 @@ def test_packed_epilogue_does_not_modify_shared_finalize() -> None:
     assert "__hmul2_rn" not in kernel
     assert "__float2bfloat16_rn(accum[element])" in kernel
     assert "__bfloat162float(shared.value[element])" in kernel
+    assert "compact_sources" not in kernel
+    assert "valid_mask" not in kernel
+    assert "kTopK = 6" not in kernel
 
 
 def test_dp_routed_finalize_is_one_shot_and_mutually_exclusive() -> None:

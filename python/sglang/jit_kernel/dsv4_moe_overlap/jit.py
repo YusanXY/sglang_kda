@@ -7,7 +7,7 @@ from pathlib import Path
 
 _DSV4_JIT_SPEC = None
 _DSV4_RAW_MODULE = None
-_DSV4_JIT_MODULE_NAME = "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v74"
+_DSV4_JIT_MODULE_NAME = "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v75"
 
 
 _EXPECTED_LAUNCHER_SHA256 = (
@@ -498,11 +498,10 @@ void dsv4_launch_shared_finalize(
       << "dsv4 fused MoE finalize launch failed: " << cudaGetErrorString(error);
 }
 
-__global__ void dsv4MoeFinalizeDpRoutedKernel(
+__global__ void dsv4MoeFinalizeDpRoutedTopK6Kernel(
     int num_tokens,
     int hidden_dim,
     int hidden_dim_padded,
-    int top_k,
     __nv_bfloat16 const* __restrict__ gemm2_output,
     int const* __restrict__ expanded_to_permuted,
     int32_t const* __restrict__ packed_topk,
@@ -511,27 +510,49 @@ __global__ void dsv4MoeFinalizeDpRoutedKernel(
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaGridDependencySynchronize();
 #endif
-  constexpr int kMaxTopK = 64;
+  constexpr int kTopK = 6;
+  constexpr int kHiddenDim = 4096;
+  constexpr int kHiddenVecs = kHiddenDim / 8;
   int const token = static_cast<int>(blockIdx.x);
-  __shared__ int permuted[kMaxTopK];
-  __shared__ float weights[kMaxTopK];
-  for (int k = threadIdx.x; k < top_k; k += blockDim.x) {
-    int const expanded = token * top_k + k;
-    permuted[k] = expanded_to_permuted[expanded];
-    weights[k] = dsv4_packed_weight_to_float(packed_topk[expanded]);
+  int const lane = static_cast<int>(threadIdx.x) & 31;
+  __shared__ int compact_sources[kTopK];
+  __shared__ float compact_weights[kTopK];
+  __shared__ int valid_count;
+
+  // Lanes 0..5 stably compact valid local routes. popc over lower lanes
+  // preserves the original TopK order even when -1 entries are interspersed.
+  if (threadIdx.x < 32) {
+    int source = -1;
+    float weight = 0.0f;
+    if (lane < kTopK) {
+      int const expanded = token * kTopK + lane;
+      source = expanded_to_permuted[expanded];
+      weight = dsv4_packed_weight_to_float(packed_topk[expanded]);
+    }
+    unsigned const valid_mask =
+        __ballot_sync(0xffffffffu, lane < kTopK && source >= 0);
+    if (lane < kTopK && source >= 0) {
+      int const slot = __popc(valid_mask & ((1u << lane) - 1u));
+      compact_sources[slot] = source;
+      compact_weights[slot] = weight;
+    }
+    if (lane == 0) {
+      valid_count = __popc(valid_mask);
+    }
   }
   __syncthreads();
 
-  int const hidden_vecs = hidden_dim / 8;
   int const padded_vecs = hidden_dim_padded / 8;
   auto const* gemm_vec = reinterpret_cast<Dsv4Bf16x8 const*>(gemm2_output);
   auto* output_vec = reinterpret_cast<Dsv4Bf16x8*>(output);
-  for (int vec = threadIdx.x; vec < hidden_vecs; vec += blockDim.x) {
-    float accum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (int k = 0; k < top_k; ++k) {
-      int const source = permuted[k];
-      if (source < 0) continue;
-      float const weight = weights[k];
+  for (int vec = threadIdx.x; vec < kHiddenVecs; vec += blockDim.x) {
+    float accum[8] = {};
+    // Stable compaction keeps this serial accumulation in original k order;
+    // do not unroll or replace it with a tree reduction.
+#pragma unroll 1
+    for (int slot = 0; slot < valid_count; ++slot) {
+      int const source = compact_sources[slot];
+      float const weight = compact_weights[slot];
       Dsv4Bf16x8 const values = gemm_vec[source * padded_vecs + vec];
 #pragma unroll
       for (int element = 0; element < 8; ++element) {
@@ -551,7 +572,7 @@ __global__ void dsv4MoeFinalizeDpRoutedKernel(
           accum[pair * 2], accum[pair * 2 + 1]);
       result2[pair] = __hmul2_rn(finalized, scale2);
     }
-    output_vec[token * hidden_vecs + vec] = result;
+    output_vec[token * kHiddenVecs + vec] = result;
   }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   cudaTriggerProgrammaticLaunchCompletion();
@@ -576,12 +597,21 @@ void dsv4_launch_dp_routed_finalize(
   dsv4_check_finalize_inputs(
       gemm2_output, packed_topk, expanded_to_permuted, output,
       state.num_tokens, state.hidden_dim, top_k);
+  // Exact DSV4 Flash contract. Huge is strict and never falls back to the
+  // generic routed-finalize implementation when these invariants drift.
+  TVM_FFI_ICHECK_GT(state.num_tokens, 0);
+  TVM_FFI_ICHECK_LE(state.num_tokens, 131072);
+  TVM_FFI_ICHECK_EQ(top_k, 6);
+  TVM_FFI_ICHECK_EQ(state.hidden_dim, 4096);
+  TVM_FFI_ICHECK_EQ(gemm2_output.size(1), 4096);
+  TVM_FFI_ICHECK_EQ(state.routed_scale, 1.5f);
 
   cudaStream_t const stream = get_stream(output.device());
-  dsv4MoeFinalizeDpRoutedKernel<<<state.num_tokens, 256, 0, stream>>>(
+  unsigned int const threads = state.num_tokens <= 4096 ? 256u : 128u;
+  dsv4MoeFinalizeDpRoutedTopK6Kernel<<<state.num_tokens, threads, 0, stream>>>(
       static_cast<int>(state.num_tokens),
       static_cast<int>(state.hidden_dim),
-      static_cast<int>(gemm2_output.size(1)), top_k,
+      static_cast<int>(gemm2_output.size(1)),
       static_cast<__nv_bfloat16 const*>(gemm2_output.data_ptr()),
       static_cast<int const*>(expanded_to_permuted.data_ptr()),
       static_cast<int32_t const*>(packed_topk.data_ptr()),
