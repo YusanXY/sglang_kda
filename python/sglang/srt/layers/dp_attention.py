@@ -600,6 +600,131 @@ def dp_gather_partial(
     _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
 
 
+def dp_gather_partial_grouped(
+    global_tensors: List[torch.Tensor],
+    local_tensors: List[torch.Tensor],
+    forward_batch: ForwardBatch,
+) -> None:
+    """Gather several Huge Attention-DP token tensors in one NCCL group.
+
+    This is intentionally stricter than :func:`dp_gather_partial`.  The Huge
+    high-load path has already materialized exact local and global views, so a
+    shape mismatch must not allocate a padded temporary or fall back to the
+    all-reduce implementation.  Keeping the BF16 activation and the compact
+    packed route in the same NCCL group also avoids adding a second host-side
+    collective boundary per decoder layer.
+    """
+
+    if not global_tensors or len(global_tensors) != len(local_tensors):
+        raise RuntimeError(
+            "Huge grouped DP gather requires equally-sized non-empty global "
+            f"and local tensor lists, got {len(global_tensors)} and "
+            f"{len(local_tensors)}"
+        )
+    if get_attn_tensor_model_parallel_world_size() != 1:
+        raise RuntimeError(
+            "Huge grouped DP gather requires attention TP=1, got "
+            f"{get_attn_tensor_model_parallel_world_size()}"
+        )
+    if get_tensor_model_parallel_world_size() != get_attention_dp_size():
+        raise RuntimeError(
+            "Huge grouped DP gather requires TP size == attention DP size, got "
+            f"TP={get_tensor_model_parallel_world_size()} and "
+            f"DP={get_attention_dp_size()}"
+        )
+
+    first_local = local_tensors[0]
+    first_global = global_tensors[0]
+    for index, (global_tensor, local_tensor) in enumerate(
+        zip(global_tensors, local_tensors)
+    ):
+        if not local_tensor.is_cuda or not global_tensor.is_cuda:
+            raise RuntimeError(
+                f"Huge grouped DP gather tensor[{index}] must be on CUDA"
+            )
+        if not local_tensor.is_contiguous() or not global_tensor.is_contiguous():
+            raise RuntimeError(
+                f"Huge grouped DP gather tensor[{index}] must be contiguous"
+            )
+        if local_tensor.device != first_local.device:
+            raise RuntimeError(
+                f"Huge grouped DP gather local tensor[{index}] is on "
+                f"{local_tensor.device}, expected {first_local.device}"
+            )
+        if global_tensor.device != first_global.device:
+            raise RuntimeError(
+                f"Huge grouped DP gather global tensor[{index}] is on "
+                f"{global_tensor.device}, expected {first_global.device}"
+            )
+        if local_tensor.device != global_tensor.device:
+            raise RuntimeError(
+                f"Huge grouped DP gather tensor[{index}] device mismatch: "
+                f"local={local_tensor.device}, global={global_tensor.device}"
+            )
+        if local_tensor.dim() == 0 or global_tensor.dim() != local_tensor.dim():
+            raise RuntimeError(
+                f"Huge grouped DP gather tensor[{index}] rank mismatch: "
+                f"local={tuple(local_tensor.shape)}, "
+                f"global={tuple(global_tensor.shape)}"
+            )
+        if tuple(global_tensor.shape[1:]) != tuple(local_tensor.shape[1:]):
+            raise RuntimeError(
+                f"Huge grouped DP gather tensor[{index}] trailing shape "
+                f"mismatch: local={tuple(local_tensor.shape)}, "
+                f"global={tuple(global_tensor.shape)}"
+            )
+
+    mode = forward_batch.dp_padding_mode
+    if mode is None:
+        raise RuntimeError("Huge grouped DP gather requires a DP padding mode")
+    if mode.is_max_len():
+        world_size = get_tensor_model_parallel_world_size()
+        for index, (global_tensor, local_tensor) in enumerate(
+            zip(global_tensors, local_tensors)
+        ):
+            expected_rows = local_tensor.shape[0] * world_size
+            if global_tensor.shape[0] != expected_rows:
+                raise RuntimeError(
+                    f"Huge grouped MAX_LEN gather tensor[{index}] has "
+                    f"global rows {global_tensor.shape[0]}, expected "
+                    f"{local_tensor.shape[0]} * {world_size} = {expected_rows}"
+                )
+        sizes = None
+    else:
+        if not is_dp_gatherv_active():
+            raise RuntimeError(
+                "Huge grouped SUM_LEN gather requires the validated all-gatherv "
+                "path; refusing an all-reduce fallback"
+            )
+        sizes = get_dp_global_num_tokens()
+        if sizes is None:
+            raise RuntimeError(
+                "Huge grouped SUM_LEN gather requires host-known per-rank sizes"
+            )
+        rank = get_attention_dp_rank()
+        local_rows = sizes[rank]
+        global_rows = sum(sizes)
+        for index, (global_tensor, local_tensor) in enumerate(
+            zip(global_tensors, local_tensors)
+        ):
+            if local_tensor.shape[0] != local_rows:
+                raise RuntimeError(
+                    f"Huge grouped SUM_LEN gather tensor[{index}] has local "
+                    f"rows {local_tensor.shape[0]}, expected {local_rows}"
+                )
+            if global_tensor.shape[0] != global_rows:
+                raise RuntimeError(
+                    f"Huge grouped SUM_LEN gather tensor[{index}] has global "
+                    f"rows {global_tensor.shape[0]}, expected {global_rows}"
+                )
+
+    get_tp_group().all_gatherv(
+        local_tensors,
+        sizes=sizes,
+        output=global_tensors,
+    )
+
+
 def dp_gather_replicate(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,

@@ -1116,14 +1116,18 @@ class GroupCoordinator:
         self,
         input_: Union[torch.Tensor, List[torch.Tensor]],
         sizes: Optional[List[int]] = None,
-        output: Optional[torch.Tensor] = None,
+        output: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
-        Supports varying sizes per rank and input tensor list.
+        Supports varying sizes per rank and one or more input tensors.
         `sizes`: a list of len(world_size) with the number of items per rank to gather.
-        `output`: optional pre-allocated destination buffer (single-tensor input only).
-            When given, NCCL writes the gathered result directly into it, avoiding an
-            extra output allocation + caller-side copy.
+        `output`: optional pre-allocated destination buffer. It must be a tensor for a
+            single-tensor input, or a list with one tensor per list input. When given,
+            NCCL writes each gathered result directly into its corresponding buffer,
+            avoiding extra output allocations and caller-side copies.
+
+        Multiple inputs are issued inside one NCCL group. The return value remains a
+        list for compatibility with existing callers, including single-tensor calls.
         """
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -1137,11 +1141,10 @@ class GroupCoordinator:
                 input_: torch.Tensor,
                 sizes: Optional[List[int]] = None,
                 output: Optional[torch.Tensor] = None,
+                input_index: int = 0,
             ):
                 input_size = input_.size()
                 if sizes is not None:
-                    assert len(sizes) == world_size
-                    assert input_.shape[0] == sizes[self.rank_in_group]
                     output_size = (sum(sizes),) + input_size[1:]
                     # 'sizes' is not needed if all inputs in the same group have the same shape
                     if all(s == sizes[0] for s in sizes):
@@ -1149,10 +1152,21 @@ class GroupCoordinator:
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
                 if output is not None:
-                    assert tuple(output.shape) == tuple(output_size), (
-                        f"all_gatherv output buffer shape {tuple(output.shape)} "
-                        f"!= expected {tuple(output_size)}"
-                    )
+                    if tuple(output.shape) != tuple(output_size):
+                        raise ValueError(
+                            f"all_gatherv output[{input_index}] shape "
+                            f"{tuple(output.shape)} != expected {tuple(output_size)}"
+                        )
+                    if output.device != input_.device:
+                        raise ValueError(
+                            f"all_gatherv output[{input_index}] device {output.device} "
+                            f"!= input device {input_.device}"
+                        )
+                    if output.dtype != input_.dtype:
+                        raise ValueError(
+                            f"all_gatherv output[{input_index}] dtype {output.dtype} "
+                            f"!= input dtype {input_.dtype}"
+                        )
                     return output, sizes
                 # Allocate output tensor.
                 with self.use_symmetric_memory(self, disabled=sizes is not None):
@@ -1163,21 +1177,82 @@ class GroupCoordinator:
 
             single_input = isinstance(input_, torch.Tensor)
             if single_input:
-                input_ = [input_]
-            elif output is not None:
-                raise ValueError("all_gatherv `output` requires a single-tensor input")
+                inputs = [input_]
+            elif isinstance(input_, list):
+                if not input_:
+                    raise ValueError("all_gatherv input list must not be empty")
+                inputs = input_
+            else:
+                raise TypeError(
+                    "all_gatherv `input_` must be a tensor or a list of tensors"
+                )
+
+            for i, inp in enumerate(inputs):
+                if not isinstance(inp, torch.Tensor):
+                    raise TypeError(f"all_gatherv input_[{i}] must be a tensor")
+                if inp.dim() == 0:
+                    raise ValueError(
+                        f"all_gatherv input_[{i}] must have at least one dimension"
+                    )
+                if inp.device != inputs[0].device:
+                    raise ValueError(
+                        f"all_gatherv input_[{i}] device {inp.device} "
+                        f"!= input_[0] device {inputs[0].device}"
+                    )
+
+            if sizes is not None:
+                if len(sizes) != world_size:
+                    raise ValueError(
+                        f"all_gatherv `sizes` length {len(sizes)} "
+                        f"!= world size {world_size}"
+                    )
+                if any(not isinstance(size, int) or size < 0 for size in sizes):
+                    raise ValueError(
+                        "all_gatherv `sizes` entries must be non-negative integers"
+                    )
+                local_size = sizes[self.rank_in_group]
+                for i, inp in enumerate(inputs):
+                    if inp.shape[0] != local_size:
+                        raise ValueError(
+                            f"all_gatherv input_[{i}] leading dimension "
+                            f"{inp.shape[0]} != local size {local_size}"
+                        )
+
+            if output is None:
+                outputs = [None] * len(inputs)
+            elif single_input:
+                if not isinstance(output, torch.Tensor):
+                    raise TypeError(
+                        "all_gatherv `output` must be a tensor for a "
+                        "single-tensor input"
+                    )
+                outputs = [output]
+            else:
+                if not isinstance(output, list):
+                    raise TypeError(
+                        "all_gatherv `output` must be a list for a list input"
+                    )
+                if len(output) != len(inputs):
+                    raise ValueError(
+                        f"all_gatherv output list length {len(output)} "
+                        f"!= input list length {len(inputs)}"
+                    )
+                for i, out in enumerate(output):
+                    if not isinstance(out, torch.Tensor):
+                        raise TypeError(f"all_gatherv output[{i}] must be a tensor")
+                outputs = output
 
             output_list = []
             size_list = []
-            for inp in input_:
+            for i, (inp, out) in enumerate(zip(inputs, outputs)):
                 output_tensor, s = _all_gather_allocate_output(
-                    inp, sizes=sizes, output=output
+                    inp, sizes=sizes, output=out, input_index=i
                 )
                 output_list.append(output_tensor)
                 size_list.append(s)
 
             pynccl_comm.group_start()
-            for i, inp in enumerate(input_):
+            for i, inp in enumerate(inputs):
                 pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
             pynccl_comm.group_end()
 

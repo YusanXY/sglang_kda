@@ -237,6 +237,12 @@ class TopKOutputChecker:
         return isinstance(topk_output, (StandardTopKOutput, StandardTopKOutputPacked))
 
     @staticmethod
+    def format_is_packed_only(
+        topk_output: TopKOutput,
+    ) -> TypeGuard[PackedOnlyTopKOutput]:
+        return isinstance(topk_output, PackedOnlyTopKOutput)
+
+    @staticmethod
     def format_is_triton_kernels(
         topk_output: TopKOutput,
     ) -> TypeGuard[TritonKernelTopKOutput]:
@@ -251,6 +257,7 @@ class TopKOutputFormat(IntEnum):
     STANDARD = auto()
     TRITON_KERNEL = auto()
     BYPASSED = auto()
+    PACKED_ONLY = auto()
 
 
 @runtime_checkable
@@ -289,6 +296,21 @@ class StandardTopKOutputPacked(NamedTuple):
     @property
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.STANDARD
+
+
+class PackedOnlyTopKOutput(NamedTuple):
+    """Huge-only routing carrier consumed directly by FlashInfer MXFP4 MoE.
+
+    Each int32 entry stores ``(physical_expert_id << 16) | bf16(weight).bits``.
+    Keeping only the packed representation avoids materializing the standard
+    top-k id and weight tensors when no downstream consumer needs them.
+    """
+
+    packed_topk_ids: torch.Tensor
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.PACKED_ONLY
 
 
 # ===== END TO BE REFACTORED ====

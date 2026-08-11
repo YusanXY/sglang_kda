@@ -67,6 +67,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     attn_tp_all_reduce,
     dp_gather_partial,
+    dp_gather_partial_grouped,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_reduce_scatterv_async,
@@ -88,6 +89,7 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import PackedOnlyTopKOutput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -2185,6 +2187,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         routed_x_quant=None,
         huge_fused_moe_post: bool = False,
         defer_shared_expert_add: bool = False,
+        dp_packed_route_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -2216,6 +2219,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             raise RuntimeError(
                 "DSV4 fused MoE/mHC post requires Huge DP1 without CP or "
                 "attention/MoE gather-scatter"
+            )
+        if dp_packed_route_output is not None and (
+            get_server_args().dsv4_worker_backend != "huge_kernel"
+            or not _use_tp_moe_gather
+            or _use_cp
+            or _use_tp_attn_a2a_scatter
+        ):
+            raise RuntimeError(
+                "precomputed packed routing requires Huge attention-DP "
+                "TP-MoE gather/scatter"
             )
         unsupported_shared_prequant = shared_x_quant is not None and (
             _use_cp
@@ -2299,6 +2312,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "DSV4 Huge attention-DP shared prequantization requires the "
                 "replicated TP1 local shared-expert path"
             )
+        precomputed_topk_output = None
         if _use_cp:
             if get_moe_a2a_backend().is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
@@ -2328,7 +2342,44 @@ class DeepseekV4DecoderLayer(nn.Module):
                     _shared_local = self.mlp._forward_shared_experts(
                         local_hidden_states, x_quant=shared_x_quant
                     )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            route_builder = getattr(
+                self.mlp, "build_dsv4_huge_local_packed_route", None
+            )
+            if (
+                dp_packed_route_output is not None
+                and isinstance(self.mlp, deepseek_v2.DeepseekV2MoE)
+                and route_builder is None
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge routed MoE is missing its local packed-route "
+                    "producer"
+                )
+            if dp_packed_route_output is not None and route_builder is not None:
+                local_packed_route = route_builder(
+                    local_hidden_states,
+                    input_ids=input_ids,
+                )
+                if local_packed_route.shape != (
+                    local_hidden_states.shape[0],
+                    6,
+                ):
+                    raise RuntimeError(
+                        "DSV4 Huge local route producer returned shape "
+                        f"{tuple(local_packed_route.shape)}, expected "
+                        f"({local_hidden_states.shape[0]}, 6)"
+                    )
+                dp_gather_partial_grouped(
+                    [hidden_states, dp_packed_route_output],
+                    [local_hidden_states, local_packed_route],
+                    forward_batch,
+                )
+                precomputed_topk_output = PackedOnlyTopKOutput(
+                    dp_packed_route_output
+                )
+            else:
+                dp_gather_partial(
+                    hidden_states, local_hidden_states, forward_batch
+                )
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
             s, r = get_parallel().attn_tp_size, get_parallel().attn_tp_rank
@@ -2340,17 +2391,29 @@ class DeepseekV4DecoderLayer(nn.Module):
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
         with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                skip_shared_experts=_do_shared_local,
-                shared_x_quant=(
-                    None if _use_tp_moe_gather else shared_x_quant
-                ),
-                routed_x_quant=routed_x_quant,
-            )
+            if precomputed_topk_output is None:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    skip_shared_experts=_do_shared_local,
+                    shared_x_quant=(
+                        None if _use_tp_moe_gather else shared_x_quant
+                    ),
+                    routed_x_quant=routed_x_quant,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    skip_shared_experts=_do_shared_local,
+                    shared_x_quant=None,
+                    routed_x_quant=routed_x_quant,
+                    precomputed_topk_output=precomputed_topk_output,
+                )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:

@@ -23,7 +23,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopKOutput,
+    TopKOutputChecker,
+)
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -118,13 +122,71 @@ class StandardDispatcher(BaseDispatcher):
         self.num_local_routed_experts = (
             self.num_local_experts - self.num_local_shared_experts
         )
+        self.top_k = moe_runner_config.top_k
         self.moe_ep_rank = get_parallel().moe_ep_rank
         self.local_expert_mapping = None
         self.expert_mask_gpu = None
 
+    def _validate_dsv4_huge_precomputed_packed_route(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> TopKOutput:
+        if not TopKOutputChecker.format_is_packed_only(topk_output):
+            return topk_output
+
+        server_args = get_server_args()
+        parallel = get_parallel()
+        tp_group = get_tp_group()
+        if (
+            server_args.dsv4_worker_backend != "huge_kernel"
+            or not server_args.enable_dp_attention
+            or parallel.tp_size != 4
+            or parallel.attn_dp_size != 4
+            or parallel.attn_tp_size != 1
+            or not get_moe_a2a_backend().is_none()
+            or not self.enable_flashinfer_mxfp4_moe
+            or tp_group.world_size != 4
+            or tp_group.rank_in_group != parallel.attn_dp_rank
+        ):
+            raise RuntimeError(
+                "DSV4 Huge packed-only dispatch requires TP4/Attention-DP4 "
+                "(attention TP1), moe_a2a_backend=none, and "
+                "moe_runner_backend=flashinfer_mxfp4"
+            )
+
+        packed_topk_ids = topk_output.packed_topk_ids
+        if (
+            not isinstance(packed_topk_ids, torch.Tensor)
+            or packed_topk_ids.ndim != 2
+            or packed_topk_ids.shape[1] != self.top_k
+            or packed_topk_ids.dtype != torch.int32
+            or packed_topk_ids.device != hidden_states.device
+            or not packed_topk_ids.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid DSV4 Huge packed route before dispatch: "
+                f"shape={getattr(packed_topk_ids, 'shape', None)}, "
+                f"dtype={getattr(packed_topk_ids, 'dtype', None)}, "
+                f"device={getattr(packed_topk_ids, 'device', None)}, "
+                f"expected columns={self.top_k}, device={hidden_states.device}"
+            )
+
+        expected_shape = (hidden_states.shape[0], self.top_k)
+        if packed_topk_ids.shape != expected_shape:
+            raise RuntimeError(
+                "DSV4 Huge precomputed packed route is not globally aligned: "
+                f"expected={expected_shape}, got={tuple(packed_topk_ids.shape)}"
+            )
+        return topk_output
+
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
+
+        topk_output = self._validate_dsv4_huge_precomputed_packed_route(
+            hidden_states, topk_output
+        )
 
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
             # all-gather fp4 hidden states

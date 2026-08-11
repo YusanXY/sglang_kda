@@ -168,6 +168,7 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     mhc_routed_output_scale: torch.Tensor
     shared_down_fp8: torch.Tensor
     shared_down_scale: torch.Tensor
+    moe_packed_route: Optional[torch.Tensor]
     wo_a_output_q: torch.Tensor
     wo_a_output_s_storage: torch.Tensor
     wo_a_gemm_output: torch.Tensor
@@ -318,6 +319,18 @@ class DSV4WholeLayerRuntime:
         self._tp4_owner_flags_workspace: Optional[tuple] = None
         self._tp4_local_wob_output_workspace: Optional[tuple] = None
         self._attention_output_forward_epoch = 0
+        # Stage-1 Attention-DP localization: every layer writes its compact
+        # global packed route into this fixed address.  The payload is only
+        # 6 int32 values per token (3 MiB at M=131072), so it can be gathered
+        # alongside the BF16 activation without materializing global router
+        # logits, top-k ids, or weights.
+        self._use_dp_local_routing = (
+            self._attention_dp4
+            and os.environ.get("SGLANG_DSV4_HUGE_DP_LOCAL_ROUTING", "0") == "1"
+        )
+        self._dp_packed_route_workspace: Optional[
+            tuple[torch.device, torch.Tensor]
+        ] = None
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
         ] = None
@@ -390,6 +403,18 @@ class DSV4WholeLayerRuntime:
                 layers, start_layer=start_layer, end_layer=end_layer
             )
         workspace_device = layers[start_layer].self_attn.wo_a.weight.device
+        if self._use_dp_local_routing and (
+            self._dp_packed_route_workspace is None
+            or self._dp_packed_route_workspace[0] != workspace_device
+        ):
+            self._dp_packed_route_workspace = (
+                workspace_device,
+                torch.empty(
+                    (_MAX_FORWARD_TOKENS, 6),
+                    dtype=torch.int32,
+                    device=workspace_device,
+                ),
+            )
         if self._use_tp4_token_shard_attention:
             self._bind_tp4_symmetric_q_workspace(workspace_device)
             self._bind_tp4_symmetric_moe_workspace(workspace_device)
@@ -1206,6 +1231,30 @@ class DSV4WholeLayerRuntime:
                     "MoE buffer length in [local_M, 131072], got "
                     f"local_M={num_tokens}, global_M={moe_num_tokens!r}"
                 )
+        # Selection must be identical on all four ranks.  Local request counts,
+        # EXTEND lengths and IDLE mode may differ, so using any of them here can
+        # split the ranks between grouped and legacy collective sequences.  The
+        # post-padding global size vector is host-mirrored and identical on all
+        # ranks; limit stage 1 to the two formally measured balanced buckets.
+        global_dp_sizes = getattr(forward_batch, "global_num_tokens_cpu", None)
+        global_dp_sizes = (
+            None
+            if global_dp_sizes is None
+            else tuple(int(size) for size in global_dp_sizes)
+        )
+        use_dp_local_routing = self._use_dp_local_routing and (
+            (moe_num_tokens == 65536 and global_dp_sizes == (16384,) * 4)
+            or (moe_num_tokens == 131072 and global_dp_sizes == (32768,) * 4)
+        )
+        if use_dp_local_routing:
+            route_workspace = self._dp_packed_route_workspace
+            if route_workspace is None or route_workspace[0] != positions.device:
+                raise RuntimeError(
+                    "DSV4 Huge local routing workspace was not bound on this device"
+                )
+            moe_packed_route = route_workspace[1][:moe_num_tokens]
+        else:
+            moe_packed_route = None
         # Huge attention-DP evaluates a replicated TP1 shared expert on this
         # rank's local tokens. Keep its 2048-wide activation workspace local;
         # the gathered token count is only for the TP-sharded routed experts.
@@ -1302,6 +1351,7 @@ class DSV4WholeLayerRuntime:
             mhc_routed_output_scale=mhc_routed_output_scale,
             shared_down_fp8=shared_down_fp8,
             shared_down_scale=shared_down_scale,
+            moe_packed_route=moe_packed_route,
             wo_a_output_q=output_q,
             wo_a_output_s_storage=output_s_storage,
             wo_a_gemm_output=wo_a_gemm_output,
@@ -1777,6 +1827,10 @@ class DSV4WholeLayerRuntime:
                 "compress_ratios layout: 43 decoder entries plus the model's "
                 "trailing C0 sentinel"
             )
+        # Do not validate the V3-only first_k_dense_replace/moe_layer_freq
+        # defaults exposed by the HF alias.  DeepSeek V4 instantiates MoE on
+        # every decoder layer; the exact 43-layer layout is validated by the
+        # architecture, expert fields, and compress_ratios checks here.
         expected_config = {
             "hidden_size": 4096,
             "num_hidden_layers": 43,
@@ -1787,6 +1841,10 @@ class DSV4WholeLayerRuntime:
             "o_lora_rank": 1024,
             "o_groups": 8,
             "hc_mult": 4,
+            "n_routed_experts": 256,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 6,
+            "num_hash_layers": 3,
         }
         for name, expected in expected_config.items():
             actual = int(getattr(config, name))
@@ -1800,7 +1858,12 @@ class DSV4WholeLayerRuntime:
             "tp_size": 4,
             "ep_size": 4,
             "pp_size": 1,
+            "moe_a2a_backend": "none",
             "moe_runner_backend": "flashinfer_mxfp4",
+            "enable_eplb": False,
+            "enable_waterfill": False,
+            "ep_num_redundant_experts": 0,
+            "ep_dispatch_algorithm": None,
             "disable_overlap_schedule": True,
             "enable_dsa_prefill_context_parallel": False,
             "enable_two_batch_overlap": False,
@@ -1989,6 +2052,7 @@ def _execute_common(
             descriptor.forward_batch,
             input_ids=descriptor.input_ids,
             input_ids_global=descriptor.input_ids_global,
+            dp_packed_route_output=descriptor.moe_packed_route,
         )
         return hidden_states, None, None, None
 
@@ -2071,6 +2135,7 @@ def _execute_common(
             input_ids_global=descriptor.input_ids_global,
             shared_x_quant=shared_x_quant,
             defer_shared_expert_add=True,
+            dp_packed_route_output=descriptor.moe_packed_route,
         )
         hidden_states = _huge_mhc_post(
             hidden_states=hidden_states,

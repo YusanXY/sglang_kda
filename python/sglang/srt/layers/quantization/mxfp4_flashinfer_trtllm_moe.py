@@ -47,6 +47,73 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 
 _DSV4_MOE_OVERLAP_INSTALLED = False
 _FLASHINFER_CUBIN_OVERLAY_INSTALLED = False
+_DSV4_HUGE_TOP_K = 6
+
+
+def _resolve_mxfp4_packed_topk(
+    topk_output,
+    hidden_states: torch.Tensor,
+    *,
+    dsv4_worker_backend: str,
+    layer_id=None,
+) -> tuple[torch.Tensor, int]:
+    """Resolve the routing ABI without allowing a Huge-to-native fallback."""
+    from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+    is_dsv4_huge = dsv4_worker_backend == "huge_kernel"
+    if TopKOutputChecker.format_is_packed_only(topk_output):
+        if not is_dsv4_huge:
+            raise RuntimeError(
+                "packed-only MXFP4 routing is restricted to DSV4 Huge; "
+                f"layer_id={layer_id}, backend={dsv4_worker_backend!r}"
+            )
+        packed_topk = topk_output.packed_topk_ids
+    elif TopKOutputChecker.format_is_standard(topk_output):
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+        if not is_dsv4_huge:
+            # Keep the native path unchanged: standard routing is packed by
+            # the existing kernel immediately before FlashInfer MXFP4 MoE.
+            return PackTopkIds.execute(topk_ids, topk_weights), topk_ids.shape[1]
+
+        packed_topk = getattr(topk_output, "packed_topk_ids", None)
+        if packed_topk is None:
+            raise RuntimeError(
+                "DSV4 Huge requires fused packed routing for every MoE layer; "
+                f"layer_id={layer_id}, got {type(topk_output).__name__}"
+            )
+    elif TopKOutputChecker.format_is_bypassed(topk_output):
+        raise NotImplementedError(
+            "the old code in this branch is WRONG. e.g. it does not consider "
+            "HashTopK, and may miss args"
+        )
+    else:
+        raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+
+    if not isinstance(packed_topk, torch.Tensor):
+        raise RuntimeError(
+            "invalid DSV4 Huge packed routing tensor; "
+            f"layer_id={layer_id}, got {type(packed_topk).__name__}"
+        )
+
+    expected_shape = (hidden_states.shape[0], _DSV4_HUGE_TOP_K)
+    if (
+        packed_topk.shape != expected_shape
+        or packed_topk.dtype != torch.int32
+        or not packed_topk.is_contiguous()
+        or packed_topk.device != hidden_states.device
+        or packed_topk.device.type != "cuda"
+    ):
+        raise RuntimeError(
+            "invalid DSV4 Huge packed routing workspace; "
+            f"layer_id={layer_id}, expected shape={expected_shape}, "
+            "dtype=torch.int32, "
+            f"device={hidden_states.device} (CUDA), contiguous=True; got "
+            f"shape={tuple(packed_topk.shape)}, dtype={packed_topk.dtype}, "
+            f"device={packed_topk.device}, contiguous={packed_topk.is_contiguous()}"
+        )
+
+    return packed_topk, _DSV4_HUGE_TOP_K
 
 
 def _install_writable_flashinfer_cubin_overlay() -> None:
@@ -327,7 +394,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         prequant=None,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
@@ -346,26 +412,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if w2_scale.dim() == 2:
             w2_scale = w2_scale.reshape(num_local_experts, hidden_size, -1)
 
-        if TopKOutputChecker.format_is_standard(topk_output):
-            topk_ids = topk_output.topk_ids
-            topk_weights = topk_output.topk_weights
-        elif TopKOutputChecker.format_is_bypassed(topk_output):
-            raise NotImplementedError(
-                "the old code in this branch is WRONG. e.g. it does not consider HashTopK, and may miss args"
-            )
-        else:
-            raise ValueError(f"Unsupported topk output format: {topk_output.format}")
-
-        if get_server_args().dsv4_worker_backend == "huge_kernel":
-            packed_topk = getattr(topk_output, "packed_topk_ids", None)
-            if packed_topk is None:
-                layer_id = getattr(layer, "layer_id", None)
-                raise RuntimeError(
-                    "DSV4 Huge requires fused packed routing for every MoE layer; "
-                    f"layer_id={layer_id}, got {type(topk_output).__name__}"
-                )
-        else:
-            packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
+        packed_topk, top_k = _resolve_mxfp4_packed_topk(
+            topk_output,
+            hidden_states,
+            dsv4_worker_backend=get_server_args().dsv4_worker_backend,
+            layer_id=getattr(layer, "layer_id", None),
+        )
 
         precision = self.flashinfer_mxfp4_moe_precision
         if precision == "bf16":
@@ -497,7 +549,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
             output2_scale_scalar=layer.output2_scale_scalar,
             num_experts=layer.num_experts,
-            top_k=topk_ids.shape[1],
+            top_k=top_k,
             n_group=1,
             topk_group=1,
             intermediate_size=intermediate_size,

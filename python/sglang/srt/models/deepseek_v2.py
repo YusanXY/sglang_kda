@@ -107,7 +107,13 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    TopK,
+    TopKOutput,
+    TopKOutputChecker,
+    TopKOutputFormat,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -1031,6 +1037,103 @@ class DeepseekV2MoE(nn.Module):
             and not server_args.enable_eplb
         )
 
+    def _validate_dsv4_huge_local_packed_route(self) -> None:
+        """Fail closed before selecting the Attention-DP local-route path."""
+        server_args = get_server_args()
+        parallel = get_parallel()
+        if (
+            server_args.dsv4_worker_backend != "huge_kernel"
+            or not server_args.enable_dp_attention
+            or parallel.tp_size != 4
+            or parallel.attn_dp_size != 4
+            or parallel.attn_tp_size != 1
+            or not get_moe_a2a_backend().is_none()
+            or not get_moe_runner_backend().is_flashinfer_mxfp4()
+            or self.num_fused_shared_experts != 0
+        ):
+            raise RuntimeError(
+                "DSV4 Huge local packed routing requires TP4/Attention-DP4 "
+                "(attention TP1), moe_a2a_backend=none, "
+                "moe_runner_backend=flashinfer_mxfp4, and unfused shared experts"
+            )
+
+    def build_dsv4_huge_local_packed_route(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ) -> torch.Tensor:
+        """Build only the packed route on the local Attention-DP token shard.
+
+        The caller owns the later grouped hidden-state + route gather and wraps
+        the global result in ``PackedOnlyTopKOutput``.  Keeping communication
+        outside this producer guarantees there is exactly one collective.
+        """
+        self._validate_dsv4_huge_local_packed_route()
+        if hidden_states.ndim != 2:
+            raise RuntimeError(
+                "DSV4 Huge local packed routing requires a 2-D hidden-state shard, "
+                f"got shape={tuple(hidden_states.shape)}"
+            )
+        if self.is_hash:
+            if (
+                input_ids is None
+                or input_ids.ndim != 1
+                or input_ids.dtype != torch.int64
+                or input_ids.device != hidden_states.device
+                or not input_ids.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge HashMoE local packed routing requires contiguous "
+                    "local int64 input_ids on the hidden-state device"
+                )
+            if input_ids.shape[0] != hidden_states.shape[0]:
+                raise RuntimeError(
+                    "DSV4 Huge HashMoE local input_ids must match the local hidden "
+                    f"rows, got ids={input_ids.shape[0]}, hidden={hidden_states.shape[0]}"
+                )
+
+        if hidden_states.shape[0] == 0:
+            return torch.empty(
+                (0, self.top_k),
+                dtype=torch.int32,
+                device=hidden_states.device,
+            )
+
+        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+        topk_kwargs = {"input_ids": input_ids} if self.is_hash else {}
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=self._get_expert_location_dispatch_info(),
+            **topk_kwargs,
+        )
+        packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
+        expected_shape = (hidden_states.shape[0], self.top_k)
+        if (
+            not isinstance(packed_topk_ids, torch.Tensor)
+            or packed_topk_ids.shape != expected_shape
+            or packed_topk_ids.dtype != torch.int32
+            or packed_topk_ids.device != hidden_states.device
+            or not packed_topk_ids.is_contiguous()
+        ):
+            got = (
+                type(packed_topk_ids).__name__
+                if not isinstance(packed_topk_ids, torch.Tensor)
+                else (
+                    f"shape={tuple(packed_topk_ids.shape)}, "
+                    f"dtype={packed_topk_ids.dtype}, "
+                    f"device={packed_topk_ids.device}, "
+                    f"contiguous={packed_topk_ids.is_contiguous()}"
+                )
+            )
+            raise RuntimeError(
+                "DSV4 Huge local router did not produce the required packed route: "
+                f"expected shape={expected_shape}, dtype=torch.int32, "
+                f"device={hidden_states.device}, contiguous=True; got {got}"
+            )
+        return packed_topk_ids
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1041,8 +1144,25 @@ class DeepseekV2MoE(nn.Module):
         skip_shared_experts: bool = False,
         shared_x_quant=None,
         routed_x_quant=None,
+        precomputed_topk_output: Optional[TopKOutput] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        if precomputed_topk_output is not None:
+            if self._enable_a2a_moe:
+                raise RuntimeError(
+                    "DSV4 Huge precomputed packed routing is incompatible with A2A MoE"
+                )
+            return self.forward_normal(
+                hidden_states,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                shared_x_quant=shared_x_quant,
+                routed_x_quant=routed_x_quant,
+                precomputed_topk_output=precomputed_topk_output,
+            )
 
         if should_use_mega_moe(self, hidden_states):
             if shared_x_quant is not None or routed_x_quant is not None:
@@ -1217,12 +1337,21 @@ class DeepseekV2MoE(nn.Module):
         skip_shared_experts: bool = False,
         shared_x_quant=None,
         routed_x_quant=None,
+        precomputed_topk_output: Optional[TopKOutput] = None,
     ) -> torch.Tensor:
+        if precomputed_topk_output is not None:
+            self._validate_dsv4_huge_local_packed_route()
+            if not TopKOutputChecker.format_is_packed_only(
+                precomputed_topk_output
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge precomputed routing must use PackedOnlyTopKOutput, "
+                    f"got {type(precomputed_topk_output).__name__}"
+                )
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
-        dispatch_info = self._get_expert_location_dispatch_info()
         defer_shared = not self.experts.moe_runner_config.inplace
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): shared expert is computed on the LOCAL
         # hidden in the decoder layer (before the dp gather) and added after the
@@ -1239,24 +1368,31 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     x_quant=shared_x_quant,
                 )
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
+            if precomputed_topk_output is None:
+                dispatch_info = self._get_expert_location_dispatch_info()
+                # router_logits: (num_tokens, n_experts)
+                router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+                topk_kwargs = (
+                    {"input_ids": input_ids_global}
+                    if getattr(self, "is_hash", False)
+                    else {}
+                )
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
+            else:
+                topk_output = precomputed_topk_output
         else:
             shared_output = None
-            topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
-            )
+            if precomputed_topk_output is None:
+                topk_output = self.topk.empty_topk_output(
+                    hidden_states.device, layer_id=self.layer_id
+                )
+            else:
+                topk_output = precomputed_topk_output
 
         if self._fuse_shared_experts_inside_sbo and not skip_shared_experts:
             shared_output = None
