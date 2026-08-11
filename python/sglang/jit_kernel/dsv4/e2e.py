@@ -242,7 +242,7 @@ def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
     args = make_cpp_args(use_pdl)
     return load_jit(
         make_name(
-            "tp4_moe_mhc_post_hc4_h4096_owner_v65_nvls_local_epoch"
+            "tp4_moe_mhc_post_hc4_h4096_owner_v66_nvls_packed_pair"
         ),
         *args,
         cuda_files=["deepseek_v4/tp4_moe_mhc_post.cuh"],

@@ -157,6 +157,20 @@ SGL_DEVICE uint4 tp4_moe_mhc_multimem_reduce_bf16x8(
   return reduced;
 }
 
+template <uint32_t kPair>
+SGL_DEVICE uint32_t tp4_moe_mhc_uint4_pair(const uint4 value) {
+  static_assert(kPair < kTp4MoeMhcVec / 2);
+  if constexpr (kPair == 0) {
+    return value.x;
+  } else if constexpr (kPair == 1) {
+    return value.y;
+  } else if constexpr (kPair == 2) {
+    return value.z;
+  } else {
+    return value.w;
+  }
+}
+
 SGL_DEVICE __nv_bfloat162 tp4_moe_mhc_add4_ordered(
     __nv_bfloat162 a,
     __nv_bfloat162 b,
@@ -575,6 +589,82 @@ SGL_DEVICE void tp4_moe_local_slice_shared_mhc_post_token(
 // ``multimem.ld_reduce ... acc::f32 ... bf16x2`` returns BF16 pairs; the
 // following shared-expert add is deliberately rounded back to BF16 so the
 // former reduce-scatter -> torch.add boundary remains explicit.
+//
+// Keep the six BF16 uint4 inputs packed while computing one pair and one
+// output route at a time.  The former float2[4] + float2[4][4] live ranges
+// exceeded the 64-register launch-bound budget and generated 80 B/thread of
+// local stack.  Pair-major stores preserve every output route's input0->3
+// FMA order and both BF16 rounding boundaries without materializing those
+// arrays.  Four 32-bit stores replace each final 128-bit store; that trade is
+// intentional until the packed implementation proves that all stack traffic
+// is gone.
+template <uint32_t kPair>
+SGL_DEVICE void tp4_moe_local_slice_multimem_shared_mhc_post_pair(
+    const uint4 reduced_raw,
+    const uint4 shared_raw,
+    const uint4 residual_raw0,
+    const uint4 residual_raw1,
+    const uint4 residual_raw2,
+    const uint4 residual_raw3,
+    const float* coefficients,
+    uint32_t* output_pairs,
+    const uint32_t chunk) {
+  const float2 reduced_value = __bfloat1622float2(
+      tp4_moe_mhc_uint_to_bf16x2(
+          tp4_moe_mhc_uint4_pair<kPair>(reduced_raw)));
+  const float2 shared_value = __bfloat1622float2(
+      tp4_moe_mhc_uint_to_bf16x2(
+          tp4_moe_mhc_uint4_pair<kPair>(shared_raw)));
+  const __nv_bfloat162 rounded_sum = __float22bfloat162_rn(make_float2(
+      reduced_value.x + shared_value.x,
+      reduced_value.y + shared_value.y));
+  const float2 hidden_value = __bfloat1622float2(rounded_sum);
+
+  const float2 residual_value0 = __bfloat1622float2(
+      tp4_moe_mhc_uint_to_bf16x2(
+          tp4_moe_mhc_uint4_pair<kPair>(residual_raw0)));
+  const float2 residual_value1 = __bfloat1622float2(
+      tp4_moe_mhc_uint_to_bf16x2(
+          tp4_moe_mhc_uint4_pair<kPair>(residual_raw1)));
+  const float2 residual_value2 = __bfloat1622float2(
+      tp4_moe_mhc_uint_to_bf16x2(
+          tp4_moe_mhc_uint4_pair<kPair>(residual_raw2)));
+  const float2 residual_value3 = __bfloat1622float2(
+      tp4_moe_mhc_uint_to_bf16x2(
+          tp4_moe_mhc_uint4_pair<kPair>(residual_raw3)));
+
+  constexpr uint32_t kChunksPerToken =
+      kTp4MoeMhcHidden / kTp4MoeMhcVec;
+#pragma unroll 1
+  for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
+       ++output_route) {
+    float2 value = make_float2(
+        coefficients[output_route] * hidden_value.x,
+        coefficients[output_route] * hidden_value.y);
+    value = tp4_moe_mhc_fma2(
+        coefficients[kTp4MoeMhcHC + output_route],
+        residual_value0,
+        value);
+    value = tp4_moe_mhc_fma2(
+        coefficients[2 * kTp4MoeMhcHC + output_route],
+        residual_value1,
+        value);
+    value = tp4_moe_mhc_fma2(
+        coefficients[3 * kTp4MoeMhcHC + output_route],
+        residual_value2,
+        value);
+    value = tp4_moe_mhc_fma2(
+        coefficients[4 * kTp4MoeMhcHC + output_route],
+        residual_value3,
+        value);
+    const __nv_bfloat162 rounded = __float22bfloat162_rn(value);
+    output_pairs[
+        (output_route * kChunksPerToken + chunk) *
+            (kTp4MoeMhcVec / 2) +
+        kPair] = tp4_moe_mhc_bf16x2_to_uint(rounded);
+  }
+}
+
 SGL_DEVICE void tp4_moe_local_slice_multimem_shared_mhc_post_token(
     const Tp4MoeLocalSliceMhcPostParams& params,
     const uint32_t local_token,
@@ -608,72 +698,62 @@ SGL_DEVICE void tp4_moe_local_slice_multimem_shared_mhc_post_token(
         static_cast<uint64_t>(chunk) * kTp4MoeMhcVec;
     const uint4 reduced_raw = tp4_moe_mhc_multimem_reduce_bf16x8(
         params.multicast_input + element);
-    const auto* reduced_pairs =
-        reinterpret_cast<const __nv_bfloat162*>(&reduced_raw);
 
     const auto* shared_chunks = reinterpret_cast<const uint4*>(
         params.shared_hidden + local_hidden_base);
     const uint4 shared_raw = shared_chunks[chunk];
-    const auto* shared_pairs =
-        reinterpret_cast<const __nv_bfloat162*>(&shared_raw);
-    float2 hidden_values[kTp4MoeMhcVec / 2];
-#pragma unroll
-    for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
-      const float2 reduced_value =
-          __bfloat1622float2(reduced_pairs[pair]);
-      const float2 shared_value =
-          __bfloat1622float2(shared_pairs[pair]);
-      const __nv_bfloat162 rounded_sum = __float22bfloat162_rn(make_float2(
-          reduced_value.x + shared_value.x,
-          reduced_value.y + shared_value.y));
-      hidden_values[pair] = __bfloat1622float2(rounded_sum);
-    }
 
-    float2 residual_values[kTp4MoeMhcHC][kTp4MoeMhcVec / 2];
-#pragma unroll
-    for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
-         ++input_route) {
-      const auto* route_chunks = reinterpret_cast<const uint4*>(
-          params.residual + residual_base +
-          static_cast<uint64_t>(input_route) * kTp4MoeMhcHidden);
-      const uint4 residual_raw = route_chunks[chunk];
-      residual_values[input_route][0] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.x));
-      residual_values[input_route][1] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.y));
-      residual_values[input_route][2] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.z));
-      residual_values[input_route][3] = __bfloat1622float2(
-          tp4_moe_mhc_uint_to_bf16x2(residual_raw.w));
-    }
+    const auto* residual_chunks = reinterpret_cast<const uint4*>(
+        params.residual + residual_base);
+    const uint4 residual_raw0 = residual_chunks[chunk];
+    const uint4 residual_raw1 =
+        residual_chunks[kChunksPerToken + chunk];
+    const uint4 residual_raw2 =
+        residual_chunks[2 * kChunksPerToken + chunk];
+    const uint4 residual_raw3 =
+        residual_chunks[3 * kChunksPerToken + chunk];
+    auto* output_pairs = reinterpret_cast<uint32_t*>(output_chunks);
 
-#pragma unroll
-    for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
-         ++output_route) {
-      __nv_bfloat162 rounded[kTp4MoeMhcVec / 2];
-#pragma unroll
-      for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
-        float2 value = make_float2(
-            coefficients[output_route] * hidden_values[pair].x,
-            coefficients[output_route] * hidden_values[pair].y);
-#pragma unroll
-        for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
-             ++input_route) {
-          value = tp4_moe_mhc_fma2(
-              coefficients[
-                  kTp4MoeMhcHC +
-                  input_route * kTp4MoeMhcHC + output_route],
-              residual_values[input_route][pair],
-              value);
-        }
-        rounded[pair] = __float22bfloat162_rn(value);
-      }
-      output_chunks[output_route * kChunksPerToken + chunk] = make_uint4(
-          tp4_moe_mhc_bf16x2_to_uint(rounded[0]),
-          tp4_moe_mhc_bf16x2_to_uint(rounded[1]),
-          tp4_moe_mhc_bf16x2_to_uint(rounded[2]),
-          tp4_moe_mhc_bf16x2_to_uint(rounded[3]));
-    }
+    tp4_moe_local_slice_multimem_shared_mhc_post_pair<0>(
+        reduced_raw,
+        shared_raw,
+        residual_raw0,
+        residual_raw1,
+        residual_raw2,
+        residual_raw3,
+        coefficients,
+        output_pairs,
+        chunk);
+    tp4_moe_local_slice_multimem_shared_mhc_post_pair<1>(
+        reduced_raw,
+        shared_raw,
+        residual_raw0,
+        residual_raw1,
+        residual_raw2,
+        residual_raw3,
+        coefficients,
+        output_pairs,
+        chunk);
+    tp4_moe_local_slice_multimem_shared_mhc_post_pair<2>(
+        reduced_raw,
+        shared_raw,
+        residual_raw0,
+        residual_raw1,
+        residual_raw2,
+        residual_raw3,
+        coefficients,
+        output_pairs,
+        chunk);
+    tp4_moe_local_slice_multimem_shared_mhc_post_pair<3>(
+        reduced_raw,
+        shared_raw,
+        residual_raw0,
+        residual_raw1,
+        residual_raw2,
+        residual_raw3,
+        coefficients,
+        output_pairs,
+        chunk);
   }
 }
 

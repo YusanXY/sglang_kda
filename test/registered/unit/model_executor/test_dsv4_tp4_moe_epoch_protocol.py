@@ -438,7 +438,7 @@ def test_nvls_counter_cuda_path_replaces_peer_staging_and_fences_aliases() -> No
     source = CUDA_SOURCE.read_text(encoding="utf-8")
     token_begin = source.index(
         "SGL_DEVICE void "
-        "tp4_moe_local_slice_multimem_shared_mhc_post_token"
+        "tp4_moe_local_slice_multimem_shared_mhc_post_pair"
     )
     token_end = source.index(
         "template <bool kUsePDL>\n"
@@ -449,6 +449,8 @@ def test_nvls_counter_cuda_path_replaces_peer_staging_and_fences_aliases() -> No
     assert "tp4_moe_mhc_multimem_reduce_bf16x8" in token
     assert "peer_stages" not in token
     assert "rounded_sum = __float22bfloat162_rn" in token
+    assert "float2 residual_values" not in token
+    assert "#pragma unroll 1" in token
 
     counter_begin = source.index(
         "void tp4_moe_local_slice_shared_mhc_post_epoch_counter_kernel"
@@ -476,7 +478,7 @@ def test_nvls_counter_cuda_path_replaces_peer_staging_and_fences_aliases() -> No
     )
 
     jit_source = Path(e2e.__file__).read_text(encoding="utf-8")
-    assert "owner_v65_nvls_local_epoch" in jit_source
+    assert "owner_v66_nvls_packed_pair" in jit_source
     assert "run_local_slice_shared_epoch_counter_multimem" in jit_source
 
 
