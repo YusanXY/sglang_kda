@@ -35,9 +35,16 @@ class _ExtendMode:
         return True
 
 
-def _make_forward_batch(extend_lens: tuple[int, ...], global_rows: int):
+def _make_forward_batch(
+    extend_lens: tuple[int, ...],
+    global_rows: int,
+    *,
+    global_sizes: tuple[int, ...] | None = None,
+):
     local_rows = sum(extend_lens)
     requests = len(extend_lens)
+    if global_sizes is None:
+        global_sizes = (local_rows,) * 4
     return SimpleNamespace(
         forward_mode=_ExtendMode(),
         req_pool_indices=torch.arange(requests, dtype=torch.int32),
@@ -46,7 +53,7 @@ def _make_forward_batch(extend_lens: tuple[int, ...], global_rows: int):
         extend_seq_lens_cpu=extend_lens,
         out_cache_loc=torch.arange(local_rows, dtype=torch.int32),
         global_dp_buffer_len=global_rows,
-        global_num_tokens_cpu=[local_rows] * 4,
+        global_num_tokens_cpu=list(global_sizes),
         dp_padding_mode=None,
     )
 
@@ -93,9 +100,18 @@ def _make_runtime_with_bound_route_workspace():
     return runtime, route_storage
 
 
-def _begin_forward(runtime, extend_lens: tuple[int, ...], global_rows: int):
+def _begin_forward(
+    runtime,
+    extend_lens: tuple[int, ...],
+    global_rows: int,
+    *,
+    global_sizes: tuple[int, ...] | None = None,
+    attn_dp_rank: int = 0,
+):
     local_rows = sum(extend_lens)
-    forward_batch = _make_forward_batch(extend_lens, global_rows)
+    forward_batch = _make_forward_batch(
+        extend_lens, global_rows, global_sizes=global_sizes
+    )
     metadata = SimpleNamespace(
         core_attn_metadata=object(),
         indexer_metadata=object(),
@@ -107,6 +123,10 @@ def _begin_forward(runtime, extend_lens: tuple[int, ...], global_rows: int):
         dsv4_whole_layer_runtime, "get_is_capture_mode", return_value=False
     ), mock.patch.object(
         dsv4_whole_layer_runtime, "get_attn_backend", return_value=attn_backend
+    ), mock.patch.object(
+        dsv4_whole_layer_runtime,
+        "get_parallel",
+        return_value=SimpleNamespace(attn_dp_rank=attn_dp_rank),
     ):
         return runtime.begin_forward(
             forward_batch=forward_batch,
@@ -192,6 +212,34 @@ def test_runtime_binds_route_storage_once_outside_the_forward_hot_path():
     assert "routed_quant_workspace[2][:moe_num_tokens]" in begin_source
 
 
+def test_local_route_selection_uses_only_rank_shared_metadata():
+    begin_source = textwrap.dedent(
+        inspect.getsource(
+            dsv4_whole_layer_runtime.DSV4WholeLayerRuntime.begin_forward
+        )
+    )
+    begin_tree = ast.parse(begin_source)
+    selection = next(
+        node.value
+        for node in ast.walk(begin_tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "use_dp_local_routing"
+            for target in node.targets
+        )
+    )
+    selection_names = {
+        node.id for node in ast.walk(selection) if isinstance(node, ast.Name)
+    }
+
+    assert "global_dp_sizes" in selection_names
+    assert "moe_num_tokens" in selection_names
+    assert "num_tokens" not in selection_names
+    assert "attn_dp_rank" not in selection_names
+    assert "get_parallel" not in selection_names
+
+
 def test_runtime_descriptors_reuse_fixed_packed_route_storage_across_buckets():
     runtime, route_storage = _make_runtime_with_bound_route_workspace()
 
@@ -221,24 +269,66 @@ def test_runtime_descriptors_reuse_fixed_packed_route_storage_across_buckets():
     runtime.end_forward(req32)
 
 
+def test_nonuniform_host_known_tp4_sizes_enable_local_route_on_every_rank():
+    runtime, _ = _make_runtime_with_bound_route_workspace()
+    global_sizes = (16384, 16384, 12288, 12288)
+    global_rows = sum(global_sizes)
+
+    for attn_dp_rank, local_rows in enumerate(global_sizes):
+        descriptor = _begin_forward(
+            runtime,
+            (4096,) * (local_rows // 4096),
+            global_rows,
+            global_sizes=global_sizes,
+            attn_dp_rank=attn_dp_rank,
+        )
+
+        assert descriptor.moe_packed_route.shape == (global_rows, 6)
+        assert descriptor.moe_routed_q_global.shape == (global_rows, 4096)
+        assert descriptor.moe_routed_scale_global.shape == (global_rows, 128)
+        runtime.end_forward(descriptor)
+
+
 @pytest.mark.parametrize(
-    ("extend_lens", "global_rows"),
+    ("extend_lens", "global_rows", "global_sizes", "attn_dp_rank"),
     [
-        ((4096,), 16384),
-        ((2048, 2048), 65536),
+        ((4096,), 12288, (4096, 4096, 4096, 0), 0),
+        ((4096,), 14336, (4096, 4096, 4096, 2048), 0),
+        ((4096,), 12288, (4096, 4096, 4096), 0),
+        ((4096,), 20480, (4096, 4096, 4096, 4096), 0),
+        ((4096,), 49152, (4096, 36864, 4096, 4096), 0),
     ],
 )
-def test_prefix_and_nonbucket_huge_forwards_do_not_enable_local_route(
-    extend_lens, global_rows
+def test_unsupported_tp4_size_vectors_keep_the_legacy_huge_path(
+    extend_lens, global_rows, global_sizes, attn_dp_rank
 ):
     runtime, _ = _make_runtime_with_bound_route_workspace()
 
-    descriptor = _begin_forward(runtime, extend_lens, global_rows)
+    descriptor = _begin_forward(
+        runtime,
+        extend_lens,
+        global_rows,
+        global_sizes=global_sizes,
+        attn_dp_rank=attn_dp_rank,
+    )
 
     assert descriptor.moe_packed_route is None
     assert descriptor.moe_routed_q_global is None
     assert descriptor.moe_routed_scale_global is None
     runtime.end_forward(descriptor)
+
+
+def test_selected_tp4_vector_rejects_rank_local_size_mismatch():
+    runtime, _ = _make_runtime_with_bound_route_workspace()
+
+    with pytest.raises(RuntimeError, match="local_M to match"):
+        _begin_forward(
+            runtime,
+            (4096,),
+            20480,
+            global_sizes=(4096, 8192, 4096, 4096),
+            attn_dp_rank=1,
+        )
 
 
 class _Experts:

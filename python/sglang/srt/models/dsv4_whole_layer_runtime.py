@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.runtime_context import get_parallel
 
 CompressRatio = Literal[0, 4, 128]
 
@@ -1257,22 +1258,43 @@ class DSV4WholeLayerRuntime:
                     "MoE buffer length in [local_M, 131072], got "
                     f"local_M={num_tokens}, global_M={moe_num_tokens!r}"
                 )
-        # Selection must be identical on all four ranks.  Local request counts,
-        # EXTEND lengths and IDLE mode may differ, so using any of them here can
-        # split the ranks between grouped and legacy collective sequences.  The
-        # post-padding global size vector is host-mirrored and identical on all
-        # ranks; limit stage 1 to the two formally measured balanced buckets.
+        # Selection must depend only on state shared by all four ranks.  The
+        # host-mirrored post-padding size vector comes from one DP all-gather
+        # and is therefore identical everywhere.  Keep zero-rank and
+        # non-4096-aligned forwards on the legacy Huge path because the grouped
+        # routed-MXFP8 collective has not been validated for either case.
         global_dp_sizes = getattr(forward_batch, "global_num_tokens_cpu", None)
         global_dp_sizes = (
             None
             if global_dp_sizes is None
             else tuple(int(size) for size in global_dp_sizes)
         )
-        use_dp_local_routing = self._use_dp_local_routing and (
-            (moe_num_tokens == 65536 and global_dp_sizes == (16384,) * 4)
-            or (moe_num_tokens == 131072 and global_dp_sizes == (32768,) * 4)
+        use_dp_local_routing = (
+            self._use_dp_local_routing
+            and global_dp_sizes is not None
+            and len(global_dp_sizes) == 4
+            and sum(global_dp_sizes) == moe_num_tokens
+            and moe_num_tokens <= _MAX_FORWARD_TOKENS
+            and all(
+                1 <= size <= _MAX_FORWARD_TOKENS // 4 and size % 4096 == 0
+                for size in global_dp_sizes
+            )
         )
         if use_dp_local_routing:
+            attn_dp_rank = get_parallel().attn_dp_rank
+            if not 0 <= attn_dp_rank < 4:
+                raise RuntimeError(
+                    "DSV4 Huge local routing requires attention-DP rank in "
+                    f"[0, 4), got {attn_dp_rank}"
+                )
+            expected_local_tokens = global_dp_sizes[attn_dp_rank]
+            if num_tokens != expected_local_tokens:
+                raise RuntimeError(
+                    "DSV4 Huge local routing requires local_M to match the "
+                    "host-known TP4 size vector entry, got "
+                    f"rank={attn_dp_rank}, local_M={num_tokens}, "
+                    f"expected={expected_local_tokens}"
+                )
             route_workspace = self._dp_packed_route_workspace
             if route_workspace is None or route_workspace[0] != positions.device:
                 raise RuntimeError(
