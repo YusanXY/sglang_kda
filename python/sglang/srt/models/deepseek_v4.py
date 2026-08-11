@@ -2272,6 +2272,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
         # M_global * dim/tp), so decode no longer pays the ~dp_size x penalty.
         _shared_local = None
+        _shared_local_stream = None
         _do_shared_local = (
             (
                 _SHARED_EXPERT_LOCAL
@@ -2295,7 +2296,21 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hidden_states,
             )
             if _do_shared_local and local_hidden_states.shape[0] > 0:
-                _shared_local = self.mlp._forward_shared_experts(local_hidden_states)
+                # The replicated TP1 shared expert is independent of DP gather
+                # and routed MoE. Issue it on the pre-created model stream and
+                # join only at the fused shared+mHC epilogue.
+                if defer_shared_expert_add and self.mlp.alt_stream is not None:
+                    current_stream = torch.cuda.current_stream()
+                    self.mlp.alt_stream.wait_stream(current_stream)
+                    with torch.cuda.stream(self.mlp.alt_stream):
+                        _shared_local = self.mlp._forward_shared_experts(
+                            local_hidden_states
+                        )
+                    _shared_local_stream = self.mlp.alt_stream
+                else:
+                    _shared_local = self.mlp._forward_shared_experts(
+                        local_hidden_states
+                    )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
@@ -2360,6 +2375,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
         if defer_shared_expert_add:
+            if _shared_local_stream is not None:
+                current_stream = torch.cuda.current_stream()
+                current_stream.wait_stream(_shared_local_stream)
+                assert _shared_local is not None
+                _shared_local.record_stream(current_stream)
             # The leading dense FFN layers have no shared expert. They still
             # use the Huge mHC CUDA path, just without the optional fused add.
             shared_local = (
