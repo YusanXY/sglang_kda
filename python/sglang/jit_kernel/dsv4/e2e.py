@@ -652,7 +652,7 @@ def tp4_moe_mhc_post_multimem(
 def _jit_mhc_pre_norm_mxfp8_quant_module(threads: int, use_pdl: bool) -> Module:
     args = make_cpp_args(threads, use_pdl)
     return load_jit(
-        make_name("mhc_pre_norm_mxfp8_quant_double_buffer_final_v1"),
+        make_name("mhc_pre_norm_mxfp8_quant_weight_prefetch_ca_v3"),
         *args,
         cuda_files=["deepseek_v4/mhc_pre_norm_mxfp8_quant.cuh"],
         cuda_wrappers=[

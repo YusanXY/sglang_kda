@@ -48,7 +48,17 @@ __device__ __forceinline__ void mhc_cp_async_16(
   asm volatile(
       "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" ::
           "r"(shared_addr),
-      "l"(global_src));
+          "l"(global_src));
+}
+
+__device__ __forceinline__ void mhc_cp_async_ca_16(
+    void* shared_dst, const void* global_src) {
+  const uint32_t shared_addr =
+      static_cast<uint32_t>(__cvta_generic_to_shared(shared_dst));
+  asm volatile(
+      "cp.async.ca.shared.global [%0], [%1], 16;\n" ::
+          "r"(shared_addr),
+          "l"(global_src));
 }
 
 __device__ __forceinline__ void mhc_cp_async_commit() {
@@ -83,6 +93,18 @@ __device__ __forceinline__ void mhc_issue_residual_tile(
           offset;
       mhc_cp_async_16(stage + route * 1024 + offset, src);
     }
+  }
+}
+
+template <uint32_t kDataThreads>
+__device__ __forceinline__ void mhc_issue_norm_weight(
+    const MhcPreNormMxfp8QuantParams& params,
+    bf16_t* stage,
+    const uint32_t data_tid) {
+#pragma unroll
+  for (uint32_t offset = data_tid * 8; offset < 4096;
+       offset += kDataThreads * 8) {
+    mhc_cp_async_ca_16(stage + offset, params.norm_weight + offset);
   }
 }
 
@@ -377,10 +399,27 @@ void mhc_pre_norm_mxfp8_quant_pipelined_kernel(
     local_sq += mhc_process_residual_tile<kDataThreads>(
         residual_stages[0], unnormalized, pre_mix, 2, data_tid);
 
-    mhc_cp_async_wait<0>();
+    // Once residual tile 2 has been consumed, stage 0 is dead.  The
+    // attention-DP specialization reuses those 8 KiB to prefetch all
+    // RMSNorm weights while tile 3 is processed.  This hides the global-load
+    // scoreboard exposed after routed quantization was compiled out without
+    // increasing static shared memory or changing occupancy.
+    if constexpr (!kEmitRoutedQuant) {
+      mhc_issue_norm_weight<kDataThreads>(
+          params, residual_stages[0], data_tid);
+      mhc_cp_async_commit();
+      // Wait for the older residual-tile-3 group while leaving the new norm
+      // weight group in flight.
+      mhc_cp_async_wait<1>();
+    } else {
+      mhc_cp_async_wait<0>();
+    }
     mhc_data_warps_barrier<kDataThreads>();
     local_sq += mhc_process_residual_tile<kDataThreads>(
         residual_stages[1], unnormalized, pre_mix, 3, data_tid);
+    if constexpr (!kEmitRoutedQuant) {
+      mhc_cp_async_wait<0>();
+    }
 
     const float warp_sq = warp::reduce_sum(local_sq);
     if (lane == 0) data_warp_sums[data_warp] = warp_sq;
@@ -396,10 +435,12 @@ void mhc_pre_norm_mxfp8_quant_pipelined_kernel(
     }
     mhc_data_warps_barrier<kDataThreads>();
 
+    const bf16_t* norm_weight =
+        kEmitRoutedQuant ? params.norm_weight : residual_stages[0];
     mhc_process_norm_quant_tile<kDataThreads, kEmitRoutedQuant>(
         params,
         unnormalized,
-        params.norm_weight,
+        norm_weight,
         norm_factor,
         token,
         0,
@@ -408,7 +449,7 @@ void mhc_pre_norm_mxfp8_quant_pipelined_kernel(
     mhc_process_norm_quant_tile<kDataThreads, kEmitRoutedQuant>(
         params,
         unnormalized,
-        params.norm_weight + 1024,
+        norm_weight + 1024,
         norm_factor,
         token,
         1,
@@ -417,7 +458,7 @@ void mhc_pre_norm_mxfp8_quant_pipelined_kernel(
     mhc_process_norm_quant_tile<kDataThreads, kEmitRoutedQuant>(
         params,
         unnormalized,
-        params.norm_weight + 2048,
+        norm_weight + 2048,
         norm_factor,
         token,
         2,
@@ -426,7 +467,7 @@ void mhc_pre_norm_mxfp8_quant_pipelined_kernel(
     mhc_process_norm_quant_tile<kDataThreads, kEmitRoutedQuant>(
         params,
         unnormalized,
-        params.norm_weight + 3072,
+        norm_weight + 3072,
         norm_factor,
         token,
         3,
