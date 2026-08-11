@@ -2216,7 +2216,26 @@ class DeepseekV4AttnBackend(
                 topk_length=combined_lens,
             )
         else:
-            if self.dsv4_huge_mode:
+            if self.dsv4_huge_mode and getattr(
+                self, "dsv4_huge_attention_dp4", False
+            ):
+                # Attention-DP owns a disjoint token shard but replicates all
+                # 64 query heads on that rank. The TP-only Huge output-only
+                # specialization deliberately stores just local16, so use the
+                # all-head FlashMLA entry until the output-only CUDA epilogue
+                # below is generalized to a 64-head specialization.
+                from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+                o, _, _ = flash_mla_sparse_fwd(
+                    q=q_flat,
+                    kv=kv,
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.softmax_scale,
+                    d_v=self.head_dim_v,
+                    attn_sink=attn_sink,
+                    topk_length=combined_lens,
+                )
+            elif self.dsv4_huge_mode:
                 from sgl_kernel.flash_mla import flash_mla_sparse_fwd_output
 
                 o = flash_mla_sparse_fwd_output(

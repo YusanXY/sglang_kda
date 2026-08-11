@@ -103,11 +103,24 @@ def validate_dsv4_huge_kernel_startup(
                 f"capability={resolved_capability!r}"
             )
 
+    attention_dp4 = bool(server_args.enable_dp_attention)
+    valid_parallel_mode = (
+        attention_dp4 and server_args.dp_size == 4
+    ) or (
+        not attention_dp4 and server_args.dp_size == 1
+    )
+    if not valid_parallel_mode:
+        errors.append(
+            "Huge supports exactly TP-only (dp_size=1, DP attention disabled) "
+            "or attention-DP4 (dp_size=4, --enable-dp-attention); got "
+            f"dp_size={server_args.dp_size!r}, "
+            f"enable_dp_attention={server_args.enable_dp_attention!r}"
+        )
+
     expected_values = {
         "tp_size": DSV4_HUGE_TP_SIZE,
         "ep_size": DSV4_HUGE_EP_SIZE,
         "pp_size": 1,
-        "dp_size": 1,
         "attn_cp_size": 1,
         "dcp_size": 1,
         "nnodes": 1,
@@ -127,13 +140,15 @@ def validate_dsv4_huge_kernel_startup(
             f"{DSV4_HUGE_EAGER_PREFILL_TOKENS!r}, got "
             f"{server_args.max_prefill_tokens!r}"
         )
-    if server_args.chunked_prefill_size != server_args.max_prefill_tokens:
+    expected_chunked_prefill = server_args.max_prefill_tokens // (
+        4 if attention_dp4 else 1
+    )
+    if server_args.chunked_prefill_size != expected_chunked_prefill:
         errors.append(
-            "chunked_prefill_size must equal the strict aggregate "
-            "max_prefill_tokens bucket; Huge applies its separate 4096-token "
-            "per-request cap in the scheduler, got "
-            f"{server_args.chunked_prefill_size!r} vs "
-            f"{server_args.max_prefill_tokens!r}"
+            "chunked_prefill_size must equal the strict per-attention-DP-rank "
+            "bucket max_prefill_tokens / attention_dp_size; got "
+            f"{server_args.chunked_prefill_size!r} vs expected "
+            f"{expected_chunked_prefill!r}"
         )
 
     if not 1 <= server_args.max_running_requests <= DSV4_HUGE_MAX_REQUESTS:
@@ -171,7 +186,11 @@ def validate_dsv4_huge_kernel_startup(
         errors.append("cuda_graph_config must be resolved")
     else:
         prefill_graph = cuda_graph_config.prefill
-        if prefill_graph.backend not in (Backend.DISABLED, Backend.BREAKABLE):
+        if attention_dp4 and prefill_graph.backend != Backend.DISABLED:
+            errors.append(
+                "attention-DP4 Huge is Eager-only during the DP tuning phase"
+            )
+        elif prefill_graph.backend not in (Backend.DISABLED, Backend.BREAKABLE):
             errors.append(
                 "prefill CUDA graph backend must be disabled or breakable, "
                 f"got {prefill_graph.backend!r}"
@@ -211,9 +230,36 @@ def validate_dsv4_huge_kernel_startup(
 
 
 def validate_dsv4_huge_kernel_forward(
-    forward_batch: ForwardBatch, *, cuda_graph_config=None
+    forward_batch: ForwardBatch,
+    *,
+    cuda_graph_config=None,
+    attention_dp4: bool = False,
 ) -> None:
     """Validate the dynamic phase-1 batch shape without device synchronizes."""
+
+    if forward_batch.forward_mode is ForwardMode.IDLE:
+        if not attention_dp4:
+            raise ValueError(
+                "dsv4 huge_kernel accepts collective IDLE ranks only under "
+                "attention-DP4"
+            )
+        if forward_batch.global_forward_mode not in (None, ForwardMode.EXTEND):
+            raise ValueError(
+                "dsv4 huge_kernel attention-DP4 IDLE ranks require an unset "
+                "or EXTEND global mode; got "
+                f"{forward_batch.global_forward_mode!r}"
+            )
+        if forward_batch.batch_size != 0:
+            raise ValueError(
+                "dsv4 huge_kernel attention-DP4 IDLE rank must have an empty "
+                f"local batch; got batch_size={forward_batch.batch_size}"
+            )
+        if forward_batch.extend_num_tokens not in (None, 0):
+            raise ValueError(
+                "dsv4 huge_kernel attention-DP4 IDLE rank must have zero "
+                f"local EXTEND tokens; got {forward_batch.extend_num_tokens!r}"
+            )
+        return
 
     if forward_batch.forward_mode is not ForwardMode.EXTEND:
         raise ValueError(
@@ -396,6 +442,8 @@ class Dsv4HugeKernelModelRunner(ModelRunner):
                 "were bound"
             )
         validate_dsv4_huge_kernel_forward(
-            forward_batch, cuda_graph_config=self.server_args.cuda_graph_config
+            forward_batch,
+            cuda_graph_config=self.server_args.cuda_graph_config,
+            attention_dp4=bool(self.server_args.enable_dp_attention),
         )
         return super().forward(forward_batch, *args, **kwargs)

@@ -203,6 +203,13 @@ class DSV4WholeLayerRuntime:
         self._validate_static_config(config, server_args)
         self._config = config
         self._server_args = server_args
+        self._attention_dp4 = bool(server_args.enable_dp_attention)
+        self._attention_groups = 8 if self._attention_dp4 else 2
+        self._max_local_tokens = (
+            _MAX_FORWARD_TOKENS // 4
+            if self._attention_dp4
+            else _MAX_FORWARD_TOKENS
+        )
         # Both strict buckets are Q16-aligned and fit the clustered kernel's
         # fixed M<=131072 capacity. Keep this selected once per model so the
         # high-load path cannot silently fall back to the Q1 DeepGEMM producer.
@@ -229,6 +236,19 @@ class DSV4WholeLayerRuntime:
             )
             == "1"
         )
+        if self._attention_dp4 and any(
+            (
+                self._use_tp4_token_shard_attention,
+                self._use_tp4_symmetric_wob,
+                self._use_tp4_direct_push_wob,
+                self._use_tp4_local_wob,
+                self._use_tp4_local_wob_direct_gather,
+            )
+        ):
+            raise RuntimeError(
+                "attention-DP4 owns disjoint request/token shards; TP-only "
+                "peer-Q and WO_B routing environment flags must be disabled"
+            )
         if self._use_tp4_symmetric_wob and not self._use_tp4_token_shard_attention:
             raise RuntimeError(
                 "TP4 symmetric WO_B A2A requires TP4 token-sharded attention"
@@ -339,7 +359,8 @@ class DSV4WholeLayerRuntime:
 
         load_mhc_post_vec8_extension()
         load_mhc_pre_norm_mxfp8_quant_extension(160)
-        load_tp4_moe_mhc_post_extension()
+        if not self._attention_dp4:
+            load_tp4_moe_mhc_post_extension()
         if self._use_tp4_local_wob:
             load_tp4_nccl_ring_bf16_reduce_extension()
         from sglang.srt.layers import deep_gemm_wrapper
@@ -776,26 +797,38 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError("DSV4 huge runtime was not bound after weight loading")
         is_graph_capture = get_is_capture_mode()
         mode = forward_batch.forward_mode
-        if not mode.is_extend_without_speculative():
+        is_dp_idle = self._attention_dp4 and mode.is_idle()
+        if not mode.is_extend_without_speculative() and not is_dp_idle:
             raise RuntimeError(
-                "DSV4 huge runtime supports ordinary EXTEND only; "
+                "DSV4 huge runtime supports ordinary EXTEND plus internal "
+                "attention-DP4 collective IDLE ranks only; "
                 f"got forward_mode={mode}"
             )
         batch_size = int(forward_batch.req_pool_indices.shape[0])
         num_tokens = int(positions.shape[0])
-        if not 1 <= batch_size <= _MAX_FORWARD_REQUESTS:
+        if is_dp_idle and (batch_size != 0 or num_tokens != 0):
+            raise RuntimeError(
+                "DSV4 Huge attention-DP4 IDLE rank must own zero requests and "
+                f"tokens, got req={batch_size}, M={num_tokens}"
+            )
+        if not is_dp_idle and not 1 <= batch_size <= _MAX_FORWARD_REQUESTS:
             raise RuntimeError(
                 "DSV4 huge runtime requires 1..128 requests per EXTEND, "
                 f"got {batch_size}"
             )
-        if not 1 <= num_tokens <= _MAX_FORWARD_TOKENS:
+        if not is_dp_idle and not 1 <= num_tokens <= self._max_local_tokens:
             raise RuntimeError(
-                "DSV4 huge runtime requires aggregate M in 1..131072, "
+                "DSV4 huge runtime local attention shard exceeds its strict "
+                f"capacity 1..{self._max_local_tokens}, "
                 f"got {num_tokens}"
             )
         if self._use_tp4_token_shard_attention and is_graph_capture:
             raise RuntimeError(
                 "TP4 token-sharded attention is an eager-only experimental path"
+            )
+        if is_dp_idle and is_graph_capture:
+            raise RuntimeError(
+                "DSV4 Huge attention-DP4 collective IDLE is Eager-only"
             )
         if is_graph_capture and (batch_size, num_tokens) not in (
             (1, 4096),
@@ -807,6 +840,8 @@ class DSV4WholeLayerRuntime:
                 f"got req={batch_size}, M={num_tokens}"
             )
         extend_lens = forward_batch.extend_seq_lens_cpu
+        if is_dp_idle and extend_lens is None:
+            extend_lens = ()
         if extend_lens is None or len(extend_lens) != batch_size:
             raise RuntimeError(
                 "DSV4 huge runtime requires one host-mirrored EXTEND length "
@@ -829,10 +864,35 @@ class DSV4WholeLayerRuntime:
                 f"ids={input_ids.shape[0]}, positions={num_tokens}"
             )
         attn_backend = get_attn_backend()
+        backend_attention_dp4 = getattr(
+            attn_backend, "dsv4_huge_attention_dp4", None
+        )
+        if backend_attention_dp4 is None:
+            # Bind the output-head contract once. TP-only Huge intentionally
+            # uses its local16 output-only FlashMLA epilogue; attention-DP
+            # requires all 64 heads for the local request shard.
+            attn_backend.dsv4_huge_attention_dp4 = self._attention_dp4
+        elif bool(backend_attention_dp4) != self._attention_dp4:
+            raise RuntimeError(
+                "DSV4 attention backend changed its Huge attention-DP mode "
+                "after binding"
+            )
         metadata = attn_backend.forward_metadata
-        core = metadata.core_attn_metadata
-        indexer_metadata = metadata.indexer_metadata
-        if indexer_metadata is None:
+        if metadata is None:
+            if not is_dp_idle:
+                raise RuntimeError(
+                    "DSV4 huge runtime requires attention metadata for every "
+                    "active EXTEND"
+                )
+            # SGLang intentionally skips attention metadata construction on an
+            # attention-DP IDLE rank.  That rank still has to enter the FFN
+            # collectives below, but must not touch any attention state.
+            core = None
+            indexer_metadata = None
+        else:
+            core = metadata.core_attn_metadata
+            indexer_metadata = metadata.indexer_metadata
+        if indexer_metadata is None and not is_dp_idle:
             raise RuntimeError(
                 "DSV4 huge runtime requires C4 indexer metadata for every EXTEND"
             )
@@ -860,7 +920,7 @@ class DSV4WholeLayerRuntime:
         # all 21 C4 layers consume these exact objects without replanning. In
         # Breakable Graph mode the captured object keeps stable addresses and
         # DSV4Metadata refreshes its live schedule in place before every replay.
-        if self._use_clustered_mqa:
+        if self._use_clustered_mqa and not is_dp_idle:
             tp_rank = None
             tp_size = None
             if tp4_token_shard_attention:
@@ -876,7 +936,7 @@ class DSV4WholeLayerRuntime:
                 tp_rank=tp_rank,
                 tp_size=tp_size,
             )
-        else:
+        elif metadata is not None:
             metadata.clustered_mqa_metadata = None
         (
             attention_q_padded,
@@ -1124,8 +1184,20 @@ class DSV4WholeLayerRuntime:
             mhc_routed_output_fp8,
             mhc_routed_output_scale,
         ) = self._get_mhc_pre_workspace(num_tokens, positions.device)
+        moe_num_tokens = num_tokens
+        if self._attention_dp4:
+            moe_num_tokens = forward_batch.global_dp_buffer_len
+            if (
+                moe_num_tokens is None
+                or not num_tokens <= moe_num_tokens <= _MAX_FORWARD_TOKENS
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge attention-DP4 requires a host-known global DP "
+                    "MoE buffer length in [local_M, 131072], got "
+                    f"local_M={num_tokens}, global_M={moe_num_tokens!r}"
+                )
         shared_down_fp8, shared_down_scale = self._get_shared_down_workspace(
-            num_tokens,
+            moe_num_tokens,
             positions.device,
         )
         descriptor = DSV4ForwardDescriptor(
@@ -1233,6 +1305,8 @@ class DSV4WholeLayerRuntime:
         torch.Tensor,
         torch.Tensor,
     ]:
+        groups = self._attention_groups
+        max_tokens = self._max_local_tokens
         workspace = self._wo_a_workspace
         if workspace is not None:
             (
@@ -1247,31 +1321,31 @@ class DSV4WholeLayerRuntime:
                     attention_q_padded[:num_tokens],
                     output_q[:num_tokens],
                     output_s_storage[
-                        : 2 * 8 * ((num_tokens + 3) // 4 * 4)
-                    ].view(2, 8, (num_tokens + 3) // 4 * 4),
+                        : groups * 8 * ((num_tokens + 3) // 4 * 4)
+                    ].view(groups, 8, (num_tokens + 3) // 4 * 4),
                     wo_a_gemm_output[:num_tokens],
                 )
         # Decoder layers execute serially on one stream. Allocate the supported
         # aggregate-M capacity once; exact-T prefix views remain contiguous.
         attention_q_padded = torch.empty(
-            (_MAX_FORWARD_TOKENS, 64, 512),
+            (0, 64, 512) if self._attention_dp4 else (max_tokens, 64, 512),
             dtype=torch.bfloat16,
             device=device,
         )
         output_q = torch.empty(
-            (_MAX_FORWARD_TOKENS, 2, 4096),
+            (max_tokens, groups, 4096),
             dtype=torch.float8_e4m3fn,
             device=device,
         )
         # Keep this flat so each dynamic align(T, 4) gets the exact physical
         # [G, packed-K, aligned-M] stride required by DeepGEMM.
         output_s_storage = torch.empty(
-            (2 * 8 * _MAX_FORWARD_TOKENS,),
+            (groups * 8 * max_tokens,),
             dtype=torch.int32,
             device=device,
         )
         wo_a_gemm_output = torch.empty(
-            (_MAX_FORWARD_TOKENS, 2, 1024),
+            (max_tokens, groups, 1024),
             dtype=torch.bfloat16,
             device=device,
         )
@@ -1286,8 +1360,8 @@ class DSV4WholeLayerRuntime:
             attention_q_padded[:num_tokens],
             output_q[:num_tokens],
             output_s_storage[
-                : 2 * 8 * ((num_tokens + 3) // 4 * 4)
-            ].view(2, 8, (num_tokens + 3) // 4 * 4),
+                : groups * 8 * ((num_tokens + 3) // 4 * 4)
+            ].view(groups, 8, (num_tokens + 3) // 4 * 4),
             wo_a_gemm_output[:num_tokens],
         )
 
@@ -1430,12 +1504,12 @@ class DSV4WholeLayerRuntime:
             # invariants validated during runtime construction. Decoder layers
             # execute serially, so one set of addresses serves all 43 layers.
             q_lora_bf16 = torch.empty(
-                (_MAX_FORWARD_TOKENS, 1024),
+                (self._max_local_tokens, 1024),
                 dtype=torch.bfloat16,
                 device=device,
             )
             q_lora_fp8 = torch.empty(
-                (_MAX_FORWARD_TOKENS, 1024),
+                (self._max_local_tokens, 1024),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
@@ -1444,7 +1518,7 @@ class DSV4WholeLayerRuntime:
             # backing store yields an exact ceil(M/4)*4 TMA stride per batch
             # without allocating in the per-layer hot path.
             q_lora_scale_storage = torch.empty(
-                (_MAX_FORWARD_TOKENS * 2,),
+                (self._max_local_tokens * 2,),
                 dtype=torch.int32,
                 device=device,
             )
@@ -1494,12 +1568,12 @@ class DSV4WholeLayerRuntime:
             # backing arrays flat so every (splits,M,24) view has an exact M
             # stride rather than inheriting MAX_FORWARD_TOKENS as a pitch.
             gemm_mul_storage = torch.empty(
-                (_MAX_MHC_SPLITS * _MAX_FORWARD_TOKENS * 24,),
+                (_MAX_MHC_SPLITS * self._max_local_tokens * 24,),
                 dtype=torch.float32,
                 device=device,
             )
             gemm_sq_storage = torch.empty(
-                (_MAX_MHC_SPLITS * _MAX_FORWARD_TOKENS,),
+                (_MAX_MHC_SPLITS * self._max_local_tokens,),
                 dtype=torch.float32,
                 device=device,
             )
@@ -1508,16 +1582,16 @@ class DSV4WholeLayerRuntime:
             # layer reads ``out`` before overwriting ``mid``, so this is a
             # graph-stable ping-pong without allocator traffic in the hot path.
             residual_mid = torch.empty(
-                (_MAX_FORWARD_TOKENS, 4, 4096),
+                (self._max_local_tokens, 4, 4096),
                 dtype=torch.bfloat16,
                 device=device,
             )
             residual_out = torch.empty_like(residual_mid)
             post = torch.empty(
-                (_MAX_FORWARD_TOKENS, 4), dtype=torch.float32, device=device
+                (self._max_local_tokens, 4), dtype=torch.float32, device=device
             )
             comb = torch.empty(
-                (_MAX_FORWARD_TOKENS, 4, 4), dtype=torch.float32, device=device
+                (self._max_local_tokens, 4, 4), dtype=torch.float32, device=device
             )
             # This buffer becomes the input/output of the in-place MoE path,
             # so preserve the symmetric allocation property of native mhc_pre.
@@ -1531,25 +1605,25 @@ class DSV4WholeLayerRuntime:
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 layer_input = torch.empty(
-                    (_MAX_FORWARD_TOKENS, 4096),
+                    (self._max_local_tokens, 4096),
                     dtype=torch.bfloat16,
                     device=device,
                 )
             output_fp8 = torch.empty(
-                (_MAX_FORWARD_TOKENS, 4096),
+                (self._max_local_tokens, 4096),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
             output_scale_storage = torch.empty(
-                (8 * _MAX_FORWARD_TOKENS,), dtype=torch.int32, device=device
+                (8 * self._max_local_tokens,), dtype=torch.int32, device=device
             )
             routed_output_fp8 = torch.empty(
-                (_MAX_FORWARD_TOKENS, 4096),
+                (self._max_local_tokens, 4096),
                 dtype=torch.float8_e4m3fn,
                 device=device,
             )
             routed_output_scale = torch.empty(
-                (_MAX_FORWARD_TOKENS, 128),
+                (self._max_local_tokens, 128),
                 dtype=torch.uint8,
                 device=device,
             )
@@ -1718,18 +1792,31 @@ class DSV4WholeLayerRuntime:
                     f"DSV4 huge runtime requires --{name.replace('_', '-')}="
                     f"{expected!r}, got {actual!r}"
                 )
+        attention_dp4 = bool(view.enable_dp_attention)
+        if not (
+            (attention_dp4 and view.dp_size == 4)
+            or (not attention_dp4 and view.dp_size == 1)
+        ):
+            raise RuntimeError(
+                "DSV4 huge runtime supports exactly TP-only or attention-DP4; "
+                f"got dp_size={view.dp_size!r}, "
+                f"enable_dp_attention={view.enable_dp_attention!r}"
+            )
         if view.max_prefill_tokens not in (4096, 65536, 131072):
             raise RuntimeError(
                 "DSV4 huge runtime requires --max-prefill-tokens to select "
                 "4096, 65536, or 131072, got "
                 f"{view.max_prefill_tokens!r}"
             )
-        if view.chunked_prefill_size != view.max_prefill_tokens:
+        expected_chunked_prefill = view.max_prefill_tokens // (
+            4 if attention_dp4 else 1
+        )
+        if view.chunked_prefill_size != expected_chunked_prefill:
             raise RuntimeError(
-                "DSV4 huge runtime requires aggregate chunked-prefill-size "
-                "to equal max-prefill-tokens; the scheduler separately caps "
-                "each request at 4096, got "
-                f"{view.chunked_prefill_size!r} vs {view.max_prefill_tokens!r}"
+                "DSV4 huge runtime requires the per-attention-DP-rank "
+                "chunked-prefill-size max_prefill_tokens / attention_dp_size; "
+                f"got {view.chunked_prefill_size!r} vs "
+                f"{expected_chunked_prefill!r}"
             )
         prefill_backend, decode_backend = attention_backends_of(view)
         if (prefill_backend, decode_backend) != ("dsv4", "dsv4"):
@@ -1738,6 +1825,10 @@ class DSV4WholeLayerRuntime:
                 f"got prefill/decode={prefill_backend!r}/{decode_backend!r}"
             )
         prefill_graph = view.cuda_graph_config.prefill
+        if attention_dp4 and prefill_graph.backend != Backend.DISABLED:
+            raise RuntimeError(
+                "DSV4 Huge attention-DP4 is Eager-only during DP tuning"
+            )
         if prefill_graph.backend not in (Backend.DISABLED, Backend.BREAKABLE):
             raise RuntimeError(
                 "DSV4 huge runtime requires prefill CUDA graph disabled or "
@@ -1774,8 +1865,7 @@ class DSV4WholeLayerRuntime:
                 f"sm{capability[0]}{capability[1]}"
             )
 
-    @staticmethod
-    def _validate_layer(layer: Any, layer_id: int, ratio: int) -> None:
+    def _validate_layer(self, layer: Any, layer_id: int, ratio: int) -> None:
         attn = layer.self_attn
         if int(attn.layer_id) != layer_id:
             raise RuntimeError(
@@ -1796,10 +1886,16 @@ class DSV4WholeLayerRuntime:
                 )
         else:
             raise AssertionError("ratio dispatch validation is incomplete")
-        if attn.n_local_heads != 16 or attn.n_local_groups != 2:
+        expected_heads = 64 if self._attention_dp4 else 16
+        expected_groups = 8 if self._attention_dp4 else 2
+        if (
+            attn.n_local_heads != expected_heads
+            or attn.n_local_groups != expected_groups
+        ):
             raise RuntimeError(
-                f"layer {layer_id}: TP4 specialization requires 16 local heads "
-                f"and 2 local output groups, got {attn.n_local_heads}/"
+                f"layer {layer_id}: Huge parallel mode requires "
+                f"{expected_heads} local heads and {expected_groups} local "
+                f"output groups, got {attn.n_local_heads}/"
                 f"{attn.n_local_groups}"
             )
         if not hasattr(attn.wo_a, "weight_scale_inv"):
@@ -1859,8 +1955,22 @@ def _execute_common(
     whole-layer native call.
     """
 
-    del runtime
     layer = handle.layer
+    if runtime._attention_dp4 and descriptor.num_tokens == 0:
+        # An attention-DP rank with no local requests must still execute every
+        # TP-sharded MoE collective. No local attention/residual math exists;
+        # the gathered active-rank tokens are processed and the empty local
+        # scatter result is discarded. This is an internal DP participant, not
+        # a decode path and not a native-layer fallback.
+        moe_input = hidden_states.new_empty((0, 4096))
+        layer._run_moe_ffn_dp_sync(
+            moe_input,
+            descriptor.forward_batch,
+            input_ids=descriptor.input_ids,
+            input_ids_global=descriptor.input_ids_global,
+        )
+        return hidden_states, None, None, None
+
     if layer.use_fused_mhc_post_pre:
         raise RuntimeError(
             "DSV4 huge runtime does not support cross-layer mHC fusion in v1"
@@ -1925,6 +2035,27 @@ def _execute_common(
     # branches stay inside the Huge whole-layer executor and unsupported
     # aggregate shapes still fail below.
     num_tokens = hidden_states.shape[0]
+    if runtime._attention_dp4:
+        # Attention-DP owns disjoint local token sets. Reuse SGLang's existing
+        # device-side gather + TP-sharded MoE + scatter semantics, then finish
+        # the local residual in the Huge CUDA epilogue. The local FP8 tensors
+        # produced above cannot be reused after the gather until that boundary
+        # is fused in a later DP-specific optimization.
+        hidden_states = layer._run_moe_ffn_dp_sync(
+            hidden_states,
+            descriptor.forward_batch,
+            input_ids=descriptor.input_ids,
+            input_ids_global=descriptor.input_ids_global,
+        )
+        hidden_states = _huge_mhc_post(
+            hidden_states=hidden_states,
+            residual=residual,
+            post=post,
+            comb=comb,
+            output=descriptor.mhc_residual_out,
+        )
+        return hidden_states, None, None, None
+
     if num_tokens not in (65536, 131072):
         if num_tokens > 4096:
             raise RuntimeError(

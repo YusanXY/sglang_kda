@@ -38,6 +38,7 @@ def _server_args(**overrides):
         ep_size=4,
         pp_size=1,
         dp_size=1,
+        enable_dp_attention=False,
         attn_cp_size=1,
         dcp_size=1,
         nnodes=1,
@@ -95,6 +96,81 @@ def test_startup_contract_accepts_req128_high_load_capacity():
         device_name="NVIDIA B200",
         device_capability=(10, 0),
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "max_running_requests",
+        "max_total_tokens",
+        "max_prefill_tokens",
+        "chunked_prefill_size",
+    ),
+    [
+        (16, 331776, 65536, 16384),
+        (128, DSV4_HUGE_MAX_TOTAL_TOKENS, 131072, 32768),
+    ],
+)
+def test_startup_contract_accepts_attention_dp4_high_load(
+    max_running_requests,
+    max_total_tokens,
+    max_prefill_tokens,
+    chunked_prefill_size,
+):
+    validate_dsv4_huge_kernel_startup(
+        server_args=_server_args(
+            dp_size=4,
+            enable_dp_attention=True,
+            max_running_requests=max_running_requests,
+            max_total_tokens=max_total_tokens,
+            max_prefill_tokens=max_prefill_tokens,
+            chunked_prefill_size=chunked_prefill_size,
+        ),
+        model_config=_flash_model_config(),
+        gpu_id=0,
+        device_name="NVIDIA B300 SXM6 AC",
+        device_capability=(10, 3),
+    )
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "enable_dp_attention"),
+    [(1, True), (4, False), (2, True)],
+)
+def test_startup_contract_rejects_mismatched_attention_dp_mode(
+    dp_size, enable_dp_attention
+):
+    with pytest.raises(ValueError, match="exactly TP-only.*attention-DP4"):
+        validate_dsv4_huge_kernel_startup(
+            server_args=_server_args(
+                dp_size=dp_size,
+                enable_dp_attention=enable_dp_attention,
+            ),
+            model_config=_flash_model_config(),
+            gpu_id=0,
+            device_name="NVIDIA B300 SXM6 AC",
+            device_capability=(10, 3),
+        )
+
+
+def test_startup_contract_rejects_attention_dp4_prefill_graph():
+    args = _server_args(
+        dp_size=4,
+        enable_dp_attention=True,
+        max_running_requests=16,
+        max_total_tokens=331776,
+        max_prefill_tokens=65536,
+        chunked_prefill_size=16384,
+    )
+    args.cuda_graph_config.prefill.backend = "breakable"
+    args.cuda_graph_config.prefill.bs = [4096, 65536]
+    with pytest.raises(ValueError, match="attention-DP4 Huge is Eager-only"):
+        validate_dsv4_huge_kernel_startup(
+            server_args=args,
+            model_config=_flash_model_config(),
+            gpu_id=0,
+            device_name="NVIDIA B300 SXM6 AC",
+            device_capability=(10, 3),
+        )
 
 
 @pytest.mark.parametrize(
@@ -240,6 +316,30 @@ def test_dynamic_contract_accepts_true_req16_m65536():
             extend_seq_lens_cpu=[4096] * 16,
         )
     )
+
+
+def test_dynamic_contract_accepts_attention_dp4_collective_idle_rank():
+    validate_dsv4_huge_kernel_forward(
+        SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            global_forward_mode=None,
+            batch_size=0,
+            extend_num_tokens=0,
+        ),
+        attention_dp4=True,
+    )
+
+
+def test_dynamic_contract_rejects_collective_idle_without_attention_dp4():
+    with pytest.raises(ValueError, match="only under attention-DP4"):
+        validate_dsv4_huge_kernel_forward(
+            SimpleNamespace(
+                forward_mode=ForwardMode.IDLE,
+                global_forward_mode=ForwardMode.EXTEND,
+                batch_size=0,
+                extend_num_tokens=0,
+            )
+        )
 
 
 @pytest.mark.parametrize(

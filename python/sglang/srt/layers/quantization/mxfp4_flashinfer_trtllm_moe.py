@@ -80,7 +80,15 @@ def _install_dsv4_huge_moe_overlap() -> None:
     global _DSV4_MOE_OVERLAP_INSTALLED
 
     _install_writable_flashinfer_cubin_overlay()
-    if get_server_args().dsv4_worker_backend != "huge_kernel":
+    server_args = get_server_args()
+    if server_args.dsv4_worker_backend != "huge_kernel":
+        return
+    if server_args.enable_dp_attention:
+        # This module fuses the TP-only Huge owner/output protocol into the
+        # TRTLLM MoE epilogue. Attention-DP uses gather -> TP-sharded MoE ->
+        # scatter and never requests that external symmetric output contract;
+        # installing the TP module here is both semantically unnecessary and
+        # creates a second multi-minute SM103 JIT artifact.
         return
     if _DSV4_MOE_OVERLAP_INSTALLED:
         return
