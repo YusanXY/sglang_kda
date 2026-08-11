@@ -2051,11 +2051,12 @@ def _execute_common(
         # the local residual in the Huge CUDA epilogue. The local FP8 tensors
         # produced above cannot be reused after the gather until that boundary
         # is fused in a later DP-specific optimization.
-        hidden_states = layer._run_moe_ffn_dp_sync(
+        hidden_states, shared_hidden = layer._run_moe_ffn_dp_sync(
             hidden_states,
             descriptor.forward_batch,
             input_ids=descriptor.input_ids,
             input_ids_global=descriptor.input_ids_global,
+            defer_shared_expert_add=True,
         )
         hidden_states = _huge_mhc_post(
             hidden_states=hidden_states,
@@ -2063,6 +2064,7 @@ def _execute_common(
             post=post,
             comb=comb,
             output=descriptor.mhc_residual_out,
+            shared_hidden=shared_hidden,
         )
         return hidden_states, None, None, None
 
@@ -2282,14 +2284,23 @@ def _huge_mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
     output: torch.Tensor,
+    shared_hidden: Optional[torch.Tensor] = None,
     ready_flags: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ready_epoch: int = 0,
 ) -> torch.Tensor:
     """Run the strict CUDA post primitive into graph-stable GPU storage."""
 
-    from sglang.jit_kernel.dsv4.e2e import mhc_post_vec8, mhc_post_vec8_ready
+    from sglang.jit_kernel.dsv4.e2e import (
+        mhc_post_vec8,
+        mhc_post_vec8_ready,
+        mhc_post_vec8_shared,
+    )
 
     if ready_flags is not None:
+        if shared_hidden is not None:
+            raise RuntimeError(
+                "shared-expert mHC fusion is incompatible with ready flags"
+            )
         return mhc_post_vec8_ready(
             hidden_states,
             residual,
@@ -2300,6 +2311,10 @@ def _huge_mhc_post(
             ready_epoch,
         )
 
+    if shared_hidden is not None:
+        return mhc_post_vec8_shared(
+            hidden_states, shared_hidden, residual, post, comb, output
+        )
     return mhc_post_vec8(hidden_states, residual, post, comb, output)
 
 

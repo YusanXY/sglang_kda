@@ -29,11 +29,12 @@ _QUANT_GROUP_SIZE = 128
 def _jit_mhc_post_vec8_module(use_pdl: bool) -> Module:
     args = make_cpp_args(use_pdl)
     return load_jit(
-        make_name("mhc_post_vec8_hc4_h4096_v68_owner_ready"),
+        make_name("mhc_post_vec8_hc4_h4096_v69_shared_post"),
         *args,
         cuda_files=["deepseek_v4/mhc_post_vec8.cuh"],
         cuda_wrappers=[
             ("run", f"MhcPostVec8Kernel<{args}>::run"),
+            ("run_shared", f"MhcPostVec8Kernel<{args}>::run_shared"),
             ("run_ready", f"MhcPostVec8Kernel<{args}>::run_ready"),
         ],
         extra_cuda_cflags=["--use_fast_math"],
@@ -59,6 +60,24 @@ def _mhc_post_vec8_custom_op(
 ) -> None:
     module = _jit_mhc_post_vec8_module(False)
     module.run(hidden_in, residual, post_mix, comb_mix, output)
+
+
+@register_custom_op(
+    op_name="dsv4_mhc_post_vec8_shared",
+    mutates_args=["output"],
+)
+def _mhc_post_vec8_shared_custom_op(
+    hidden_in: torch.Tensor,
+    shared_in: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    module = _jit_mhc_post_vec8_module(False)
+    module.run_shared(
+        hidden_in, shared_in, residual, post_mix, comb_mix, output
+    )
 
 
 @register_custom_op(
@@ -126,6 +145,47 @@ def mhc_post_vec8(
                 "all DSV4 mHC post tensors must share one CUDA device"
             )
     _mhc_post_vec8_custom_op(hidden_in, residual, post_mix, comb_mix, output)
+    return output
+
+
+@debug_kernel_api
+def mhc_post_vec8_shared(
+    hidden_in: torch.Tensor,
+    shared_in: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Add the local shared expert and apply mHC post in one CUDA launch."""
+
+    m = hidden_in.shape[0]
+    expected = (
+        (hidden_in, (m, 4096), torch.bfloat16),
+        (shared_in, (m, 4096), torch.bfloat16),
+        (residual, (m, 4, 4096), torch.bfloat16),
+        (post_mix, (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (output, (m, 4, 4096), torch.bfloat16),
+    )
+    device = hidden_in.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                f"invalid DSV4 shared mHC post tensor: expected contiguous "
+                f"{shape} {dtype}, got {tuple(tensor.shape)} {tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError(
+                "all DSV4 shared mHC post tensors must share one CUDA device"
+            )
+    _mhc_post_vec8_shared_custom_op(
+        hidden_in, shared_in, residual, post_mix, comb_mix, output
+    )
     return output
 
 
@@ -1767,6 +1827,7 @@ __all__ = [
     "load_tp4_nccl_ring_bf16_reduce_extension",
     "load_tp4_moe_mhc_post_extension",
     "mhc_post_vec8",
+    "mhc_post_vec8_shared",
     "mhc_post_vec8_ready",
     "mhc_pre_norm_mxfp8_quant",
     "tp4_pack_attention_output_ue8m0",

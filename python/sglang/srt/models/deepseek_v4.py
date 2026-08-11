@@ -2184,7 +2184,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         shared_x_quant=None,
         routed_x_quant=None,
         huge_fused_moe_post: bool = False,
-    ) -> torch.Tensor:
+        defer_shared_expert_add: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
@@ -2197,6 +2198,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
+        if defer_shared_expert_add and (
+            get_server_args().dsv4_worker_backend != "huge_kernel"
+            or not _use_tp_moe_gather
+            or _use_tp_attn_a2a_scatter
+        ):
+            raise RuntimeError(
+                "deferred shared-expert add requires Huge attention-DP "
+                "gather/scatter"
+            )
         if huge_fused_moe_post and (
             get_server_args().dsv4_worker_backend != "huge_kernel"
             or _use_cp
@@ -2342,12 +2352,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             # above). Covers both prefill (gatherv) and decode (dp_scatter).
             if _shared_local is not None:
                 n = hidden_states.shape[0]
-                hidden_states = hidden_states + _shared_local[:n]
+                if not defer_shared_expert_add:
+                    hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
+        if defer_shared_expert_add:
+            # The leading dense FFN layers have no shared expert. They still
+            # use the Huge mHC CUDA path, just without the optional fused add.
+            shared_local = (
+                None
+                if _shared_local is None
+                else _shared_local[: hidden_states.shape[0]]
+            )
+            return hidden_states, shared_local
         return hidden_states
 
     # ------------------------------------------------------------------

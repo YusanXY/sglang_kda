@@ -24,6 +24,7 @@ constexpr uint32_t kMhcPostMaxReadyGroups = 131072 / 2;
 
 struct MhcPostVec8Params {
   const __nv_bfloat16* __restrict__ hidden_in;
+  const __nv_bfloat16* __restrict__ shared_in;
   const __nv_bfloat16* __restrict__ residual;
   const float* __restrict__ post_mix;
   const float* __restrict__ comb_mix;
@@ -70,7 +71,7 @@ SGL_DEVICE float2 mhc_post_fma2(
   return accumulator;
 }
 
-template <bool kUsePDL>
+template <bool kUsePDL, bool kAddShared = false>
 __global__ void mhc_post_vec8_kernel(
     const MhcPostVec8Params __grid_constant__ params) {
   device::PDLWaitPrimary<kUsePDL>();
@@ -119,12 +120,33 @@ __global__ void mhc_post_vec8_kernel(
   for (uint32_t chunk = tid; chunk < kChunksPerToken;
        chunk += kMhcPostThreads) {
     const uint4 hidden_raw = hidden_chunks[chunk];
-    const float2 hidden_values[kMhcPostVec / 2] = {
+    float2 hidden_values[kMhcPostVec / 2] = {
         __bfloat1622float2(mhc_post_uint_to_bf16x2(hidden_raw.x)),
         __bfloat1622float2(mhc_post_uint_to_bf16x2(hidden_raw.y)),
         __bfloat1622float2(mhc_post_uint_to_bf16x2(hidden_raw.z)),
         __bfloat1622float2(mhc_post_uint_to_bf16x2(hidden_raw.w)),
     };
+    if constexpr (kAddShared) {
+      const auto* shared_chunks = reinterpret_cast<const uint4*>(
+          params.shared_in +
+          static_cast<uint64_t>(token) * kMhcPostHidden);
+      const uint4 shared_raw = shared_chunks[chunk];
+      const float2 shared_values[kMhcPostVec / 2] = {
+          __bfloat1622float2(mhc_post_uint_to_bf16x2(shared_raw.x)),
+          __bfloat1622float2(mhc_post_uint_to_bf16x2(shared_raw.y)),
+          __bfloat1622float2(mhc_post_uint_to_bf16x2(shared_raw.z)),
+          __bfloat1622float2(mhc_post_uint_to_bf16x2(shared_raw.w)),
+      };
+#pragma unroll
+      for (uint32_t pair = 0; pair < kMhcPostVec / 2; ++pair) {
+        // Match the former BF16 torch.add boundary exactly: round the shared
+        // expert sum to BF16 before applying the FP32 mHC coefficients.
+        const __nv_bfloat162 rounded_sum = __float22bfloat162_rn(make_float2(
+            hidden_values[pair].x + shared_values[pair].x,
+            hidden_values[pair].y + shared_values[pair].y));
+        hidden_values[pair] = __bfloat1622float2(rounded_sum);
+      }
+    }
 
     float2 residual_values[kMhcPostHC][kMhcPostVec / 2];
 #pragma unroll
@@ -217,6 +239,7 @@ struct MhcPostVec8Kernel {
     if (M.unwrap() == 0) return;
     const auto params = MhcPostVec8Params{
         .hidden_in = reinterpret_cast<const __nv_bfloat16*>(hidden_in.data_ptr()),
+        .shared_in = nullptr,
         .residual = reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
         .post_mix = static_cast<const float*>(post_mix.data_ptr()),
         .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
@@ -229,7 +252,69 @@ struct MhcPostVec8Kernel {
         .num_tokens = static_cast<uint32_t>(M.unwrap()),
     };
     LaunchKernel(M.unwrap(), kMhcPostThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(mhc_post_vec8_kernel<kUsePDL>, params);
+        .enable_pdl(kUsePDL)(mhc_post_vec8_kernel<kUsePDL, false>, params);
+  }
+
+  static void run_shared(
+      const tvm::ffi::TensorView hidden_in,
+      const tvm::ffi::TensorView shared_in,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView post_mix,
+      const tvm::ffi::TensorView comb_mix,
+      const tvm::ffi::TensorView output) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto M = SymbolicSize{"num_tokens"};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, kMhcPostHidden})
+        .with_strides({kMhcPostHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(hidden_in);
+    TensorMatcher({M, kMhcPostHidden})
+        .with_strides({kMhcPostHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(shared_in);
+    TensorMatcher({M, kMhcPostHC, kMhcPostHidden})
+        .with_strides({kMhcPostHC * kMhcPostHidden, kMhcPostHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(residual);
+    TensorMatcher({M, kMhcPostHC})
+        .with_strides({kMhcPostHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(post_mix);
+    TensorMatcher({M, kMhcPostHC, kMhcPostHC})
+        .with_strides({kMhcPostHC * kMhcPostHC, kMhcPostHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(comb_mix);
+    TensorMatcher({M, kMhcPostHC, kMhcPostHidden})
+        .with_strides({kMhcPostHC * kMhcPostHidden, kMhcPostHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+
+    if (M.unwrap() == 0) return;
+    const auto params = MhcPostVec8Params{
+        .hidden_in = reinterpret_cast<const __nv_bfloat16*>(hidden_in.data_ptr()),
+        .shared_in = reinterpret_cast<const __nv_bfloat16*>(shared_in.data_ptr()),
+        .residual = reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        .post_mix = static_cast<const float*>(post_mix.data_ptr()),
+        .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
+        .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .ready0 = nullptr,
+        .ready1 = nullptr,
+        .ready2 = nullptr,
+        .ready3 = nullptr,
+        .ready_epoch = 0,
+        .num_tokens = static_cast<uint32_t>(M.unwrap()),
+    };
+    LaunchKernel(M.unwrap(), kMhcPostThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(mhc_post_vec8_kernel<kUsePDL, true>, params);
   }
 
   static void run_ready(
@@ -286,6 +371,7 @@ struct MhcPostVec8Kernel {
 
     const auto params = MhcPostVec8Params{
         .hidden_in = reinterpret_cast<const __nv_bfloat16*>(hidden_in.data_ptr()),
+        .shared_in = nullptr,
         .residual = reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
         .post_mix = static_cast<const float*>(post_mix.data_ptr()),
         .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
@@ -298,7 +384,7 @@ struct MhcPostVec8Kernel {
         .num_tokens = static_cast<uint32_t>(M.unwrap()),
     };
     LaunchKernel(M.unwrap(), kMhcPostThreads, device.unwrap())
-        .enable_pdl(kUsePDL)(mhc_post_vec8_kernel<kUsePDL>, params);
+        .enable_pdl(kUsePDL)(mhc_post_vec8_kernel<kUsePDL, false>, params);
   }
 };
 
