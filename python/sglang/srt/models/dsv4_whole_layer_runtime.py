@@ -26,6 +26,8 @@ CompressRatio = Literal[0, 4, 128]
 _MAX_FORWARD_TOKENS = 131072
 _MAX_FORWARD_REQUESTS = 128
 _MAX_MHC_SPLITS = 64
+_TP4_MOE_SLOT_BYTES = _MAX_FORWARD_TOKENS * 4096 * 2
+_SIGNED_INT64_MAX = (1 << 63) - 1
 
 # This is model identity, not a generic V4 default.  Fail rather than silently
 # running a different architecture through a shape-specialized executor.
@@ -114,6 +116,28 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     moe_partial_peer1: Optional[torch.Tensor]
     moe_partial_peer2: Optional[torch.Tensor]
     moe_partial_peer3: Optional[torch.Tensor]
+    moe_partial_slot1_local: Optional[torch.Tensor]
+    moe_partial_slot1_peer0: Optional[torch.Tensor]
+    moe_partial_slot1_peer1: Optional[torch.Tensor]
+    moe_partial_slot1_peer2: Optional[torch.Tensor]
+    moe_partial_slot1_peer3: Optional[torch.Tensor]
+    dp_symmetric_moe_post_selected: bool
+    dp_moe_epoch_selected: bool
+    dp_moe_epoch_split_selected: bool
+    dp_moe_epoch_counter_selected: bool
+    dp_moe_nvls_selected: bool
+    dp_moe_global_num_tokens: int
+    dp_moe_attention_rank: int
+    dp_moe_local_row_offset: int
+    dp_moe_epoch_base: int
+    dp_moe_expected_done_epoch: int
+    moe_epoch_flag0: Optional[torch.Tensor]
+    moe_epoch_flag1: Optional[torch.Tensor]
+    moe_epoch_flag2: Optional[torch.Tensor]
+    moe_epoch_flag3: Optional[torch.Tensor]
+    moe_epoch_completion_state: Optional[torch.Tensor]
+    moe_multicast_local_slot0_ptr: int
+    moe_multicast_local_slot1_ptr: int
     moe_owner_flag0: Optional[torch.Tensor]
     moe_owner_flag1: Optional[torch.Tensor]
     moe_owner_flag2: Optional[torch.Tensor]
@@ -196,6 +220,7 @@ class DSV4LayerHandle(msgspec.Struct, frozen=True, kw_only=True):
     generation: int
     layer_id: int
     compress_ratio: CompressRatio
+    dp_moe_sequence_index: int
     layer: Any
     execute: LayerExecutor
 
@@ -217,6 +242,56 @@ class DSV4WholeLayerRuntime:
             )
 
             enable_dp_gatherv_for_dsv4_huge()
+        # Stage-3B bring-up is deliberately a construction-time policy.  Every
+        # rank reads the environment once and the hot path consumes only the
+        # immutable bool plus the rank-shared size vector in its descriptor.
+        # The strict Huge Attention-DP configuration is Eager-only by contract;
+        # reject TP-only use here instead of silently ignoring the request.
+        self._use_dp_symmetric_moe_post = (
+            os.environ.get("SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST", "0") == "1"
+        )
+        if self._use_dp_symmetric_moe_post and not self._attention_dp4:
+            raise RuntimeError(
+                "SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST=1 requires strict Huge "
+                "attention-DP4 Eager mode"
+            )
+        self._use_dp_moe_epoch = (
+            os.environ.get("SGLANG_DSV4_HUGE_DP_MOE_EPOCH", "0") == "1"
+        )
+        if self._use_dp_moe_epoch and not self._use_dp_symmetric_moe_post:
+            raise RuntimeError(
+                "SGLANG_DSV4_HUGE_DP_MOE_EPOCH=1 requires "
+                "SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST=1"
+            )
+        self._use_dp_moe_epoch_split = (
+            os.environ.get("SGLANG_DSV4_HUGE_DP_MOE_EPOCH_SPLIT", "0") == "1"
+        )
+        if self._use_dp_moe_epoch_split and not self._use_dp_moe_epoch:
+            raise RuntimeError(
+                "SGLANG_DSV4_HUGE_DP_MOE_EPOCH_SPLIT=1 requires "
+                "SGLANG_DSV4_HUGE_DP_MOE_EPOCH=1"
+            )
+        self._use_dp_moe_epoch_counter = (
+            os.environ.get("SGLANG_DSV4_HUGE_DP_MOE_EPOCH_COUNTER", "0") == "1"
+        )
+        if self._use_dp_moe_epoch_counter and not self._use_dp_moe_epoch:
+            raise RuntimeError(
+                "SGLANG_DSV4_HUGE_DP_MOE_EPOCH_COUNTER=1 requires "
+                "SGLANG_DSV4_HUGE_DP_MOE_EPOCH=1"
+            )
+        if self._use_dp_moe_epoch_counter and self._use_dp_moe_epoch_split:
+            raise RuntimeError(
+                "DSV4 Huge MoE epoch split and counter variants are mutually "
+                "exclusive"
+            )
+        self._use_dp_moe_nvls = (
+            os.environ.get("SGLANG_DSV4_HUGE_DP_MOE_NVLS", "0") == "1"
+        )
+        if self._use_dp_moe_nvls and not self._use_dp_moe_epoch_counter:
+            raise RuntimeError(
+                "SGLANG_DSV4_HUGE_DP_MOE_NVLS=1 requires the symmetric "
+                "MoE epoch-counter path"
+            )
         self._attention_groups = 8 if self._attention_dp4 else 2
         self._max_local_tokens = (
             _MAX_FORWARD_TOKENS // 4
@@ -319,9 +394,19 @@ class DSV4WholeLayerRuntime:
         self._tp4_symmetric_workspace: Optional[tuple] = None
         self._tp4_symmetric_q_workspace: Optional[tuple] = None
         self._tp4_symmetric_moe_workspace: Optional[tuple] = None
+        self._tp4_symmetric_moe_epoch_workspace: Optional[tuple] = None
+        self._tp4_moe_epoch_flags_workspace: Optional[tuple] = None
         self._tp4_owner_flags_workspace: Optional[tuple] = None
         self._tp4_local_wob_output_workspace: Optional[tuple] = None
         self._attention_output_forward_epoch = 0
+        # Host state only assigns monotonically increasing protocol epochs at
+        # descriptor construction.  All readiness, peer waiting and slot
+        # lifetime enforcement remain device-side.  An aborted selected
+        # forward poisons the sequence rather than risking reuse of a partial
+        # whose peer done epoch can no longer be proven.
+        self._dp_moe_epoch_layer_count = 0
+        self._dp_moe_last_planned_epoch = 0
+        self._dp_moe_epoch_poisoned = False
         # Stage-1 Attention-DP localization: every layer writes its compact
         # global packed route into this fixed address.  The payload is only
         # 6 int32 values per token (3 MiB at M=131072), so it can be gathered
@@ -391,7 +476,7 @@ class DSV4WholeLayerRuntime:
 
         load_mhc_post_vec8_extension()
         load_mhc_pre_norm_mxfp8_quant_extension(160)
-        if not self._attention_dp4:
+        if not self._attention_dp4 or self._use_dp_symmetric_moe_post:
             load_tp4_moe_mhc_post_extension()
         if self._use_tp4_local_wob:
             load_tp4_nccl_ring_bf16_reduce_extension()
@@ -444,7 +529,16 @@ class DSV4WholeLayerRuntime:
             )
         if self._use_tp4_token_shard_attention:
             self._bind_tp4_symmetric_q_workspace(workspace_device)
+        if self._use_tp4_token_shard_attention or (
+            self._use_dp_symmetric_moe_post
+            and not self._use_dp_moe_epoch_counter
+        ):
             self._bind_tp4_symmetric_moe_workspace(workspace_device)
+        if self._use_dp_moe_epoch_counter:
+            self._bind_tp4_symmetric_moe_epoch_workspace(workspace_device)
+        if self._use_dp_moe_epoch:
+            self._bind_tp4_moe_epoch_flags_workspace(workspace_device)
+        if self._use_tp4_token_shard_attention:
             self._bind_tp4_owner_flags_workspace(workspace_device)
         if self._use_tp4_symmetric_wob:
             self._bind_tp4_symmetric_workspace(workspace_device)
@@ -465,6 +559,7 @@ class DSV4WholeLayerRuntime:
         self._generation += 1
         generation = self._generation
         handles: list[DSV4LayerHandle] = []
+        dp_moe_sequence_index = 0
         for layer_id in range(start_layer, end_layer):
             layer = layers[layer_id]
             ratio = int(layer.self_attn.compress_ratio)
@@ -476,14 +571,28 @@ class DSV4WholeLayerRuntime:
                     f"compress_ratio={ratio}"
                 ) from exc
             self._validate_layer(layer, layer_id, ratio)
+            has_shared_experts = (
+                getattr(layer.mlp, "shared_experts", None) is not None
+            )
             handles.append(
                 DSV4LayerHandle(
                     generation=generation,
                     layer_id=layer_id,
                     compress_ratio=ratio,  # type: ignore[arg-type]
+                    dp_moe_sequence_index=(
+                        dp_moe_sequence_index if has_shared_experts else -1
+                    ),
                     layer=layer,
                     execute=executor,
                 )
+            )
+            if has_shared_experts:
+                dp_moe_sequence_index += 1
+        self._dp_moe_epoch_layer_count = dp_moe_sequence_index
+        if self._use_dp_moe_epoch and self._dp_moe_epoch_layer_count == 0:
+            raise RuntimeError(
+                "DSV4 Huge GPU MoE epoch protocol requires at least one "
+                "shared-expert MoE layer"
             )
         self._handles = tuple(handles)
         for handle in self._handles:
@@ -717,16 +826,16 @@ class DSV4WholeLayerRuntime:
         )
 
     def _bind_tp4_symmetric_moe_workspace(self, device: torch.device) -> None:
-        """Bind a peer-visible MoE partial buffer disjoint from peer-Q.
+        """Bind one max-capacity peer-visible MoE partial per TP rank.
 
         The old path aliased FlashInfer's [M, 4096] partial with the first
         half of the [M, 16, 512] peer-Q receive tensor.  That forced every
         decoder layer to end with a cross-rank barrier before the next Q
         producer could overwrite the allocation.  A dedicated max-capacity
-        buffer removes that alias.  The existing peer-Q barrier in the next
-        layer then orders reuse of this MoE buffer after all ranks have
-        completed the previous owner-post read, without another hot-path
-        launch.
+        buffer removes that alias and is also the Attention-DP Stage-3B direct
+        MoE destination.  TP token sharding orders reuse through the next
+        peer-Q barrier; the conservative Attention-DP bring-up uses an explicit
+        consumer barrier until its GPU epoch protocol is enabled.
         """
         from torch.distributed import _symmetric_memory as symm_mem
 
@@ -755,6 +864,118 @@ class DSV4WholeLayerRuntime:
             device,
             handle,
             local_partial,
+            peers,
+            tp_group.rank_in_group,
+        )
+
+    def _bind_tp4_symmetric_moe_epoch_workspace(
+        self, device: torch.device
+    ) -> None:
+        """Bind two real peer-visible partial slots plus a local CTA counter."""
+        from torch.distributed import _symmetric_memory as symm_mem
+
+        from sglang.srt.distributed import get_tp_group
+
+        cached = self._tp4_symmetric_moe_epoch_workspace
+        if cached is not None and cached[0] == device:
+            return
+        if self._dp_moe_last_planned_epoch != 0:
+            self._dp_moe_epoch_poisoned = True
+            raise RuntimeError(
+                "cannot replace TP4 double-buffered MoE workspace after "
+                "publishing epochs"
+            )
+        tp_group = get_tp_group()
+        if tp_group.world_size != 4:
+            raise RuntimeError(
+                "TP4 double-buffered MoE epoch workspace requires TP=4, got "
+                f"{tp_group.world_size}"
+            )
+        local_partials = symm_mem.empty(
+            (2, _MAX_FORWARD_TOKENS, 4096),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        handle = symm_mem.rendezvous(local_partials, tp_group.device_group)
+        peers = tuple(
+            handle.get_buffer(rank, local_partials.shape, local_partials.dtype)
+            for rank in range(4)
+        )
+        slot_stride_bytes = (
+            local_partials.stride(0) * local_partials.element_size()
+        )
+        if self._use_dp_moe_nvls and slot_stride_bytes != _TP4_MOE_SLOT_BYTES:
+            raise RuntimeError(
+                "DSV4 Huge NVLS MoE slot stride mismatch: expected fixed "
+                f"{_TP4_MOE_SLOT_BYTES} bytes, got {slot_stride_bytes}"
+            )
+        multicast_base = int(getattr(handle, "multicast_ptr", 0) or 0)
+        if self._use_dp_moe_nvls and not (
+            0 < multicast_base <= _SIGNED_INT64_MAX
+            and multicast_base % 16 == 0
+            and multicast_base + 2 * _TP4_MOE_SLOT_BYTES - 1
+            <= _SIGNED_INT64_MAX
+        ):
+            raise RuntimeError(
+                "SGLANG_DSV4_HUGE_DP_MOE_NVLS=1 requires the real TP4 "
+                "2-GiB symmetric MoE allocation to expose a positive, "
+                "16-byte-aligned signed-int64 multicast VA; got "
+                f"{multicast_base!r}"
+            )
+        completion_state = torch.zeros((2,), dtype=torch.int64, device=device)
+        self._tp4_symmetric_moe_epoch_workspace = (
+            device,
+            handle,
+            local_partials,
+            peers,
+            tp_group.rank_in_group,
+            completion_state,
+            multicast_base,
+        )
+
+    def _bind_tp4_moe_epoch_flags_workspace(
+        self, device: torch.device
+    ) -> None:
+        """Bind and initialize the peer-visible ready/done epoch words.
+
+        Layout is ``[ready_slot0, ready_slot1, done_slot0, done_slot1]`` per
+        rank.  Initialization and its publication barrier happen once during
+        weight binding, never in a forward or decoder-layer hot path.
+        """
+        from torch.distributed import _symmetric_memory as symm_mem
+
+        from sglang.srt.distributed import get_tp_group
+
+        cached = self._tp4_moe_epoch_flags_workspace
+        if cached is not None and cached[0] == device:
+            return
+        if self._dp_moe_last_planned_epoch != 0:
+            self._dp_moe_epoch_poisoned = True
+            raise RuntimeError(
+                "cannot replace TP4 MoE epoch flags after publishing epochs; "
+                "the new zeroed allocation cannot prove prior slot completion"
+            )
+        tp_group = get_tp_group()
+        if tp_group.world_size != 4:
+            raise RuntimeError(
+                "TP4 MoE GPU epoch protocol requires TP=4, got "
+                f"{tp_group.world_size}"
+            )
+        local_flags = symm_mem.empty((4,), dtype=torch.int32, device=device)
+        local_flags.zero_()
+        handle = symm_mem.rendezvous(local_flags, tp_group.device_group)
+        peers = tuple(
+            handle.get_buffer(rank, local_flags.shape, local_flags.dtype)
+            for rank in range(4)
+        )
+        # Publish the first-use zero sentinel before any rank can enqueue an
+        # epoch wait.  This is load-time setup, not a measured forward barrier.
+        handle.barrier(channel=0)
+        torch.cuda.current_stream(device).synchronize()
+        self._tp4_moe_epoch_flags_workspace = (
+            device,
+            handle,
+            local_flags,
             peers,
             tp_group.rank_in_group,
         )
@@ -857,6 +1078,11 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError("nested DSV4 huge-runtime forwards are unsupported")
         if not self._handles:
             raise RuntimeError("DSV4 huge runtime was not bound after weight loading")
+        if self._use_dp_moe_epoch and self._dp_moe_epoch_poisoned:
+            raise RuntimeError(
+                "DSV4 Huge GPU MoE epoch sequence was poisoned by an aborted "
+                "selected forward; refusing all subsequent GPU work"
+            )
         is_graph_capture = get_is_capture_mode()
         mode = forward_batch.forward_mode
         is_dp_idle = self._attention_dp4 and mode.is_idle()
@@ -887,6 +1113,10 @@ class DSV4WholeLayerRuntime:
         if self._use_tp4_token_shard_attention and is_graph_capture:
             raise RuntimeError(
                 "TP4 token-sharded attention is an eager-only experimental path"
+            )
+        if self._use_dp_symmetric_moe_post and is_graph_capture:
+            raise RuntimeError(
+                "DSV4 Huge Attention-DP symmetric MoE post is Eager-only"
             )
         if is_dp_idle and is_graph_capture:
             raise RuntimeError(
@@ -1269,9 +1499,8 @@ class DSV4WholeLayerRuntime:
             if global_dp_sizes is None
             else tuple(int(size) for size in global_dp_sizes)
         )
-        use_dp_local_routing = (
-            self._use_dp_local_routing
-            and global_dp_sizes is not None
+        shared_dp_bucket = (
+            global_dp_sizes is not None
             and len(global_dp_sizes) == 4
             and sum(global_dp_sizes) == moe_num_tokens
             and moe_num_tokens <= _MAX_FORWARD_TOKENS
@@ -1280,21 +1509,60 @@ class DSV4WholeLayerRuntime:
                 for size in global_dp_sizes
             )
         )
-        if use_dp_local_routing:
+        use_dp_local_routing = (
+            self._use_dp_local_routing
+            and shared_dp_bucket
+        )
+        use_dp_symmetric_moe_post = (
+            self._use_dp_symmetric_moe_post and shared_dp_bucket
+        )
+        use_dp_moe_epoch = (
+            self._use_dp_moe_epoch and use_dp_symmetric_moe_post
+        )
+        use_dp_moe_epoch_counter = (
+            self._use_dp_moe_epoch_counter and use_dp_moe_epoch
+        )
+        use_dp_moe_nvls = (
+            self._use_dp_moe_nvls and use_dp_moe_epoch_counter
+        )
+        dp_moe_attention_rank = -1
+        dp_moe_local_row_offset = 0
+        dp_moe_epoch_base = 0
+        dp_moe_expected_done_epoch = 0
+        moe_epoch_flag0 = None
+        moe_epoch_flag1 = None
+        moe_epoch_flag2 = None
+        moe_epoch_flag3 = None
+        moe_epoch_completion_state = None
+        moe_multicast_local_slot0_ptr = 0
+        moe_multicast_local_slot1_ptr = 0
+        moe_partial_slot1_local = None
+        moe_partial_slot1_peer0 = None
+        moe_partial_slot1_peer1 = None
+        moe_partial_slot1_peer2 = None
+        moe_partial_slot1_peer3 = None
+        if use_dp_local_routing or use_dp_symmetric_moe_post:
             attn_dp_rank = get_parallel().attn_dp_rank
             if not 0 <= attn_dp_rank < 4:
                 raise RuntimeError(
-                    "DSV4 Huge local routing requires attention-DP rank in "
+                    "DSV4 Huge localized Attention-DP requires rank in "
                     f"[0, 4), got {attn_dp_rank}"
                 )
+            # ``shared_dp_bucket`` proved this is a four-element tuple before
+            # rank-local indexing.  Selection itself cannot depend on this
+            # rank's M or rank id; only after all ranks agree on the path do we
+            # fail closed on a local scheduler/descriptor mismatch.
             expected_local_tokens = global_dp_sizes[attn_dp_rank]
             if num_tokens != expected_local_tokens:
                 raise RuntimeError(
-                    "DSV4 Huge local routing requires local_M to match the "
+                    "DSV4 Huge localized Attention-DP requires local_M to match the "
                     "host-known TP4 size vector entry, got "
                     f"rank={attn_dp_rank}, local_M={num_tokens}, "
                     f"expected={expected_local_tokens}"
                 )
+            dp_moe_attention_rank = attn_dp_rank
+            dp_moe_local_row_offset = sum(global_dp_sizes[:attn_dp_rank])
+        if use_dp_local_routing:
             route_workspace = self._dp_packed_route_workspace
             if route_workspace is None or route_workspace[0] != positions.device:
                 raise RuntimeError(
@@ -1316,6 +1584,125 @@ class DSV4WholeLayerRuntime:
             moe_packed_route = None
             moe_routed_q_global = None
             moe_routed_scale_global = None
+        if use_dp_symmetric_moe_post:
+            symmetric_moe = (
+                self._tp4_symmetric_moe_epoch_workspace
+                if use_dp_moe_epoch_counter
+                else self._tp4_symmetric_moe_workspace
+            )
+            if symmetric_moe is None or symmetric_moe[0] != positions.device:
+                raise RuntimeError(
+                    "DSV4 Huge Attention-DP symmetric MoE workspace was not "
+                    "bound on this device"
+                )
+            if use_dp_moe_epoch_counter:
+                (
+                    _,
+                    moe_partial_handle,
+                    moe_partial_storage,
+                    moe_partial_peers,
+                    moe_partial_rank,
+                    moe_epoch_completion_state,
+                    moe_multicast_base,
+                ) = symmetric_moe
+            else:
+                (
+                    _,
+                    moe_partial_handle,
+                    moe_partial_storage,
+                    moe_partial_peers,
+                    moe_partial_rank,
+                ) = symmetric_moe
+            if moe_partial_rank != dp_moe_attention_rank:
+                raise RuntimeError(
+                    "DSV4 Huge symmetric TP rank must match Attention-DP rank, "
+                    f"got TP={moe_partial_rank}, Attention-DP="
+                    f"{dp_moe_attention_rank}"
+                )
+            if use_dp_moe_epoch_counter:
+                slot0_peers = tuple(
+                    peer[0, :moe_num_tokens] for peer in moe_partial_peers
+                )
+                slot1_peers = tuple(
+                    peer[1, :moe_num_tokens] for peer in moe_partial_peers
+                )
+                moe_partial_peers = slot0_peers
+                moe_partial_slot1_local = slot1_peers[moe_partial_rank]
+                (
+                    moe_partial_slot1_peer0,
+                    moe_partial_slot1_peer1,
+                    moe_partial_slot1_peer2,
+                    moe_partial_slot1_peer3,
+                ) = slot1_peers
+            else:
+                moe_partial_peers = tuple(
+                    peer[:moe_num_tokens] for peer in moe_partial_peers
+                )
+            moe_partial_local = moe_partial_peers[moe_partial_rank]
+            (
+                moe_partial_peer0,
+                moe_partial_peer1,
+                moe_partial_peer2,
+                moe_partial_peer3,
+            ) = moe_partial_peers
+            if use_dp_moe_nvls:
+                row_offset_bytes = (
+                    dp_moe_local_row_offset * 4096 * 2
+                )
+                moe_multicast_local_slot0_ptr = (
+                    moe_multicast_base + row_offset_bytes
+                )
+                moe_multicast_local_slot1_ptr = (
+                    moe_multicast_base
+                    + _TP4_MOE_SLOT_BYTES
+                    + row_offset_bytes
+                )
+                if not (
+                    0 < moe_multicast_local_slot0_ptr <= _SIGNED_INT64_MAX
+                    and moe_multicast_local_slot0_ptr % 16 == 0
+                    and 0
+                    < moe_multicast_local_slot1_ptr
+                    <= _SIGNED_INT64_MAX
+                    and moe_multicast_local_slot1_ptr % 16 == 0
+                ):
+                    raise RuntimeError(
+                        "DSV4 Huge NVLS local multicast slot address is "
+                        "invalid"
+                    )
+            del moe_partial_storage
+        if use_dp_moe_epoch:
+            epoch_flags = self._tp4_moe_epoch_flags_workspace
+            if epoch_flags is None or epoch_flags[0] != positions.device:
+                raise RuntimeError(
+                    "DSV4 Huge TP4 MoE epoch flags were not bound on this device"
+                )
+            _, _, _, epoch_flag_peers, epoch_flag_rank = epoch_flags
+            if epoch_flag_rank != dp_moe_attention_rank:
+                raise RuntimeError(
+                    "DSV4 Huge epoch flag rank must match Attention-DP rank, "
+                    f"got flags={epoch_flag_rank}, Attention-DP="
+                    f"{dp_moe_attention_rank}"
+                )
+            if self._dp_moe_epoch_layer_count <= 0:
+                raise RuntimeError(
+                    "DSV4 Huge GPU MoE epoch protocol has no bound MoE layers"
+                )
+            next_final_epoch = (
+                self._dp_moe_last_planned_epoch
+                + self._dp_moe_epoch_layer_count
+            )
+            if next_final_epoch > 0xFFFFFFFF:
+                raise RuntimeError(
+                    "DSV4 Huge GPU MoE epoch counter exhausted UINT32 range"
+                )
+            dp_moe_expected_done_epoch = self._dp_moe_last_planned_epoch
+            dp_moe_epoch_base = dp_moe_expected_done_epoch + 1
+            (
+                moe_epoch_flag0,
+                moe_epoch_flag1,
+                moe_epoch_flag2,
+                moe_epoch_flag3,
+            ) = epoch_flag_peers
         # Huge attention-DP evaluates a replicated TP1 shared expert on this
         # rank's local tokens. Keep its 2048-wide activation workspace local;
         # the gathered token count is only for the TP-sharded routed experts.
@@ -1355,6 +1742,30 @@ class DSV4WholeLayerRuntime:
             moe_partial_peer1=moe_partial_peer1,
             moe_partial_peer2=moe_partial_peer2,
             moe_partial_peer3=moe_partial_peer3,
+            moe_partial_slot1_local=moe_partial_slot1_local,
+            moe_partial_slot1_peer0=moe_partial_slot1_peer0,
+            moe_partial_slot1_peer1=moe_partial_slot1_peer1,
+            moe_partial_slot1_peer2=moe_partial_slot1_peer2,
+            moe_partial_slot1_peer3=moe_partial_slot1_peer3,
+            dp_symmetric_moe_post_selected=use_dp_symmetric_moe_post,
+            dp_moe_epoch_selected=use_dp_moe_epoch,
+            dp_moe_epoch_split_selected=(
+                self._use_dp_moe_epoch_split and use_dp_moe_epoch
+            ),
+            dp_moe_epoch_counter_selected=use_dp_moe_epoch_counter,
+            dp_moe_nvls_selected=use_dp_moe_nvls,
+            dp_moe_global_num_tokens=moe_num_tokens,
+            dp_moe_attention_rank=dp_moe_attention_rank,
+            dp_moe_local_row_offset=dp_moe_local_row_offset,
+            dp_moe_epoch_base=dp_moe_epoch_base,
+            dp_moe_expected_done_epoch=dp_moe_expected_done_epoch,
+            moe_epoch_flag0=moe_epoch_flag0,
+            moe_epoch_flag1=moe_epoch_flag1,
+            moe_epoch_flag2=moe_epoch_flag2,
+            moe_epoch_flag3=moe_epoch_flag3,
+            moe_epoch_completion_state=moe_epoch_completion_state,
+            moe_multicast_local_slot0_ptr=moe_multicast_local_slot0_ptr,
+            moe_multicast_local_slot1_ptr=moe_multicast_local_slot1_ptr,
             moe_owner_flag0=moe_owner_flag0,
             moe_owner_flag1=moe_owner_flag1,
             moe_owner_flag2=moe_owner_flag2,
@@ -1421,6 +1832,8 @@ class DSV4WholeLayerRuntime:
             num_tokens=num_tokens,
             batch_size=batch_size,
         )
+        if use_dp_moe_epoch:
+            self._dp_moe_last_planned_epoch = next_final_epoch
         self._active = descriptor
         return descriptor
 
@@ -1873,6 +2286,13 @@ class DSV4WholeLayerRuntime:
         """Clear lifecycle state while preserving the original exception."""
 
         if descriptor is self._active:
+            if descriptor.dp_moe_epoch_selected:
+                # Some ranks may already have published a subset of this
+                # descriptor's epochs.  Continuing could wait forever for a
+                # peer epoch that the aborted layer loop will never publish.
+                # Strict Huge mode therefore fails closed for the process
+                # lifetime instead of resetting or falling back to native.
+                self._dp_moe_epoch_poisoned = True
             self._active = None
 
     @staticmethod
@@ -2088,6 +2508,17 @@ class DSV4WholeLayerRuntime:
             )
 
 
+def _should_run_dp_symmetric_moe_post(
+    layer: Any, descriptor: DSV4ForwardDescriptor
+) -> bool:
+    """Keep per-layer eligibility independent of rank-local scheduler state."""
+
+    return (
+        descriptor.dp_symmetric_moe_post_selected
+        and getattr(layer.mlp, "shared_experts", None) is not None
+    )
+
+
 def _execute_common(
     runtime: DSV4WholeLayerRuntime,
     handle: DSV4LayerHandle,
@@ -2203,6 +2634,25 @@ def _execute_common(
     # aggregate shapes still fail below.
     num_tokens = hidden_states.shape[0]
     if runtime._attention_dp4:
+        # Stage-3B is enabled only for MoE layers that expose the replicated
+        # TP1 shared expert.  Prefix/zero-rank/unaligned buckets and dense
+        # layers remain on the existing Huge Attention-DP implementation.
+        # They never fall through to ``_forward_native``.
+        if _should_run_dp_symmetric_moe_post(layer, descriptor):
+            hidden_states = _run_dp_symmetric_moe_mhc_post(
+                layer=layer,
+                handle=handle,
+                descriptor=descriptor,
+                hidden_states=hidden_states,
+                shared_x_quant=shared_x_quant,
+                routed_x_quant=routed_x_quant,
+                use_dp_routed_prequant=use_dp_routed_prequant,
+                residual=residual,
+                post=post,
+                comb=comb,
+            )
+            return hidden_states, None, None, None
+
         # Attention-DP owns disjoint local token sets. Reuse SGLang's existing
         # device-side gather + TP-sharded MoE + scatter semantics, then finish
         # the local residual in the Huge CUDA epilogue.  The shared-expert input
@@ -2323,6 +2773,292 @@ def _execute_common(
         output=descriptor.mhc_residual_out,
     )
     return hidden_states, None, None, None
+
+
+def _run_dp_symmetric_moe_mhc_post(
+    *,
+    layer: Any,
+    handle: DSV4LayerHandle,
+    descriptor: DSV4ForwardDescriptor,
+    hidden_states: torch.Tensor,
+    shared_x_quant: tuple[torch.Tensor, torch.Tensor],
+    routed_x_quant: Optional[tuple[torch.Tensor, torch.Tensor]],
+    use_dp_routed_prequant: bool,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    """Bring up direct symmetric Attention-DP combine + shared/mHC post.
+
+    FlashInfer writes the rank's unreduced global-M TP partial directly into
+    its peer-visible fixed buffer.  The CUDA consumer reads the local row slice
+    of all four partials, performs the TP sum, adds the local shared expert, and
+    applies mHC post without materializing a reduce-scatter output.
+
+    The conservative bring-up retains two symmetric-memory barriers.  When the
+    GPU epoch policy is selected, one device wait protects reuse and the fused
+    cooperative consumer publishes ready/done epochs itself, eliminating both
+    host-enqueued barriers while retaining the same one-slot data allocation.
+    """
+
+    epoch_flags = (
+        descriptor.moe_epoch_flag0,
+        descriptor.moe_epoch_flag1,
+        descriptor.moe_epoch_flag2,
+        descriptor.moe_epoch_flag3,
+    )
+    epoch = 0
+    epoch_slot = 0
+    if descriptor.dp_moe_epoch_selected:
+        if any(flag is None for flag in epoch_flags):
+            raise RuntimeError(
+                "DSV4 Huge GPU MoE epoch selected without four peer flags"
+            )
+        if handle.dp_moe_sequence_index < 0:
+            raise RuntimeError(
+                f"layer {handle.layer_id}: GPU MoE epoch selected for a "
+                "non-MoE layer"
+            )
+        epoch = descriptor.dp_moe_epoch_base + handle.dp_moe_sequence_index
+        if not 1 <= epoch <= 0xFFFFFFFF:
+            raise RuntimeError(
+                f"layer {handle.layer_id}: invalid GPU MoE epoch {epoch}"
+            )
+        if descriptor.dp_moe_epoch_counter_selected:
+            epoch_slot = (epoch - 1) & 1
+
+    if epoch_slot == 1:
+        moe_partial_local = descriptor.moe_partial_slot1_local
+        moe_partials = (
+            descriptor.moe_partial_slot1_peer0,
+            descriptor.moe_partial_slot1_peer1,
+            descriptor.moe_partial_slot1_peer2,
+            descriptor.moe_partial_slot1_peer3,
+        )
+    else:
+        moe_partial_local = descriptor.moe_partial_local
+        moe_partials = (
+            descriptor.moe_partial_peer0,
+            descriptor.moe_partial_peer1,
+            descriptor.moe_partial_peer2,
+            descriptor.moe_partial_peer3,
+        )
+    if (
+        moe_partial_local is None
+        or any(partial is None for partial in moe_partials)
+        or descriptor.moe_partial_handle is None
+    ):
+        raise RuntimeError(
+            "DSV4 Huge Attention-DP symmetric MoE post selected without its "
+            "bound peer workspace"
+        )
+    global_m = descriptor.dp_moe_global_num_tokens
+    local_m = descriptor.num_tokens
+    expected_global_shape = (global_m, 4096)
+    if (
+        tuple(moe_partial_local.shape) != expected_global_shape
+        or any(
+            tuple(partial.shape) != expected_global_shape
+            for partial in moe_partials
+        )
+    ):
+        raise RuntimeError(
+            "DSV4 Huge Attention-DP symmetric MoE partial shape mismatch: "
+            f"expected {expected_global_shape}"
+        )
+    if not (
+        0 <= descriptor.dp_moe_attention_rank < 4
+        and 0 <= descriptor.dp_moe_local_row_offset
+        and descriptor.dp_moe_local_row_offset + local_m <= global_m
+    ):
+        raise RuntimeError(
+            "DSV4 Huge Attention-DP symmetric MoE descriptor has an invalid "
+            "rank-local row interval"
+        )
+
+    if (
+        descriptor.dp_moe_epoch_selected
+        and not descriptor.dp_moe_epoch_counter_selected
+    ):
+        expected_done_epoch = (
+            descriptor.dp_moe_expected_done_epoch
+            if handle.dp_moe_sequence_index == 0
+            else epoch - 1
+        )
+        from sglang.jit_kernel.dsv4.e2e import (
+            tp4_moe_wait_slot_reusable,
+        )
+
+        # This single-CTA acquire wait is ordered before FlashInfer's write to
+        # the reused symmetric partial.  The zero sentinel returns immediately
+        # on first use; every later layer waits entirely on GPU done epochs.
+        tp4_moe_wait_slot_reusable(
+            epoch_flags,
+            epoch_slot,
+            expected_done_epoch,
+        )
+
+    from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
+
+    with moe_output_buffer_ctx(
+        moe_partial_local, external_symmetric=True
+    ):
+        result = layer._run_moe_ffn_dp_sync(
+            hidden_states,
+            descriptor.forward_batch,
+            input_ids=descriptor.input_ids,
+            input_ids_global=descriptor.input_ids_global,
+            shared_x_quant=shared_x_quant,
+            routed_x_quant=routed_x_quant,
+            defer_shared_expert_add=True,
+            defer_dp_output_combine=True,
+            dp_packed_route_output=descriptor.moe_packed_route,
+            dp_routed_quant_output=(
+                (
+                    descriptor.moe_routed_q_global,
+                    descriptor.moe_routed_scale_global,
+                )
+                if use_dp_routed_prequant
+                else None
+            ),
+        )
+    if not isinstance(result, tuple) or len(result) != 2:
+        raise RuntimeError(
+            "deferred Attention-DP MoE combine must return "
+            "(global_partial, local_shared_hidden)"
+        )
+    moe_result, shared_hidden = result
+    if (
+        not isinstance(moe_result, torch.Tensor)
+        or tuple(moe_result.shape) != expected_global_shape
+        or moe_result.dtype != torch.bfloat16
+        or not moe_result.is_contiguous()
+        or moe_result.data_ptr() != moe_partial_local.data_ptr()
+    ):
+        result_ptr = (
+            f"0x{moe_result.data_ptr():x}"
+            if isinstance(moe_result, torch.Tensor)
+            else repr(type(moe_result))
+        )
+        raise RuntimeError(
+            "FlashInfer MoE did not honor the Huge Attention-DP symmetric "
+            f"output buffer: result_ptr={result_ptr}, "
+            f"provided_ptr=0x{moe_partial_local.data_ptr():x}"
+        )
+    if (
+        not isinstance(shared_hidden, torch.Tensor)
+        or tuple(shared_hidden.shape) != (local_m, 4096)
+        or shared_hidden.dtype != torch.bfloat16
+        or not shared_hidden.is_contiguous()
+    ):
+        raise RuntimeError(
+            "DSV4 Huge Attention-DP symmetric MoE post requires a contiguous "
+            f"local BF16 shared expert output [{local_m},4096]"
+        )
+
+    if descriptor.dp_moe_epoch_selected:
+        if descriptor.dp_moe_epoch_counter_selected:
+            completion_state = descriptor.moe_epoch_completion_state
+            if completion_state is None:
+                raise RuntimeError(
+                    "DSV4 Huge counter epoch selected without its local CTA "
+                    "completion state"
+                )
+            if descriptor.dp_moe_nvls_selected:
+                from sglang.jit_kernel.dsv4.e2e import (
+                    tp4_moe_local_slice_shared_mhc_post_epoch_counter_multimem as nvls_epoch_post,
+                )
+
+                multicast_local_ptr = (
+                    descriptor.moe_multicast_local_slot1_ptr
+                    if epoch_slot == 1
+                    else descriptor.moe_multicast_local_slot0_ptr
+                )
+                if not (
+                    0 < multicast_local_ptr <= _SIGNED_INT64_MAX
+                    and multicast_local_ptr % 16 == 0
+                ):
+                    raise RuntimeError(
+                        "DSV4 Huge NVLS epoch selected without a valid "
+                        "rank-local multicast slot address"
+                    )
+                return nvls_epoch_post(
+                    multicast_local_ptr,
+                    moe_partial_local,
+                    descriptor.dp_moe_local_row_offset,
+                    shared_hidden,
+                    residual,
+                    post,
+                    comb,
+                    descriptor.mhc_residual_out,
+                    epoch_flags,
+                    completion_state,
+                    descriptor.dp_moe_attention_rank,
+                    epoch_slot,
+                    epoch,
+                )
+            from sglang.jit_kernel.dsv4.e2e import (
+                tp4_moe_local_slice_shared_mhc_post_epoch_counter as epoch_post,
+            )
+
+            return epoch_post(
+                moe_partials,
+                descriptor.dp_moe_local_row_offset,
+                shared_hidden,
+                residual,
+                post,
+                comb,
+                descriptor.mhc_residual_out,
+                epoch_flags,
+                completion_state,
+                descriptor.dp_moe_attention_rank,
+                epoch_slot,
+                epoch,
+            )
+        if descriptor.dp_moe_epoch_split_selected:
+            from sglang.jit_kernel.dsv4.e2e import (
+                tp4_moe_local_slice_shared_mhc_post_epoch_split as epoch_post,
+            )
+        else:
+            from sglang.jit_kernel.dsv4.e2e import (
+                tp4_moe_local_slice_shared_mhc_post_epoch as epoch_post,
+            )
+
+        return epoch_post(
+            moe_partials,
+            descriptor.dp_moe_local_row_offset,
+            shared_hidden,
+            residual,
+            post,
+            comb,
+            descriptor.mhc_residual_out,
+            epoch_flags,
+            descriptor.dp_moe_attention_rank,
+            epoch_slot,
+            epoch,
+        )
+
+    # Conservative Stage-3B bring-up protocol.  Both calls are stream ordered;
+    # producer publication precedes peer loads and the consumer barrier proves
+    # every rank has finished those loads before the one-slot buffer is reused.
+    producer_channel = handle.layer_id & 1
+    consumer_channel = producer_channel ^ 1
+    descriptor.moe_partial_handle.barrier(channel=producer_channel)
+    from sglang.jit_kernel.dsv4.e2e import (
+        tp4_moe_local_slice_shared_mhc_post,
+    )
+
+    output = tp4_moe_local_slice_shared_mhc_post(
+        moe_partials,
+        descriptor.dp_moe_local_row_offset,
+        shared_hidden,
+        residual,
+        post,
+        comb,
+        descriptor.mhc_residual_out,
+    )
+    descriptor.moe_partial_handle.barrier(channel=consumer_channel)
+    return output
 
 
 def _fused_mhc_post_ffn_pre(

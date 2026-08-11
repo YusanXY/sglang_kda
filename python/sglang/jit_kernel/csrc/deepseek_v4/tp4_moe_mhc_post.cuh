@@ -31,6 +31,12 @@ constexpr uint32_t kTp4OwnerFlagArrived = 0;
 constexpr uint32_t kTp4OwnerFlagProducedEpoch = 1;
 constexpr uint32_t kTp4OwnerFlagPeerReadyEpoch = 2;
 constexpr uint32_t kTp4OwnerFlagCount = 4;
+constexpr uint32_t kTp4MoeEpochReadyBase = 0;
+constexpr uint32_t kTp4MoeEpochDoneBase = 2;
+constexpr uint32_t kTp4MoeEpochFlagCount = 4;
+constexpr uint64_t kTp4MoeEpochLocalReadyBit = 1ULL << 31;
+constexpr uint64_t kTp4MoeEpochLocalCountMask =
+    kTp4MoeEpochLocalReadyBit - 1;
 constexpr uint64_t kNCCLChannelGroupElements = 1ULL << 20;
 constexpr uint64_t kNCCLPeriodElements = 4 * kNCCLChannelGroupElements;
 
@@ -45,6 +51,68 @@ struct Tp4MoeMhcPostParams {
   const float* __restrict__ comb_mix;
   __nv_bfloat16* __restrict__ output;
   uint32_t num_tokens;
+};
+
+// Attention-DP combine specialization.  Each peer exposes its TP-sharded
+// MoE output as one symmetric [global_M, H] buffer.  A rank consumes only its
+// contiguous local row interval, adds the independently computed local shared
+// expert with the same BF16 rounding boundary as torch.add, and immediately
+// applies mHC post.  No reduced [local_M, H] tensor is materialized.
+struct Tp4MoeLocalSliceMhcPostParams {
+  const __nv_bfloat16* __restrict__ input0;
+  const __nv_bfloat16* __restrict__ input1;
+  const __nv_bfloat16* __restrict__ input2;
+  const __nv_bfloat16* __restrict__ input3;
+  const __nv_bfloat16* __restrict__ multicast_input;
+  const __nv_bfloat16* __restrict__ shared_hidden;
+  const __nv_bfloat16* __restrict__ residual;
+  const float* __restrict__ post_mix;
+  const float* __restrict__ comb_mix;
+  __nv_bfloat16* __restrict__ output;
+  uint32_t local_num_tokens;
+  uint32_t local_row_offset;
+};
+
+struct Tp4MoeLocalSliceEpochParams {
+  Tp4MoeLocalSliceMhcPostParams post;
+  uint32_t* flags0;
+  uint32_t* flags1;
+  uint32_t* flags2;
+  uint32_t* flags3;
+  uint32_t rank;
+  uint32_t slot;
+  uint32_t epoch;
+};
+
+struct Tp4MoeEpochControlParams {
+  uint32_t* flags0;
+  uint32_t* flags1;
+  uint32_t* flags2;
+  uint32_t* flags3;
+  uint32_t rank;
+  uint32_t slot;
+  uint32_t epoch;
+};
+
+struct Tp4MoeLocalSliceEpochCounterParams {
+  Tp4MoeLocalSliceMhcPostParams post;
+  uint32_t* flags0;
+  uint32_t* flags1;
+  uint32_t* flags2;
+  uint32_t* flags3;
+  unsigned long long* completion_state;
+  uint32_t rank;
+  uint32_t slot;
+  uint32_t epoch;
+};
+
+struct Tp4MoeWaitSlotParams {
+  const uint32_t* flags0;
+  const uint32_t* flags1;
+  const uint32_t* flags2;
+  const uint32_t* flags3;
+  uint32_t slot;
+  uint32_t expected_done_epoch;
 };
 
 struct Tp4MoeOwnerPersistentParams {
@@ -157,6 +225,36 @@ SGL_DEVICE uint32_t tp4_moe_mhc_atomic_add_release_sys(
       : "l"(ptr), "r"(value)
       : "memory");
   return previous;
+}
+
+SGL_DEVICE unsigned long long tp4_moe_mhc_atomic_add_acq_rel_gpu(
+    unsigned long long* ptr, const unsigned long long value) {
+  unsigned long long previous;
+  asm volatile(
+      "atom.acq_rel.gpu.global.add.u64 %0, [%1], %2;"
+      : "=l"(previous)
+      : "l"(ptr), "l"(value)
+      : "memory");
+  return previous;
+}
+
+SGL_DEVICE unsigned long long tp4_moe_mhc_load_acquire_gpu_u64(
+    const unsigned long long* ptr) {
+  unsigned long long value;
+  asm volatile(
+      "ld.acquire.gpu.global.u64 %0, [%1];"
+      : "=l"(value)
+      : "l"(ptr)
+      : "memory");
+  return value;
+}
+
+SGL_DEVICE void tp4_moe_mhc_fence_proxy_alias() {
+  // FlashInfer produces through each rank's unicast mapping, whereas NVLS
+  // consumes the same bytes through their multicast alias.  The epoch
+  // acquire orders producer completion; this proxy fence makes that ordering
+  // visible across the two virtual aliases before any multimem load.
+  asm volatile("fence.proxy.alias;" : : : "memory");
 }
 
 template <int kPending>
@@ -311,6 +409,594 @@ __global__ void tp4_moe_mhc_post_kernel(
   }
 
   device::PDLTriggerSecondary<kUsePDL>();
+}
+
+// Bring-up kernel for the Attention-DP output boundary.  The peer inputs are
+// global symmetric buffers, whereas every other tensor is the local token
+// slice.  The global element offset is deliberately retained in the channel
+// group calculation: changing it to a local offset changes BF16 addition
+// order relative to NCCL reduce_scatterv at 1M-element channel boundaries.
+SGL_DEVICE void tp4_moe_local_slice_shared_mhc_post_token(
+    const Tp4MoeLocalSliceMhcPostParams& params,
+    const uint32_t local_token,
+    float* coefficients,
+    uint4 peer_stages[2][4][kTp4MoeMhcThreads]) {
+  const uint32_t global_token = params.local_row_offset + local_token;
+  const uint32_t tid = threadIdx.x;
+  if (tid < kTp4MoeMhcHC) {
+    coefficients[tid] =
+        params.post_mix[local_token * kTp4MoeMhcHC + tid];
+  }
+  if (tid < kTp4MoeMhcHC * kTp4MoeMhcHC) {
+    coefficients[kTp4MoeMhcHC + tid] =
+        params.comb_mix[
+            local_token * kTp4MoeMhcHC * kTp4MoeMhcHC + tid];
+  }
+  __syncthreads();
+
+  constexpr uint32_t kChunksPerToken =
+      kTp4MoeMhcHidden / kTp4MoeMhcVec;
+  const uint64_t global_hidden_base =
+      static_cast<uint64_t>(global_token) * kTp4MoeMhcHidden;
+  const uint64_t local_hidden_base =
+      static_cast<uint64_t>(local_token) * kTp4MoeMhcHidden;
+  const uint64_t residual_base =
+      static_cast<uint64_t>(local_token) *
+      kTp4MoeMhcHC * kTp4MoeMhcHidden;
+  auto* output_chunks = reinterpret_cast<uint4*>(
+      params.output + residual_base);
+
+#pragma unroll
+  for (uint32_t stage = 0; stage < 2; ++stage) {
+    const uint32_t chunk = tid + stage * kTp4MoeMhcThreads;
+    const uint64_t element =
+        global_hidden_base +
+        static_cast<uint64_t>(chunk) * kTp4MoeMhcVec;
+    tp4_moe_mhc_cp_async_16(
+        &peer_stages[stage][0][tid], params.input0 + element);
+    tp4_moe_mhc_cp_async_16(
+        &peer_stages[stage][1][tid], params.input1 + element);
+    tp4_moe_mhc_cp_async_16(
+        &peer_stages[stage][2][tid], params.input2 + element);
+    tp4_moe_mhc_cp_async_16(
+        &peer_stages[stage][3][tid], params.input3 + element);
+    tp4_moe_mhc_cp_async_commit();
+  }
+
+  for (uint32_t chunk = tid; chunk < kChunksPerToken;
+       chunk += kTp4MoeMhcThreads) {
+    const uint32_t stage = chunk / kTp4MoeMhcThreads;
+    if (stage == 0) {
+      tp4_moe_mhc_cp_async_wait<1>();
+    } else {
+      tp4_moe_mhc_cp_async_wait<0>();
+    }
+    const uint4 input0_raw = peer_stages[stage][0][tid];
+    const uint4 input1_raw = peer_stages[stage][1][tid];
+    const uint4 input2_raw = peer_stages[stage][2][tid];
+    const uint4 input3_raw = peer_stages[stage][3][tid];
+    const auto* input0_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input0_raw);
+    const auto* input1_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input1_raw);
+    const auto* input2_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input2_raw);
+    const auto* input3_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&input3_raw);
+    __nv_bfloat162 reduced_pairs[kTp4MoeMhcVec / 2];
+    const uint64_t first_element =
+        global_hidden_base +
+        static_cast<uint64_t>(chunk) * kTp4MoeMhcVec;
+    const uint32_t group = static_cast<uint32_t>(
+        (first_element % kNCCLPeriodElements) /
+        kNCCLChannelGroupElements);
+#pragma unroll
+    for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+      reduced_pairs[pair] = tp4_moe_mhc_add4_ordered(
+          input0_pairs[pair],
+          input1_pairs[pair],
+          input2_pairs[pair],
+          input3_pairs[pair],
+          group);
+    }
+
+    const auto* shared_chunks = reinterpret_cast<const uint4*>(
+        params.shared_hidden + local_hidden_base);
+    const uint4 shared_raw = shared_chunks[chunk];
+    const auto* shared_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&shared_raw);
+    float2 hidden_values[kTp4MoeMhcVec / 2];
+#pragma unroll
+    for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+      const float2 reduced_value =
+          __bfloat1622float2(reduced_pairs[pair]);
+      const float2 shared_value =
+          __bfloat1622float2(shared_pairs[pair]);
+      // Preserve the former reduce_scatterv -> BF16 torch.add boundary.
+      const __nv_bfloat162 rounded_sum = __float22bfloat162_rn(make_float2(
+          reduced_value.x + shared_value.x,
+          reduced_value.y + shared_value.y));
+      hidden_values[pair] = __bfloat1622float2(rounded_sum);
+    }
+
+    float2 residual_values[kTp4MoeMhcHC][kTp4MoeMhcVec / 2];
+#pragma unroll
+    for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+         ++input_route) {
+      const auto* route_chunks = reinterpret_cast<const uint4*>(
+          params.residual + residual_base +
+          static_cast<uint64_t>(input_route) * kTp4MoeMhcHidden);
+      const uint4 residual_raw = route_chunks[chunk];
+      residual_values[input_route][0] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.x));
+      residual_values[input_route][1] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.y));
+      residual_values[input_route][2] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.z));
+      residual_values[input_route][3] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.w));
+    }
+
+#pragma unroll
+    for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
+         ++output_route) {
+      __nv_bfloat162 rounded[kTp4MoeMhcVec / 2];
+#pragma unroll
+      for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+        float2 value = make_float2(
+            coefficients[output_route] * hidden_values[pair].x,
+            coefficients[output_route] * hidden_values[pair].y);
+#pragma unroll
+        for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+             ++input_route) {
+          value = tp4_moe_mhc_fma2(
+              coefficients[
+                  kTp4MoeMhcHC +
+                  input_route * kTp4MoeMhcHC + output_route],
+              residual_values[input_route][pair],
+              value);
+        }
+        rounded[pair] = __float22bfloat162_rn(value);
+      }
+      output_chunks[output_route * kChunksPerToken + chunk] = make_uint4(
+          tp4_moe_mhc_bf16x2_to_uint(rounded[0]),
+          tp4_moe_mhc_bf16x2_to_uint(rounded[1]),
+          tp4_moe_mhc_bf16x2_to_uint(rounded[2]),
+          tp4_moe_mhc_bf16x2_to_uint(rounded[3]));
+    }
+  }
+
+}
+
+// NVLS specialization of the same Attention-DP boundary.  The multicast VA
+// is pre-offset to this rank's local row interval and selected double-buffer
+// slot on the host descriptor path.  One switch-side reduction replaces four
+// peer loads, the 32 KiB peer staging allocation, and the software add chain.
+// ``multimem.ld_reduce ... acc::f32 ... bf16x2`` returns BF16 pairs; the
+// following shared-expert add is deliberately rounded back to BF16 so the
+// former reduce-scatter -> torch.add boundary remains explicit.
+SGL_DEVICE void tp4_moe_local_slice_multimem_shared_mhc_post_token(
+    const Tp4MoeLocalSliceMhcPostParams& params,
+    const uint32_t local_token,
+    float* coefficients) {
+  const uint32_t tid = threadIdx.x;
+  if (tid < kTp4MoeMhcHC) {
+    coefficients[tid] =
+        params.post_mix[local_token * kTp4MoeMhcHC + tid];
+  }
+  if (tid < kTp4MoeMhcHC * kTp4MoeMhcHC) {
+    coefficients[kTp4MoeMhcHC + tid] =
+        params.comb_mix[
+            local_token * kTp4MoeMhcHC * kTp4MoeMhcHC + tid];
+  }
+  __syncthreads();
+
+  constexpr uint32_t kChunksPerToken =
+      kTp4MoeMhcHidden / kTp4MoeMhcVec;
+  const uint64_t local_hidden_base =
+      static_cast<uint64_t>(local_token) * kTp4MoeMhcHidden;
+  const uint64_t residual_base =
+      static_cast<uint64_t>(local_token) *
+      kTp4MoeMhcHC * kTp4MoeMhcHidden;
+  auto* output_chunks = reinterpret_cast<uint4*>(
+      params.output + residual_base);
+
+  for (uint32_t chunk = tid; chunk < kChunksPerToken;
+       chunk += kTp4MoeMhcThreads) {
+    const uint64_t element =
+        local_hidden_base +
+        static_cast<uint64_t>(chunk) * kTp4MoeMhcVec;
+    const uint4 reduced_raw = tp4_moe_mhc_multimem_reduce_bf16x8(
+        params.multicast_input + element);
+    const auto* reduced_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&reduced_raw);
+
+    const auto* shared_chunks = reinterpret_cast<const uint4*>(
+        params.shared_hidden + local_hidden_base);
+    const uint4 shared_raw = shared_chunks[chunk];
+    const auto* shared_pairs =
+        reinterpret_cast<const __nv_bfloat162*>(&shared_raw);
+    float2 hidden_values[kTp4MoeMhcVec / 2];
+#pragma unroll
+    for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+      const float2 reduced_value =
+          __bfloat1622float2(reduced_pairs[pair]);
+      const float2 shared_value =
+          __bfloat1622float2(shared_pairs[pair]);
+      const __nv_bfloat162 rounded_sum = __float22bfloat162_rn(make_float2(
+          reduced_value.x + shared_value.x,
+          reduced_value.y + shared_value.y));
+      hidden_values[pair] = __bfloat1622float2(rounded_sum);
+    }
+
+    float2 residual_values[kTp4MoeMhcHC][kTp4MoeMhcVec / 2];
+#pragma unroll
+    for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+         ++input_route) {
+      const auto* route_chunks = reinterpret_cast<const uint4*>(
+          params.residual + residual_base +
+          static_cast<uint64_t>(input_route) * kTp4MoeMhcHidden);
+      const uint4 residual_raw = route_chunks[chunk];
+      residual_values[input_route][0] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.x));
+      residual_values[input_route][1] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.y));
+      residual_values[input_route][2] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.z));
+      residual_values[input_route][3] = __bfloat1622float2(
+          tp4_moe_mhc_uint_to_bf16x2(residual_raw.w));
+    }
+
+#pragma unroll
+    for (uint32_t output_route = 0; output_route < kTp4MoeMhcHC;
+         ++output_route) {
+      __nv_bfloat162 rounded[kTp4MoeMhcVec / 2];
+#pragma unroll
+      for (uint32_t pair = 0; pair < kTp4MoeMhcVec / 2; ++pair) {
+        float2 value = make_float2(
+            coefficients[output_route] * hidden_values[pair].x,
+            coefficients[output_route] * hidden_values[pair].y);
+#pragma unroll
+        for (uint32_t input_route = 0; input_route < kTp4MoeMhcHC;
+             ++input_route) {
+          value = tp4_moe_mhc_fma2(
+              coefficients[
+                  kTp4MoeMhcHC +
+                  input_route * kTp4MoeMhcHC + output_route],
+              residual_values[input_route][pair],
+              value);
+        }
+        rounded[pair] = __float22bfloat162_rn(value);
+      }
+      output_chunks[output_route * kChunksPerToken + chunk] = make_uint4(
+          tp4_moe_mhc_bf16x2_to_uint(rounded[0]),
+          tp4_moe_mhc_bf16x2_to_uint(rounded[1]),
+          tp4_moe_mhc_bf16x2_to_uint(rounded[2]),
+          tp4_moe_mhc_bf16x2_to_uint(rounded[3]));
+    }
+  }
+}
+
+template <bool kUsePDL>
+__global__ void tp4_moe_local_slice_shared_mhc_post_kernel(
+    const Tp4MoeLocalSliceMhcPostParams __grid_constant__ params) {
+  device::PDLWaitPrimary<kUsePDL>();
+  __shared__ float coefficients[
+      kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
+  __shared__ __align__(16) uint4 peer_stages[2][4][kTp4MoeMhcThreads];
+  tp4_moe_local_slice_shared_mhc_post_token(
+      params, blockIdx.x, coefficients, peer_stages);
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
+// Wait before reusing one double-buffered symmetric producer slot.  Epoch
+// zero denotes a slot that has never been published and therefore needs no
+// peer wait.  A single system-acquire polling thread is sufficient; stream
+// ordering holds the following producer until this CTA completes.
+__global__ void tp4_moe_wait_slot_reusable_kernel(
+    const Tp4MoeWaitSlotParams __grid_constant__ params) {
+  if (threadIdx.x != 0 || params.expected_done_epoch == 0) {
+    return;
+  }
+  bool reusable = false;
+  while (!reusable) {
+    const uint32_t done_index = kTp4MoeEpochDoneBase + params.slot;
+    reusable =
+        tp4_moe_mhc_load_acquire_sys(params.flags0 + done_index) ==
+            params.expected_done_epoch &&
+        tp4_moe_mhc_load_acquire_sys(params.flags1 + done_index) ==
+            params.expected_done_epoch &&
+        tp4_moe_mhc_load_acquire_sys(params.flags2 + done_index) ==
+            params.expected_done_epoch &&
+        tp4_moe_mhc_load_acquire_sys(params.flags3 + done_index) ==
+            params.expected_done_epoch;
+    if (!reusable) {
+      __nanosleep(128);
+    }
+  }
+}
+
+// Non-cooperative epoch control.  The FFI wrapper launches ready/wait, the
+// high-throughput one-CTA-per-token fused data kernel, and done publication on
+// one CUDA stream.  Keeping the three launches inside one custom op preserves
+// a single Python boundary while avoiding the fixed resident grid and its two
+// expensive grid-wide barriers.
+__global__ void tp4_moe_publish_ready_wait_kernel(
+    const Tp4MoeEpochControlParams __grid_constant__ params) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  uint32_t* local_flags = params.flags0;
+  if (params.rank == 1) {
+    local_flags = params.flags1;
+  } else if (params.rank == 2) {
+    local_flags = params.flags2;
+  } else if (params.rank == 3) {
+    local_flags = params.flags3;
+  }
+  __threadfence_system();
+  tp4_moe_mhc_store_release_sys(
+      local_flags + kTp4MoeEpochReadyBase + params.slot, params.epoch);
+  bool ready = false;
+  while (!ready) {
+    const uint32_t ready_index = kTp4MoeEpochReadyBase + params.slot;
+    ready =
+        tp4_moe_mhc_load_acquire_sys(params.flags0 + ready_index) ==
+            params.epoch &&
+        tp4_moe_mhc_load_acquire_sys(params.flags1 + ready_index) ==
+            params.epoch &&
+        tp4_moe_mhc_load_acquire_sys(params.flags2 + ready_index) ==
+            params.epoch &&
+        tp4_moe_mhc_load_acquire_sys(params.flags3 + ready_index) ==
+            params.epoch;
+    if (!ready) {
+      __nanosleep(128);
+    }
+  }
+}
+
+__global__ void tp4_moe_publish_done_kernel(
+    const Tp4MoeEpochControlParams __grid_constant__ params) {
+  if (threadIdx.x != 0) {
+    return;
+  }
+  uint32_t* local_flags = params.flags0;
+  if (params.rank == 1) {
+    local_flags = params.flags1;
+  } else if (params.rank == 2) {
+    local_flags = params.flags2;
+  } else if (params.rank == 3) {
+    local_flags = params.flags3;
+  }
+  __threadfence_system();
+  tp4_moe_mhc_store_release_sys(
+      local_flags + kTp4MoeEpochDoneBase + params.slot, params.epoch);
+}
+
+// Double-buffered, non-cooperative epoch consumer.  A per-slot 64-bit local
+// state packs {epoch, local_ready_bit | completed_CTA_count}.  The CAS winner
+// alone polls the four system-scope peer flags, then releases a cheap local
+// gate.  All CTAs consume peer partials after acquiring that gate, and the
+// last CTA publishes done.
+// Before it exits, that CTA proves the *other* slot's previous epoch is done on
+// every peer, so the next layer can overwrite that slot without a standalone
+// wait kernel.  No CTA residency assumption or grid-wide barrier is required.
+template <bool kUseMultimem>
+__global__ __launch_bounds__(kTp4MoeMhcThreads, 4)
+void tp4_moe_local_slice_shared_mhc_post_epoch_counter_kernel(
+    const Tp4MoeLocalSliceEpochCounterParams __grid_constant__ params) {
+  const uint32_t tid = threadIdx.x;
+  uint32_t* local_flags = params.flags0;
+  if (params.rank == 1) {
+    local_flags = params.flags1;
+  } else if (params.rank == 2) {
+    local_flags = params.flags2;
+  } else if (params.rank == 3) {
+    local_flags = params.flags3;
+  }
+
+  if (tid == 0) {
+    const uint64_t expected_previous =
+        params.epoch <= 2
+        ? 0
+        : (static_cast<uint64_t>(params.epoch - 2) << 32) |
+              kTp4MoeEpochLocalReadyBit |
+              static_cast<uint64_t>(gridDim.x);
+    const uint64_t initialized = static_cast<uint64_t>(params.epoch) << 32;
+    auto* state = params.completion_state + params.slot;
+    uint64_t observed = atomicAdd(state, 0ULL);
+    bool initializer = false;
+    while (static_cast<uint32_t>(observed >> 32) != params.epoch) {
+      if (observed != expected_previous) {
+        __trap();
+      }
+      const uint64_t prior = atomicCAS(state, expected_previous, initialized);
+      if (prior == expected_previous) {
+        initializer = true;
+        observed = initialized;
+        break;
+      }
+      observed = prior;
+    }
+    if (initializer) {
+      if constexpr (kUseMultimem) {
+        // Bridge the producer's generic/unicast writes into the multicast
+        // proxy before this rank publishes its ready epoch.
+        tp4_moe_mhc_fence_proxy_alias();
+      }
+      __threadfence_system();
+      tp4_moe_mhc_store_release_sys(
+          local_flags + kTp4MoeEpochReadyBase + params.slot,
+          params.epoch);
+
+      bool ready = false;
+      while (!ready) {
+        const uint32_t ready_index = kTp4MoeEpochReadyBase + params.slot;
+        ready =
+            tp4_moe_mhc_load_acquire_sys(params.flags0 + ready_index) ==
+                params.epoch &&
+            tp4_moe_mhc_load_acquire_sys(params.flags1 + ready_index) ==
+                params.epoch &&
+            tp4_moe_mhc_load_acquire_sys(params.flags2 + ready_index) ==
+                params.epoch &&
+            tp4_moe_mhc_load_acquire_sys(params.flags3 + ready_index) ==
+                params.epoch;
+        if (!ready) {
+          __nanosleep(128);
+        }
+      }
+      tp4_moe_mhc_atomic_add_acq_rel_gpu(
+          state, kTp4MoeEpochLocalReadyBit);
+    } else {
+      bool locally_ready = false;
+      while (!locally_ready) {
+        const uint64_t local_state =
+            tp4_moe_mhc_load_acquire_gpu_u64(state);
+        locally_ready =
+            static_cast<uint32_t>(local_state >> 32) == params.epoch &&
+            (local_state & kTp4MoeEpochLocalReadyBit) != 0;
+        if (!locally_ready) {
+          __nanosleep(128);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  __shared__ float coefficients[
+      kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
+  if constexpr (kUseMultimem) {
+    tp4_moe_mhc_fence_proxy_alias();
+    for (uint32_t local_token = blockIdx.x;
+         local_token < params.post.local_num_tokens;
+         local_token += gridDim.x) {
+      tp4_moe_local_slice_multimem_shared_mhc_post_token(
+          params.post, local_token, coefficients);
+      __syncthreads();
+    }
+  } else {
+    __shared__ __align__(16) uint4
+        peer_stages[2][4][kTp4MoeMhcThreads];
+    for (uint32_t local_token = blockIdx.x;
+         local_token < params.post.local_num_tokens;
+         local_token += gridDim.x) {
+      tp4_moe_local_slice_shared_mhc_post_token(
+          params.post, local_token, coefficients, peer_stages);
+      __syncthreads();
+    }
+  }
+
+  if (tid == 0) {
+    auto* state = params.completion_state + params.slot;
+    __threadfence();
+    // Every CTA releases completion of its peer reads through this single
+    // atomic modification order.  The last CTA's acquire observes that
+    // release sequence before it publishes the system-scope done epoch, so a
+    // producer cannot overwrite the slot while a non-last CTA still has
+    // outstanding reads.
+    const uint64_t prior =
+        tp4_moe_mhc_atomic_add_acq_rel_gpu(state, 1ULL);
+    const uint32_t prior_count = static_cast<uint32_t>(
+        prior & kTp4MoeEpochLocalCountMask);
+    if (static_cast<uint32_t>(prior >> 32) != params.epoch ||
+        (prior & kTp4MoeEpochLocalReadyBit) == 0 ||
+        prior_count >= gridDim.x) {
+      __trap();
+    }
+    if (prior_count + 1 == gridDim.x) {
+      __threadfence_system();
+      tp4_moe_mhc_store_release_sys(
+          local_flags + kTp4MoeEpochDoneBase + params.slot, params.epoch);
+
+      const uint32_t expected_reuse_epoch =
+          params.epoch == 1 ? 0 : params.epoch - 1;
+      if (expected_reuse_epoch != 0) {
+        const uint32_t next_slot = params.slot ^ 1;
+        const uint32_t done_index = kTp4MoeEpochDoneBase + next_slot;
+        bool reusable = false;
+        while (!reusable) {
+          reusable =
+              tp4_moe_mhc_load_acquire_sys(params.flags0 + done_index) ==
+                  expected_reuse_epoch &&
+              tp4_moe_mhc_load_acquire_sys(params.flags1 + done_index) ==
+                  expected_reuse_epoch &&
+              tp4_moe_mhc_load_acquire_sys(params.flags2 + done_index) ==
+                  expected_reuse_epoch &&
+              tp4_moe_mhc_load_acquire_sys(params.flags3 + done_index) ==
+                  expected_reuse_epoch;
+          if (!reusable) {
+            __nanosleep(128);
+          }
+        }
+      }
+    }
+  }
+}
+
+// The producer has completed on this stream before this launch.  One leader
+// publishes that rank's ready epoch, waits for all four peer producers, and
+// releases the resident grid.  Every CTA then grid-strides local rows through
+// the same ordered TP reduction + BF16 shared-add + mHC body as the bring-up
+// ABI.  A final grid barrier lets the leader publish slot completion without
+// a Host barrier or a second CUDA launch.
+__global__ __launch_bounds__(kTp4MoeMhcThreads, 4)
+void tp4_moe_local_slice_shared_mhc_post_epoch_kernel(
+    const Tp4MoeLocalSliceEpochParams __grid_constant__ params) {
+  const uint32_t tid = threadIdx.x;
+  uint32_t* local_flags = params.flags0;
+  if (params.rank == 1) {
+    local_flags = params.flags1;
+  } else if (params.rank == 2) {
+    local_flags = params.flags2;
+  } else if (params.rank == 3) {
+    local_flags = params.flags3;
+  }
+
+  auto grid = cooperative_groups::this_grid();
+  if (blockIdx.x == 0 && tid == 0) {
+    __threadfence_system();
+    tp4_moe_mhc_store_release_sys(
+        local_flags + kTp4MoeEpochReadyBase + params.slot,
+        params.epoch);
+    bool ready = false;
+    while (!ready) {
+      const uint32_t ready_index = kTp4MoeEpochReadyBase + params.slot;
+      ready =
+          tp4_moe_mhc_load_acquire_sys(params.flags0 + ready_index) ==
+              params.epoch &&
+          tp4_moe_mhc_load_acquire_sys(params.flags1 + ready_index) ==
+              params.epoch &&
+          tp4_moe_mhc_load_acquire_sys(params.flags2 + ready_index) ==
+              params.epoch &&
+          tp4_moe_mhc_load_acquire_sys(params.flags3 + ready_index) ==
+              params.epoch;
+      if (!ready) {
+        __nanosleep(128);
+      }
+    }
+  }
+  grid.sync();
+
+  __shared__ float coefficients[
+      kTp4MoeMhcHC + kTp4MoeMhcHC * kTp4MoeMhcHC];
+  __shared__ __align__(16) uint4 peer_stages[2][4][kTp4MoeMhcThreads];
+  for (uint32_t local_token = blockIdx.x;
+       local_token < params.post.local_num_tokens;
+       local_token += gridDim.x) {
+    tp4_moe_local_slice_shared_mhc_post_token(
+        params.post, local_token, coefficients, peer_stages);
+    // Do not let an early warp reuse the staged peer/coefficient storage for
+    // its next grid-stride row while another warp still consumes this row.
+    __syncthreads();
+  }
+
+  grid.sync();
+  if (blockIdx.x == 0 && tid == 0) {
+    __threadfence_system();
+    tp4_moe_mhc_store_release_sys(
+        local_flags + kTp4MoeEpochDoneBase + params.slot,
+        params.epoch);
+  }
 }
 
 // Two-stage owner protocol for the strict no-Graph TP4 prefill buckets.
@@ -780,6 +1466,702 @@ struct Tp4MoeMhcPostKernel {
     LaunchKernel(M.unwrap(), kTp4MoeMhcThreads, device.unwrap())
         .enable_pdl(kUsePDL)(
             tp4_moe_mhc_post_kernel<kUsePDL, false>, params);
+  }
+
+  static void run_local_slice_shared(
+      const tvm::ffi::TensorView input0,
+      const tvm::ffi::TensorView input1,
+      const tvm::ffi::TensorView input2,
+      const tvm::ffi::TensorView input3,
+      int64_t local_row_offset,
+      const tvm::ffi::TensorView shared_hidden,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView post_mix,
+      const tvm::ffi::TensorView comb_mix,
+      const tvm::ffi::TensorView output) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto G = SymbolicSize{"global_num_tokens"};
+    auto L = SymbolicSize{"local_num_tokens"};
+    device.set_options<kDLCUDA>();
+
+    for (const auto tensor : {input0, input1, input2, input3}) {
+      TensorMatcher({G, kTp4MoeMhcHidden})
+          .with_strides({kTp4MoeMhcHidden, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .verify(tensor);
+    }
+    TensorMatcher({L, kTp4MoeMhcHidden})
+        .with_strides({kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(shared_hidden);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(residual);
+    TensorMatcher({L, kTp4MoeMhcHC})
+        .with_strides({kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(post_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHC})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHC, kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(comb_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+
+    RuntimeCheck(
+        G.unwrap() >= 4096 && G.unwrap() <= 131072 &&
+            G.unwrap() % 4096 == 0,
+        "TP4 local-slice MoE/mHC requires global_M in [4096,131072] "
+        "and divisible by 4096");
+    RuntimeCheck(
+        L.unwrap() >= 4096 && L.unwrap() <= 32768 &&
+            L.unwrap() % 4096 == 0,
+        "TP4 local-slice MoE/mHC requires local_M in [4096,32768] "
+        "and divisible by 4096");
+    RuntimeCheck(
+        local_row_offset >= 0 && local_row_offset <= G.unwrap() &&
+            local_row_offset % 4096 == 0,
+        "TP4 local-slice MoE/mHC requires a 4096-row-aligned in-range "
+        "local offset");
+    RuntimeCheck(
+        L.unwrap() <= G.unwrap() - local_row_offset,
+        "TP4 local-slice MoE/mHC local interval exceeds global partials");
+
+    const auto params = Tp4MoeLocalSliceMhcPostParams{
+        .input0 = reinterpret_cast<const __nv_bfloat16*>(input0.data_ptr()),
+        .input1 = reinterpret_cast<const __nv_bfloat16*>(input1.data_ptr()),
+        .input2 = reinterpret_cast<const __nv_bfloat16*>(input2.data_ptr()),
+        .input3 = reinterpret_cast<const __nv_bfloat16*>(input3.data_ptr()),
+        .multicast_input = nullptr,
+        .shared_hidden = reinterpret_cast<const __nv_bfloat16*>(
+            shared_hidden.data_ptr()),
+        .residual =
+            reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        .post_mix = static_cast<const float*>(post_mix.data_ptr()),
+        .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
+        .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .local_num_tokens = static_cast<uint32_t>(L.unwrap()),
+        .local_row_offset = static_cast<uint32_t>(local_row_offset),
+    };
+    LaunchKernel(L.unwrap(), kTp4MoeMhcThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(
+            tp4_moe_local_slice_shared_mhc_post_kernel<kUsePDL>, params);
+  }
+
+  static void run_wait_slot_reusable(
+      const tvm::ffi::TensorView flags0,
+      const tvm::ffi::TensorView flags1,
+      const tvm::ffi::TensorView flags2,
+      const tvm::ffi::TensorView flags3,
+      int64_t slot,
+      int64_t expected_done_epoch) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+    for (const auto flags : {flags0, flags1, flags2, flags3}) {
+      TensorMatcher({kTp4MoeEpochFlagCount})
+          .with_strides({1})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(flags);
+    }
+    RuntimeCheck(
+        slot == 0 || slot == 1,
+        "TP4 MoE epoch slot must be 0 or 1");
+    RuntimeCheck(
+        expected_done_epoch >= 0 && expected_done_epoch <= 0xffffffffLL,
+        "TP4 MoE expected done epoch must fit uint32");
+    RuntimeCheck(
+        !kUsePDL,
+        "TP4 MoE epoch synchronization does not support PDL");
+
+    const auto params = Tp4MoeWaitSlotParams{
+        .flags0 = reinterpret_cast<const uint32_t*>(flags0.data_ptr()),
+        .flags1 = reinterpret_cast<const uint32_t*>(flags1.data_ptr()),
+        .flags2 = reinterpret_cast<const uint32_t*>(flags2.data_ptr()),
+        .flags3 = reinterpret_cast<const uint32_t*>(flags3.data_ptr()),
+        .slot = static_cast<uint32_t>(slot),
+        .expected_done_epoch =
+            static_cast<uint32_t>(expected_done_epoch),
+    };
+    LaunchKernel(1, 32, device.unwrap())(
+        tp4_moe_wait_slot_reusable_kernel, params);
+  }
+
+  static void run_local_slice_shared_epoch(
+      const tvm::ffi::TensorView input0,
+      const tvm::ffi::TensorView input1,
+      const tvm::ffi::TensorView input2,
+      const tvm::ffi::TensorView input3,
+      int64_t local_row_offset,
+      const tvm::ffi::TensorView shared_hidden,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView post_mix,
+      const tvm::ffi::TensorView comb_mix,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView flags0,
+      const tvm::ffi::TensorView flags1,
+      const tvm::ffi::TensorView flags2,
+      const tvm::ffi::TensorView flags3,
+      int64_t rank,
+      int64_t slot,
+      int64_t epoch) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto G = SymbolicSize{"global_num_tokens"};
+    auto L = SymbolicSize{"local_num_tokens"};
+    device.set_options<kDLCUDA>();
+
+    for (const auto tensor : {input0, input1, input2, input3}) {
+      TensorMatcher({G, kTp4MoeMhcHidden})
+          .with_strides({kTp4MoeMhcHidden, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .verify(tensor);
+    }
+    TensorMatcher({L, kTp4MoeMhcHidden})
+        .with_strides({kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(shared_hidden);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(residual);
+    TensorMatcher({L, kTp4MoeMhcHC})
+        .with_strides({kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(post_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHC})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHC, kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(comb_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+    for (const auto flags : {flags0, flags1, flags2, flags3}) {
+      TensorMatcher({kTp4MoeEpochFlagCount})
+          .with_strides({1})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(flags);
+    }
+
+    RuntimeCheck(
+        G.unwrap() >= 4096 && G.unwrap() <= 131072 &&
+            G.unwrap() % 4096 == 0,
+        "TP4 epoch local-slice MoE/mHC requires global_M in "
+        "[4096,131072] and divisible by 4096");
+    RuntimeCheck(
+        L.unwrap() >= 4096 && L.unwrap() <= 32768 &&
+            L.unwrap() % 4096 == 0,
+        "TP4 epoch local-slice MoE/mHC requires local_M in "
+        "[4096,32768] and divisible by 4096");
+    RuntimeCheck(
+        local_row_offset >= 0 && local_row_offset <= G.unwrap() &&
+            local_row_offset % 4096 == 0 &&
+            L.unwrap() <= G.unwrap() - local_row_offset,
+        "TP4 epoch local-slice MoE/mHC requires a 4096-row-aligned "
+        "in-bounds local interval");
+    RuntimeCheck(
+        rank >= 0 && rank < 4,
+        "TP4 MoE epoch rank must be in [0,4)");
+    RuntimeCheck(
+        slot == 0 || slot == 1,
+        "TP4 MoE epoch slot must be 0 or 1");
+    RuntimeCheck(
+        epoch > 0 && epoch <= 0xffffffffLL,
+        "TP4 MoE ready/done epoch must be in [1,UINT32_MAX]");
+    RuntimeCheck(
+        !kUsePDL,
+        "TP4 cooperative local-slice epoch synchronization does not "
+        "support PDL");
+
+    const auto post_params = Tp4MoeLocalSliceMhcPostParams{
+        .input0 = reinterpret_cast<const __nv_bfloat16*>(input0.data_ptr()),
+        .input1 = reinterpret_cast<const __nv_bfloat16*>(input1.data_ptr()),
+        .input2 = reinterpret_cast<const __nv_bfloat16*>(input2.data_ptr()),
+        .input3 = reinterpret_cast<const __nv_bfloat16*>(input3.data_ptr()),
+        .multicast_input = nullptr,
+        .shared_hidden = reinterpret_cast<const __nv_bfloat16*>(
+            shared_hidden.data_ptr()),
+        .residual =
+            reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        .post_mix = static_cast<const float*>(post_mix.data_ptr()),
+        .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
+        .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .local_num_tokens = static_cast<uint32_t>(L.unwrap()),
+        .local_row_offset = static_cast<uint32_t>(local_row_offset),
+    };
+    const auto params = Tp4MoeLocalSliceEpochParams{
+        .post = post_params,
+        .flags0 = reinterpret_cast<uint32_t*>(flags0.data_ptr()),
+        .flags1 = reinterpret_cast<uint32_t*>(flags1.data_ptr()),
+        .flags2 = reinterpret_cast<uint32_t*>(flags2.data_ptr()),
+        .flags3 = reinterpret_cast<uint32_t*>(flags3.data_ptr()),
+        .rank = static_cast<uint32_t>(rank),
+        .slot = static_cast<uint32_t>(slot),
+        .epoch = static_cast<uint32_t>(epoch),
+    };
+
+    const DLDevice dl_device = device.unwrap();
+    int sm_count = 0;
+    int cooperative_launch = 0;
+    int active_blocks_per_sm = 0;
+    RuntimeDeviceCheck(cudaDeviceGetAttribute(
+        &sm_count,
+        cudaDevAttrMultiProcessorCount,
+        dl_device.device_id));
+    RuntimeDeviceCheck(cudaDeviceGetAttribute(
+        &cooperative_launch,
+        cudaDevAttrCooperativeLaunch,
+        dl_device.device_id));
+    RuntimeDeviceCheck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks_per_sm,
+        tp4_moe_local_slice_shared_mhc_post_epoch_kernel,
+        kTp4MoeMhcThreads,
+        0));
+    RuntimeCheck(
+        cooperative_launch != 0,
+        "TP4 local-slice epoch kernel requires cooperative launch");
+    RuntimeCheck(
+        sm_count > 0 && active_blocks_per_sm > 0 &&
+            static_cast<uint64_t>(sm_count) * active_blocks_per_sm >=
+                kTp4OwnerPersistentBlocks,
+        "TP4 local-slice epoch fixed 592-CTA grid is not fully resident "
+        "under this device's SM/occupancy limit");
+
+    auto cooperative_params = params;
+    void* cooperative_args[] = {&cooperative_params};
+    RuntimeDeviceCheck(cudaLaunchCooperativeKernel(
+        reinterpret_cast<const void*>(
+            tp4_moe_local_slice_shared_mhc_post_epoch_kernel),
+        dim3(kTp4OwnerPersistentBlocks),
+        dim3(kTp4MoeMhcThreads),
+        cooperative_args,
+        0,
+        LaunchKernel::resolve_device(dl_device)));
+  }
+
+  static void run_local_slice_shared_epoch_split(
+      const tvm::ffi::TensorView input0,
+      const tvm::ffi::TensorView input1,
+      const tvm::ffi::TensorView input2,
+      const tvm::ffi::TensorView input3,
+      int64_t local_row_offset,
+      const tvm::ffi::TensorView shared_hidden,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView post_mix,
+      const tvm::ffi::TensorView comb_mix,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView flags0,
+      const tvm::ffi::TensorView flags1,
+      const tvm::ffi::TensorView flags2,
+      const tvm::ffi::TensorView flags3,
+      int64_t rank,
+      int64_t slot,
+      int64_t epoch) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto G = SymbolicSize{"global_num_tokens"};
+    auto L = SymbolicSize{"local_num_tokens"};
+    device.set_options<kDLCUDA>();
+
+    for (const auto tensor : {input0, input1, input2, input3}) {
+      TensorMatcher({G, kTp4MoeMhcHidden})
+          .with_strides({kTp4MoeMhcHidden, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .verify(tensor);
+    }
+    TensorMatcher({L, kTp4MoeMhcHidden})
+        .with_strides({kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(shared_hidden);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(residual);
+    TensorMatcher({L, kTp4MoeMhcHC})
+        .with_strides({kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(post_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHC})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHC, kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(comb_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+    for (const auto flags : {flags0, flags1, flags2, flags3}) {
+      TensorMatcher({kTp4MoeEpochFlagCount})
+          .with_strides({1})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(flags);
+    }
+
+    RuntimeCheck(
+        G.unwrap() >= 4096 && G.unwrap() <= 131072 &&
+            G.unwrap() % 4096 == 0,
+        "TP4 split-epoch local-slice MoE/mHC requires global_M in "
+        "[4096,131072] and divisible by 4096");
+    RuntimeCheck(
+        L.unwrap() >= 4096 && L.unwrap() <= 32768 &&
+            L.unwrap() % 4096 == 0,
+        "TP4 split-epoch local-slice MoE/mHC requires local_M in "
+        "[4096,32768] and divisible by 4096");
+    RuntimeCheck(
+        local_row_offset >= 0 && local_row_offset <= G.unwrap() &&
+            local_row_offset % 4096 == 0 &&
+            L.unwrap() <= G.unwrap() - local_row_offset,
+        "TP4 split-epoch local-slice MoE/mHC requires a 4096-row-aligned "
+        "in-bounds local interval");
+    RuntimeCheck(rank >= 0 && rank < 4, "TP4 split epoch rank must be in [0,4)");
+    RuntimeCheck(
+        slot == 0 || slot == 1, "TP4 split epoch slot must be 0 or 1");
+    RuntimeCheck(
+        epoch > 0 && epoch <= 0xffffffffLL,
+        "TP4 split ready/done epoch must be in [1,UINT32_MAX]");
+    RuntimeCheck(
+        !kUsePDL, "TP4 split epoch synchronization does not support PDL");
+
+    const auto post_params = Tp4MoeLocalSliceMhcPostParams{
+        .input0 = reinterpret_cast<const __nv_bfloat16*>(input0.data_ptr()),
+        .input1 = reinterpret_cast<const __nv_bfloat16*>(input1.data_ptr()),
+        .input2 = reinterpret_cast<const __nv_bfloat16*>(input2.data_ptr()),
+        .input3 = reinterpret_cast<const __nv_bfloat16*>(input3.data_ptr()),
+        .multicast_input = nullptr,
+        .shared_hidden = reinterpret_cast<const __nv_bfloat16*>(
+            shared_hidden.data_ptr()),
+        .residual =
+            reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        .post_mix = static_cast<const float*>(post_mix.data_ptr()),
+        .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
+        .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .local_num_tokens = static_cast<uint32_t>(L.unwrap()),
+        .local_row_offset = static_cast<uint32_t>(local_row_offset),
+    };
+    const auto control_params = Tp4MoeEpochControlParams{
+        .flags0 = reinterpret_cast<uint32_t*>(flags0.data_ptr()),
+        .flags1 = reinterpret_cast<uint32_t*>(flags1.data_ptr()),
+        .flags2 = reinterpret_cast<uint32_t*>(flags2.data_ptr()),
+        .flags3 = reinterpret_cast<uint32_t*>(flags3.data_ptr()),
+        .rank = static_cast<uint32_t>(rank),
+        .slot = static_cast<uint32_t>(slot),
+        .epoch = static_cast<uint32_t>(epoch),
+    };
+    const DLDevice dl_device = device.unwrap();
+    LaunchKernel(1, 32, dl_device)(
+        tp4_moe_publish_ready_wait_kernel, control_params);
+    LaunchKernel(L.unwrap(), kTp4MoeMhcThreads, dl_device)(
+        tp4_moe_local_slice_shared_mhc_post_kernel<false>, post_params);
+    LaunchKernel(1, 32, dl_device)(
+        tp4_moe_publish_done_kernel, control_params);
+  }
+
+  static void run_local_slice_shared_epoch_counter(
+      const tvm::ffi::TensorView input0,
+      const tvm::ffi::TensorView input1,
+      const tvm::ffi::TensorView input2,
+      const tvm::ffi::TensorView input3,
+      int64_t local_row_offset,
+      const tvm::ffi::TensorView shared_hidden,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView post_mix,
+      const tvm::ffi::TensorView comb_mix,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView flags0,
+      const tvm::ffi::TensorView flags1,
+      const tvm::ffi::TensorView flags2,
+      const tvm::ffi::TensorView flags3,
+      const tvm::ffi::TensorView completion_state,
+      int64_t rank,
+      int64_t slot,
+      int64_t epoch) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto G = SymbolicSize{"global_num_tokens"};
+    auto L = SymbolicSize{"local_num_tokens"};
+    device.set_options<kDLCUDA>();
+
+    for (const auto tensor : {input0, input1, input2, input3}) {
+      TensorMatcher({G, kTp4MoeMhcHidden})
+          .with_strides({kTp4MoeMhcHidden, 1})
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .verify(tensor);
+    }
+    TensorMatcher({L, kTp4MoeMhcHidden})
+        .with_strides({kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(shared_hidden);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(residual);
+    TensorMatcher({L, kTp4MoeMhcHC})
+        .with_strides({kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(post_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHC})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHC, kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(comb_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+    for (const auto flags : {flags0, flags1, flags2, flags3}) {
+      TensorMatcher({kTp4MoeEpochFlagCount})
+          .with_strides({1})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(flags);
+    }
+    TensorMatcher({2})
+        .with_strides({1})
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(completion_state);
+
+    RuntimeCheck(
+        G.unwrap() >= 4096 && G.unwrap() <= 131072 &&
+            G.unwrap() % 4096 == 0,
+        "TP4 counter-epoch local-slice MoE/mHC requires global_M in "
+        "[4096,131072] and divisible by 4096");
+    RuntimeCheck(
+        L.unwrap() >= 4096 && L.unwrap() <= 32768 &&
+            L.unwrap() % 4096 == 0,
+        "TP4 counter-epoch local-slice MoE/mHC requires local_M in "
+        "[4096,32768] and divisible by 4096");
+    RuntimeCheck(
+        local_row_offset >= 0 && local_row_offset <= G.unwrap() &&
+            local_row_offset % 4096 == 0 &&
+            L.unwrap() <= G.unwrap() - local_row_offset,
+        "TP4 counter-epoch local-slice MoE/mHC requires a 4096-row-aligned "
+        "in-bounds local interval");
+    RuntimeCheck(
+        rank >= 0 && rank < 4, "TP4 counter epoch rank must be in [0,4)");
+    RuntimeCheck(
+        slot == 0 || slot == 1, "TP4 counter epoch slot must be 0 or 1");
+    RuntimeCheck(
+        epoch > 0 && epoch <= 0xffffffffLL,
+        "TP4 counter ready/done epoch must be in [1,UINT32_MAX]");
+    RuntimeCheck(
+        !kUsePDL, "TP4 counter epoch synchronization does not support PDL");
+
+    const auto post_params = Tp4MoeLocalSliceMhcPostParams{
+        .input0 = reinterpret_cast<const __nv_bfloat16*>(input0.data_ptr()),
+        .input1 = reinterpret_cast<const __nv_bfloat16*>(input1.data_ptr()),
+        .input2 = reinterpret_cast<const __nv_bfloat16*>(input2.data_ptr()),
+        .input3 = reinterpret_cast<const __nv_bfloat16*>(input3.data_ptr()),
+        .multicast_input = nullptr,
+        .shared_hidden = reinterpret_cast<const __nv_bfloat16*>(
+            shared_hidden.data_ptr()),
+        .residual =
+            reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        .post_mix = static_cast<const float*>(post_mix.data_ptr()),
+        .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
+        .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .local_num_tokens = static_cast<uint32_t>(L.unwrap()),
+        .local_row_offset = static_cast<uint32_t>(local_row_offset),
+    };
+    const auto params = Tp4MoeLocalSliceEpochCounterParams{
+        .post = post_params,
+        .flags0 = reinterpret_cast<uint32_t*>(flags0.data_ptr()),
+        .flags1 = reinterpret_cast<uint32_t*>(flags1.data_ptr()),
+        .flags2 = reinterpret_cast<uint32_t*>(flags2.data_ptr()),
+        .flags3 = reinterpret_cast<uint32_t*>(flags3.data_ptr()),
+        .completion_state = reinterpret_cast<unsigned long long*>(
+            completion_state.data_ptr()),
+        .rank = static_cast<uint32_t>(rank),
+        .slot = static_cast<uint32_t>(slot),
+        .epoch = static_cast<uint32_t>(epoch),
+    };
+    LaunchKernel(
+        kTp4OwnerPersistentBlocks, kTp4MoeMhcThreads, device.unwrap())(
+        tp4_moe_local_slice_shared_mhc_post_epoch_counter_kernel<false>,
+        params);
+  }
+
+  static void run_local_slice_shared_epoch_counter_multimem(
+      int64_t multicast_local_ptr,
+      const tvm::ffi::TensorView local_partial_anchor,
+      int64_t local_row_offset,
+      const tvm::ffi::TensorView shared_hidden,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView post_mix,
+      const tvm::ffi::TensorView comb_mix,
+      const tvm::ffi::TensorView output,
+      const tvm::ffi::TensorView flags0,
+      const tvm::ffi::TensorView flags1,
+      const tvm::ffi::TensorView flags2,
+      const tvm::ffi::TensorView flags3,
+      const tvm::ffi::TensorView completion_state,
+      int64_t rank,
+      int64_t slot,
+      int64_t epoch) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto G = SymbolicSize{"global_num_tokens"};
+    auto L = SymbolicSize{"local_num_tokens"};
+    device.set_options<kDLCUDA>();
+
+    // The anchor is the selected local unicast slot written by FlashInfer.
+    // It is intentionally not read by the kernel: it gives the custom-op ABI
+    // a real tensor dependency, holds the symmetric allocation alive, and
+    // supplies the global-M/device contract for the raw multicast VA.
+    TensorMatcher({G, kTp4MoeMhcHidden})
+        .with_strides({kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(local_partial_anchor);
+    TensorMatcher({L, kTp4MoeMhcHidden})
+        .with_strides({kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(shared_hidden);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(residual);
+    TensorMatcher({L, kTp4MoeMhcHC})
+        .with_strides({kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(post_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHC})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHC, kTp4MoeMhcHC, 1})
+        .with_dtype<float>()
+        .with_device(device)
+        .verify(comb_mix);
+    TensorMatcher({L, kTp4MoeMhcHC, kTp4MoeMhcHidden})
+        .with_strides(
+            {kTp4MoeMhcHC * kTp4MoeMhcHidden, kTp4MoeMhcHidden, 1})
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(output);
+    for (const auto flags : {flags0, flags1, flags2, flags3}) {
+      TensorMatcher({kTp4MoeEpochFlagCount})
+          .with_strides({1})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .verify(flags);
+    }
+    TensorMatcher({2})
+        .with_strides({1})
+        .with_dtype<int64_t>()
+        .with_device(device)
+        .verify(completion_state);
+
+    RuntimeCheck(
+        multicast_local_ptr > 0 && (multicast_local_ptr & 0xF) == 0,
+        "TP4 NVLS local-slice MoE/mHC requires a positive 16-byte aligned "
+        "multicast VA");
+    RuntimeCheck(
+        G.unwrap() >= 4096 && G.unwrap() <= 131072 &&
+            G.unwrap() % 4096 == 0,
+        "TP4 NVLS counter-epoch requires global_M in [4096,131072] and "
+        "divisible by 4096");
+    RuntimeCheck(
+        L.unwrap() >= 4096 && L.unwrap() <= 32768 &&
+            L.unwrap() % 4096 == 0,
+        "TP4 NVLS counter-epoch requires local_M in [4096,32768] and "
+        "divisible by 4096");
+    RuntimeCheck(
+        local_row_offset >= 0 && local_row_offset <= G.unwrap() &&
+            local_row_offset % 4096 == 0 &&
+            L.unwrap() <= G.unwrap() - local_row_offset,
+        "TP4 NVLS counter-epoch requires a 4096-row-aligned in-bounds "
+        "local interval");
+    RuntimeCheck(
+        rank >= 0 && rank < 4,
+        "TP4 NVLS counter epoch rank must be in [0,4)");
+    RuntimeCheck(
+        slot == 0 || slot == 1,
+        "TP4 NVLS counter epoch slot must be 0 or 1");
+    RuntimeCheck(
+        epoch > 0 && epoch <= 0xffffffffLL,
+        "TP4 NVLS counter ready/done epoch must be in [1,UINT32_MAX]");
+    RuntimeCheck(
+        !kUsePDL,
+        "TP4 NVLS counter epoch synchronization does not support PDL");
+
+    const auto post_params = Tp4MoeLocalSliceMhcPostParams{
+        .input0 = nullptr,
+        .input1 = nullptr,
+        .input2 = nullptr,
+        .input3 = nullptr,
+        .multicast_input = reinterpret_cast<const __nv_bfloat16*>(
+            static_cast<uintptr_t>(multicast_local_ptr)),
+        .shared_hidden = reinterpret_cast<const __nv_bfloat16*>(
+            shared_hidden.data_ptr()),
+        .residual =
+            reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
+        .post_mix = static_cast<const float*>(post_mix.data_ptr()),
+        .comb_mix = static_cast<const float*>(comb_mix.data_ptr()),
+        .output = reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+        .local_num_tokens = static_cast<uint32_t>(L.unwrap()),
+        .local_row_offset = static_cast<uint32_t>(local_row_offset),
+    };
+    const auto params = Tp4MoeLocalSliceEpochCounterParams{
+        .post = post_params,
+        .flags0 = reinterpret_cast<uint32_t*>(flags0.data_ptr()),
+        .flags1 = reinterpret_cast<uint32_t*>(flags1.data_ptr()),
+        .flags2 = reinterpret_cast<uint32_t*>(flags2.data_ptr()),
+        .flags3 = reinterpret_cast<uint32_t*>(flags3.data_ptr()),
+        .completion_state = reinterpret_cast<unsigned long long*>(
+            completion_state.data_ptr()),
+        .rank = static_cast<uint32_t>(rank),
+        .slot = static_cast<uint32_t>(slot),
+        .epoch = static_cast<uint32_t>(epoch),
+    };
+    LaunchKernel(
+        kTp4OwnerPersistentBlocks, kTp4MoeMhcThreads, device.unwrap())(
+        tp4_moe_local_slice_shared_mhc_post_epoch_counter_kernel<true>,
+        params);
   }
 
   static void run_multimem(

@@ -2187,6 +2187,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         routed_x_quant=None,
         huge_fused_moe_post: bool = False,
         defer_shared_expert_add: bool = False,
+        defer_dp_output_combine: bool = False,
         dp_packed_route_output: Optional[torch.Tensor] = None,
         dp_routed_quant_output: Optional[
             tuple[torch.Tensor, torch.Tensor]
@@ -2203,6 +2204,27 @@ class DeepseekV4DecoderLayer(nn.Module):
             and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
+        )
+        if defer_dp_output_combine and (
+            get_server_args().dsv4_worker_backend != "huge_kernel"
+            or _use_cp
+            or get_parallel().attn_dp_size != 4
+            or not _use_tp_moe_gather
+            or not should_use_dp_reduce_scatterv()
+            or not get_moe_a2a_backend().is_none()
+            or _use_tp_attn_a2a_scatter
+        ):
+            raise RuntimeError(
+                "deferred DP output combine requires Huge attention-DP4 with "
+                "TP-MoE gather, reduce_scatterv combine, and no CP or A2A "
+                "gather-scatter"
+            )
+        # A deferred DP combine necessarily leaves the replicated TP1 shared
+        # expert local as well: it cannot be added to a global-M TP partial.
+        # Reuse the existing alternate-stream lifetime protocol and return it
+        # beside the global partial for the downstream fused combine/epilogue.
+        _defer_shared_expert_add = (
+            defer_shared_expert_add or defer_dp_output_combine
         )
         if defer_shared_expert_add and (
             get_server_args().dsv4_worker_backend != "huge_kernel"
@@ -2248,7 +2270,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         unsupported_shared_prequant = shared_x_quant is not None and (
             _use_cp
             or _use_tp_attn_a2a_scatter
-            or (_use_tp_moe_gather and not defer_shared_expert_add)
+            or (_use_tp_moe_gather and not _defer_shared_expert_add)
         )
         unsupported_routed_prequant = routed_x_quant is not None and (
             _use_cp
@@ -2299,6 +2321,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             or _use_reduce_scatterv
             or _use_reduce_scatter
             or huge_fused_moe_post
+            or defer_dp_output_combine
         )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
         # on LOCAL hidden before the gather and add it back after the combine
@@ -2428,7 +2451,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # The replicated TP1 shared expert is independent of DP gather
                 # and routed MoE. Issue it on the pre-created model stream and
                 # join only at the fused shared+mHC epilogue.
-                if defer_shared_expert_add and self.mlp.alt_stream is not None:
+                if _defer_shared_expert_add and self.mlp.alt_stream is not None:
                     current_stream = torch.cuda.current_stream()
                     self.mlp.alt_stream.wait_stream(current_stream)
                     with torch.cuda.stream(self.mlp.alt_stream):
@@ -2526,46 +2549,58 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
-            hidden_states, global_hidden_states = (
-                get_local_dp_buffer(get_tp_group()),
-                hidden_states,
-            )
-            if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
-                # SUM the TP-sharded per-rank partial expert outputs AND scatter
-                # each rank its own token slice, in one op. Correct because the
-                # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
-                # This is the symmetric inverse of the all_gatherv gather.
-                get_tp_group().reduce_scatterv(
-                    global_hidden_states,
-                    output=hidden_states,
-                    sizes=get_dp_global_num_tokens(),
-                )
-            elif _use_reduce_scatter:
-                # Equal-chunk reduce_scatter: SUM the TP-sharded per-rank partial
-                # expert outputs AND scatter each rank its own (MAX_LEN-padded)
-                # token chunk in one op (symmetric inverse of the MAX_LEN
-                # all_gather). Correct because the MoE-internal all_reduce was
-                # skipped (mlp_reduce_scatter above). dp_reduce_scatter_tensor
-                # routes to the equal-chunk reduce_scatter_tensor here (its
-                # variable-length reduce_scatterv branch is gated by
-                # is_dp_gatherv_active(), which is False under MAX_LEN), which in
-                # turn uses the aiter custom kernel when it fits (else RCCL).
-                dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
+            global_hidden_states = hidden_states
+            if defer_dp_output_combine:
+                if (
+                    global_hidden_states.ndim != 2
+                    or global_hidden_states.dtype != torch.bfloat16
+                ):
+                    raise RuntimeError(
+                        "deferred DP output combine requires a rank-global "
+                        "2D BF16 MoE partial"
+                    )
+                # Do not acquire or write get_local_dp_buffer here.  The caller
+                # owns the subsequent TP sum + local slicing, normally fused
+                # into the Huge mHC post kernel.
+                hidden_states = global_hidden_states
             else:
-                dp_scatter(hidden_states, global_hidden_states, forward_batch)
+                hidden_states = get_local_dp_buffer(get_tp_group())
+                if should_use_dp_reduce_scatterv() or _use_reduce_scatterv:
+                    # SUM the TP-sharded per-rank partial expert outputs AND scatter
+                    # each rank its own token slice, in one op. Correct because the
+                    # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
+                    # This is the symmetric inverse of the all_gatherv gather.
+                    get_tp_group().reduce_scatterv(
+                        global_hidden_states,
+                        output=hidden_states,
+                        sizes=get_dp_global_num_tokens(),
+                    )
+                elif _use_reduce_scatter:
+                    # Equal-chunk reduce_scatter: SUM the TP-sharded per-rank partial
+                    # expert outputs AND scatter each rank its own (MAX_LEN-padded)
+                    # token chunk in one op (symmetric inverse of the MAX_LEN
+                    # all_gather). Correct because the MoE-internal all_reduce was
+                    # skipped (mlp_reduce_scatter above). dp_reduce_scatter_tensor
+                    # routes to the equal-chunk reduce_scatter_tensor here (its
+                    # variable-length reduce_scatterv branch is gated by
+                    # is_dp_gatherv_active(), which is False under MAX_LEN), which in
+                    # turn uses the aiter custom kernel when it fits (else RCCL).
+                    dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
+                else:
+                    dp_scatter(hidden_states, global_hidden_states, forward_batch)
             # PoC: add the locally-computed shared-expert output to this rank's
             # reduce-scattered / dp-scattered local slice (skipped inside self.mlp
             # above). Covers both prefill (gatherv) and decode (dp_scatter).
             if _shared_local is not None:
                 n = hidden_states.shape[0]
-                if not defer_shared_expert_add:
+                if not _defer_shared_expert_add:
                     hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
-        if defer_shared_expert_add:
+        if _defer_shared_expert_add:
             if _shared_local_stream is not None:
                 current_stream = torch.cuda.current_stream()
                 current_stream.wait_stream(_shared_local_stream)

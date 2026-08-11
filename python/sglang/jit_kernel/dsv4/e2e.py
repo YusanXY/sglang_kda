@@ -241,7 +241,9 @@ def mhc_post_vec8_ready(
 def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
     args = make_cpp_args(use_pdl)
     return load_jit(
-        make_name("tp4_moe_mhc_post_hc4_h4096_owner_v59b_leader_epoch"),
+        make_name(
+            "tp4_moe_mhc_post_hc4_h4096_owner_v65_nvls_local_epoch"
+        ),
         *args,
         cuda_files=["deepseek_v4/tp4_moe_mhc_post.cuh"],
         cuda_wrappers=[
@@ -261,6 +263,30 @@ def _jit_tp4_moe_mhc_post_module(use_pdl: bool) -> Module:
             (
                 "run_owner_persistent",
                 f"Tp4MoeMhcPostKernel<{args}>::run_owner_persistent",
+            ),
+            (
+                "run_local_slice_shared",
+                f"Tp4MoeMhcPostKernel<{args}>::run_local_slice_shared",
+            ),
+            (
+                "run_wait_slot_reusable",
+                f"Tp4MoeMhcPostKernel<{args}>::run_wait_slot_reusable",
+            ),
+            (
+                "run_local_slice_shared_epoch",
+                f"Tp4MoeMhcPostKernel<{args}>::run_local_slice_shared_epoch",
+            ),
+            (
+                "run_local_slice_shared_epoch_split",
+                f"Tp4MoeMhcPostKernel<{args}>::run_local_slice_shared_epoch_split",
+            ),
+            (
+                "run_local_slice_shared_epoch_counter",
+                f"Tp4MoeMhcPostKernel<{args}>::run_local_slice_shared_epoch_counter",
+            ),
+            (
+                "run_local_slice_shared_epoch_counter_multimem",
+                f"Tp4MoeMhcPostKernel<{args}>::run_local_slice_shared_epoch_counter_multimem",
             ),
         ],
         extra_cuda_cflags=["--use_fast_math"],
@@ -297,6 +323,259 @@ def _tp4_moe_mhc_post_custom_op(
         post_mix,
         comb_mix,
         output,
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_moe_local_slice_shared_mhc_post",
+    mutates_args=["output"],
+)
+def _tp4_moe_local_slice_shared_mhc_post_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_local_slice_shared(
+        input0,
+        input1,
+        input2,
+        input3,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_moe_wait_slot_reusable",
+    # The kernel only reads the flags, but declaring the peer epochs mutable
+    # keeps this stream-ordering side effect visible to the dispatcher.
+    mutates_args=["flags0", "flags1", "flags2", "flags3"],
+)
+def _tp4_moe_wait_slot_reusable_custom_op(
+    flags0: torch.Tensor,
+    flags1: torch.Tensor,
+    flags2: torch.Tensor,
+    flags3: torch.Tensor,
+    slot: int,
+    expected_done_epoch: int,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_wait_slot_reusable(
+        flags0,
+        flags1,
+        flags2,
+        flags3,
+        slot,
+        expected_done_epoch,
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_moe_local_slice_shared_mhc_post_epoch",
+    mutates_args=["output", "flags0", "flags1", "flags2", "flags3"],
+)
+def _tp4_moe_local_slice_shared_mhc_post_epoch_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    flags0: torch.Tensor,
+    flags1: torch.Tensor,
+    flags2: torch.Tensor,
+    flags3: torch.Tensor,
+    rank: int,
+    slot: int,
+    epoch: int,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_local_slice_shared_epoch(
+        input0,
+        input1,
+        input2,
+        input3,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        flags0,
+        flags1,
+        flags2,
+        flags3,
+        rank,
+        slot,
+        epoch,
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_moe_local_slice_shared_mhc_post_epoch_split",
+    mutates_args=["output", "flags0", "flags1", "flags2", "flags3"],
+)
+def _tp4_moe_local_slice_shared_mhc_post_epoch_split_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    flags0: torch.Tensor,
+    flags1: torch.Tensor,
+    flags2: torch.Tensor,
+    flags3: torch.Tensor,
+    rank: int,
+    slot: int,
+    epoch: int,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_local_slice_shared_epoch_split(
+        input0,
+        input1,
+        input2,
+        input3,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        flags0,
+        flags1,
+        flags2,
+        flags3,
+        rank,
+        slot,
+        epoch,
+    )
+
+
+@register_custom_op(
+    op_name="dsv4_tp4_moe_local_slice_shared_mhc_post_epoch_counter",
+    mutates_args=[
+        "output",
+        "flags0",
+        "flags1",
+        "flags2",
+        "flags3",
+        "completion_state",
+    ],
+)
+def _tp4_moe_local_slice_shared_mhc_post_epoch_counter_custom_op(
+    input0: torch.Tensor,
+    input1: torch.Tensor,
+    input2: torch.Tensor,
+    input3: torch.Tensor,
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    flags0: torch.Tensor,
+    flags1: torch.Tensor,
+    flags2: torch.Tensor,
+    flags3: torch.Tensor,
+    completion_state: torch.Tensor,
+    rank: int,
+    slot: int,
+    epoch: int,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_local_slice_shared_epoch_counter(
+        input0,
+        input1,
+        input2,
+        input3,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        flags0,
+        flags1,
+        flags2,
+        flags3,
+        completion_state,
+        rank,
+        slot,
+        epoch,
+    )
+
+
+@register_custom_op(
+    op_name=(
+        "dsv4_tp4_moe_local_slice_shared_mhc_post_"
+        "epoch_counter_multimem"
+    ),
+    mutates_args=[
+        "output",
+        "flags0",
+        "flags1",
+        "flags2",
+        "flags3",
+        "completion_state",
+    ],
+)
+def _tp4_moe_local_slice_shared_mhc_post_epoch_counter_multimem_custom_op(
+    multicast_local_ptr: int,
+    local_partial_anchor: torch.Tensor,
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    flags0: torch.Tensor,
+    flags1: torch.Tensor,
+    flags2: torch.Tensor,
+    flags3: torch.Tensor,
+    completion_state: torch.Tensor,
+    rank: int,
+    slot: int,
+    epoch: int,
+) -> None:
+    module = _jit_tp4_moe_mhc_post_module(False)
+    module.run_local_slice_shared_epoch_counter_multimem(
+        multicast_local_ptr,
+        local_partial_anchor,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        flags0,
+        flags1,
+        flags2,
+        flags3,
+        completion_state,
+        rank,
+        slot,
+        epoch,
     )
 
 
@@ -454,6 +733,799 @@ def tp4_moe_mhc_post(
         post_mix,
         comb_mix,
         output,
+    )
+    return output
+
+
+@debug_kernel_api
+def tp4_moe_local_slice_shared_mhc_post(
+    partials: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Reduce one Attention-DP row slice and fuse shared add + mHC post.
+
+    ``partials`` are the four peer-visible TP partials in global token order.
+    All remaining tensors use the rank-local row order.  The explicit offset
+    keeps NCCL's BF16 channel-dependent addition order reproducible without a
+    Host-side slice or a reduced ``[local_M, 4096]`` intermediate.
+    """
+
+    if not isinstance(partials, tuple) or len(partials) != 4:
+        raise RuntimeError(
+            "TP4 local-slice fused MoE/mHC post requires four partials"
+        )
+    tensors = (
+        *partials,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+    if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise RuntimeError(
+            "TP4 local-slice fused MoE/mHC post accepts only torch tensors"
+        )
+    if not isinstance(local_row_offset, int) or isinstance(
+        local_row_offset, bool
+    ):
+        raise RuntimeError(
+            "TP4 local-slice fused MoE/mHC post offset must be an integer"
+        )
+
+    if partials[0].ndim != 2 or partials[0].shape[1] != 4096:
+        raise RuntimeError(
+            "TP4 local-slice partials must be contiguous CUDA BF16 "
+            "[global_M,4096]"
+        )
+    global_m = partials[0].shape[0]
+    if (
+        global_m < 4096
+        or global_m > 131072
+        or global_m % 4096 != 0
+    ):
+        raise RuntimeError(
+            "TP4 local-slice fused MoE/mHC post requires global_M in "
+            "[4096,131072] and divisible by 4096"
+        )
+    if shared_hidden.ndim != 2 or shared_hidden.shape[1] != 4096:
+        raise RuntimeError(
+            "TP4 local-slice shared_hidden must be contiguous CUDA BF16 "
+            "[local_M,4096]"
+        )
+    local_m = shared_hidden.shape[0]
+    if local_m < 4096 or local_m > 32768 or local_m % 4096 != 0:
+        raise RuntimeError(
+            "TP4 local-slice fused MoE/mHC post requires local_M in "
+            "[4096,32768] and divisible by 4096"
+        )
+    if (
+        local_row_offset < 0
+        or local_row_offset % 4096 != 0
+        or local_row_offset + local_m > global_m
+    ):
+        raise RuntimeError(
+            "TP4 local-slice fused MoE/mHC post requires a 4096-row-aligned "
+            "in-bounds local interval"
+        )
+
+    expected = (
+        *((tensor, (global_m, 4096), torch.bfloat16) for tensor in partials),
+        (shared_hidden, (local_m, 4096), torch.bfloat16),
+        (residual, (local_m, 4, 4096), torch.bfloat16),
+        (post_mix, (local_m, 4), torch.float32),
+        (comb_mix, (local_m, 4, 4), torch.float32),
+        (output, (local_m, 4, 4096), torch.bfloat16),
+    )
+    device = shared_hidden.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid TP4 local-slice fused MoE/mHC tensor: expected "
+                f"contiguous {shape} {dtype}, got {tuple(tensor.shape)} "
+                f"{tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError(
+                "all TP4 local-slice fused MoE/mHC tensors must share one "
+                "CUDA device"
+            )
+
+    _tp4_moe_local_slice_shared_mhc_post_custom_op(
+        *partials,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+    return output
+
+
+def _validate_tp4_moe_epoch_flags(
+    flags: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    device: torch.device | None = None,
+) -> torch.device:
+    if not isinstance(flags, tuple) or len(flags) != 4:
+        raise RuntimeError("TP4 MoE epoch protocol requires four peer flags")
+    if any(not isinstance(flag, torch.Tensor) for flag in flags):
+        raise RuntimeError("TP4 MoE epoch flags must be torch tensors")
+    if device is None:
+        device = flags[0].device
+    for flag in flags:
+        if (
+            flag.shape != (4,)
+            or flag.dtype != torch.int32
+            or not flag.is_contiguous()
+        ):
+            raise RuntimeError(
+                "TP4 MoE epoch flags must be contiguous CUDA int32 [4]"
+            )
+        if device.type != "cuda" or flag.device != device:
+            raise RuntimeError(
+                "all TP4 MoE epoch flags must share the operation's CUDA "
+                "device"
+            )
+    return device
+
+
+@debug_kernel_api
+def tp4_moe_wait_slot_reusable(
+    flags: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    slot: int,
+    expected_done_epoch: int,
+) -> None:
+    """Hold this stream until all peers finished reading one producer slot.
+
+    ``expected_done_epoch == 0`` is the first-use sentinel.  The CUDA kernel
+    returns immediately for it, so initialization needs no Host-side branch or
+    peer synchronization.
+    """
+
+    _validate_tp4_moe_epoch_flags(flags)
+    if not isinstance(slot, int) or isinstance(slot, bool) or slot not in (0, 1):
+        raise RuntimeError("TP4 MoE epoch slot must be integer 0 or 1")
+    if (
+        not isinstance(expected_done_epoch, int)
+        or isinstance(expected_done_epoch, bool)
+        or expected_done_epoch < 0
+        or expected_done_epoch > 0xFFFFFFFF
+    ):
+        raise RuntimeError(
+            "TP4 MoE expected done epoch must be an integer in "
+            "[0,UINT32_MAX]"
+        )
+    _tp4_moe_wait_slot_reusable_custom_op(
+        *flags,
+        slot,
+        expected_done_epoch,
+    )
+
+
+@debug_kernel_api
+def tp4_moe_local_slice_shared_mhc_post_epoch(
+    partials: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    flags: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    rank: int,
+    slot: int,
+    epoch: int,
+) -> torch.Tensor:
+    """GPU-publish, peer-wait, local-slice combine and publish completion.
+
+    This strict cooperative path is the epoch-managed counterpart of
+    :func:`tp4_moe_local_slice_shared_mhc_post`.  It retains the bring-up ABI
+    and makes producer readiness plus slot lifetime entirely GPU-resident.
+    """
+
+    if not isinstance(partials, tuple) or len(partials) != 4:
+        raise RuntimeError(
+            "TP4 epoch local-slice fused MoE/mHC post requires four partials"
+        )
+    tensors = (
+        *partials,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+    if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise RuntimeError(
+            "TP4 epoch local-slice fused MoE/mHC post accepts only torch "
+            "tensors"
+        )
+    if not isinstance(local_row_offset, int) or isinstance(
+        local_row_offset, bool
+    ):
+        raise RuntimeError(
+            "TP4 epoch local-slice fused MoE/mHC post offset must be an "
+            "integer"
+        )
+    if partials[0].ndim != 2 or partials[0].shape[1] != 4096:
+        raise RuntimeError(
+            "TP4 epoch local-slice partials must be contiguous CUDA BF16 "
+            "[global_M,4096]"
+        )
+    global_m = partials[0].shape[0]
+    if (
+        global_m < 4096
+        or global_m > 131072
+        or global_m % 4096 != 0
+    ):
+        raise RuntimeError(
+            "TP4 epoch local-slice fused MoE/mHC post requires global_M in "
+            "[4096,131072] and divisible by 4096"
+        )
+    if shared_hidden.ndim != 2 or shared_hidden.shape[1] != 4096:
+        raise RuntimeError(
+            "TP4 epoch local-slice shared_hidden must be contiguous CUDA "
+            "BF16 [local_M,4096]"
+        )
+    local_m = shared_hidden.shape[0]
+    if local_m < 4096 or local_m > 32768 or local_m % 4096 != 0:
+        raise RuntimeError(
+            "TP4 epoch local-slice fused MoE/mHC post requires local_M in "
+            "[4096,32768] and divisible by 4096"
+        )
+    if (
+        local_row_offset < 0
+        or local_row_offset % 4096 != 0
+        or local_row_offset + local_m > global_m
+    ):
+        raise RuntimeError(
+            "TP4 epoch local-slice fused MoE/mHC post requires a "
+            "4096-row-aligned in-bounds local interval"
+        )
+
+    expected = (
+        *((tensor, (global_m, 4096), torch.bfloat16) for tensor in partials),
+        (shared_hidden, (local_m, 4096), torch.bfloat16),
+        (residual, (local_m, 4, 4096), torch.bfloat16),
+        (post_mix, (local_m, 4), torch.float32),
+        (comb_mix, (local_m, 4, 4), torch.float32),
+        (output, (local_m, 4, 4096), torch.bfloat16),
+    )
+    device = shared_hidden.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid TP4 epoch local-slice fused MoE/mHC tensor: "
+                f"expected contiguous {shape} {dtype}, got "
+                f"{tuple(tensor.shape)} {tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError(
+                "all TP4 epoch local-slice fused MoE/mHC tensors must share "
+                "one CUDA device"
+            )
+    _validate_tp4_moe_epoch_flags(flags, device)
+
+    for value, name, valid in (
+        (rank, "rank", lambda item: item in range(4)),
+        (slot, "slot", lambda item: item in (0, 1)),
+        (epoch, "epoch", lambda item: 1 <= item <= 0xFFFFFFFF),
+    ):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not valid(value)
+        ):
+            raise RuntimeError(f"invalid TP4 MoE epoch {name}: {value!r}")
+
+    _tp4_moe_local_slice_shared_mhc_post_epoch_custom_op(
+        *partials,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        *flags,
+        rank,
+        slot,
+        epoch,
+    )
+    return output
+
+
+@debug_kernel_api
+def tp4_moe_local_slice_shared_mhc_post_epoch_split(
+    partials: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    flags: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    rank: int,
+    slot: int,
+    epoch: int,
+) -> torch.Tensor:
+    """GPU epoch protocol using non-cooperative stream-ordered CUDA stages.
+
+    One custom-op call launches ready/wait, the ordinary high-throughput fused
+    data kernel, and done publication.  The data kernel therefore keeps its
+    one-CTA-per-token schedule instead of paying cooperative-grid barriers.
+    """
+
+    if not isinstance(partials, tuple) or len(partials) != 4:
+        raise RuntimeError(
+            "TP4 split-epoch local-slice fused MoE/mHC post requires four "
+            "partials"
+        )
+    tensors = (
+        *partials,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+    if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise RuntimeError(
+            "TP4 split-epoch local-slice fused MoE/mHC post accepts only "
+            "torch tensors"
+        )
+    if not isinstance(local_row_offset, int) or isinstance(
+        local_row_offset, bool
+    ):
+        raise RuntimeError(
+            "TP4 split-epoch local-slice offset must be an integer"
+        )
+    if partials[0].ndim != 2 or partials[0].shape[1] != 4096:
+        raise RuntimeError(
+            "TP4 split-epoch partials must be contiguous CUDA BF16 "
+            "[global_M,4096]"
+        )
+    global_m = partials[0].shape[0]
+    if global_m < 4096 or global_m > 131072 or global_m % 4096 != 0:
+        raise RuntimeError(
+            "TP4 split-epoch requires global_M in [4096,131072] and "
+            "divisible by 4096"
+        )
+    if shared_hidden.ndim != 2 or shared_hidden.shape[1] != 4096:
+        raise RuntimeError(
+            "TP4 split-epoch shared_hidden must be contiguous CUDA BF16 "
+            "[local_M,4096]"
+        )
+    local_m = shared_hidden.shape[0]
+    if local_m < 4096 or local_m > 32768 or local_m % 4096 != 0:
+        raise RuntimeError(
+            "TP4 split-epoch requires local_M in [4096,32768] and "
+            "divisible by 4096"
+        )
+    if (
+        local_row_offset < 0
+        or local_row_offset % 4096 != 0
+        or local_row_offset + local_m > global_m
+    ):
+        raise RuntimeError(
+            "TP4 split-epoch requires a 4096-row-aligned in-bounds local "
+            "interval"
+        )
+    expected = (
+        *((tensor, (global_m, 4096), torch.bfloat16) for tensor in partials),
+        (shared_hidden, (local_m, 4096), torch.bfloat16),
+        (residual, (local_m, 4, 4096), torch.bfloat16),
+        (post_mix, (local_m, 4), torch.float32),
+        (comb_mix, (local_m, 4, 4), torch.float32),
+        (output, (local_m, 4, 4096), torch.bfloat16),
+    )
+    device = shared_hidden.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid TP4 split-epoch local-slice fused MoE/mHC tensor: "
+                f"expected contiguous {shape} {dtype}, got "
+                f"{tuple(tensor.shape)} {tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError(
+                "all TP4 split-epoch fused MoE/mHC tensors must share one "
+                "CUDA device"
+            )
+    _validate_tp4_moe_epoch_flags(flags, device)
+    for value, name, valid in (
+        (rank, "rank", lambda item: item in range(4)),
+        (slot, "slot", lambda item: item in (0, 1)),
+        (epoch, "epoch", lambda item: 1 <= item <= 0xFFFFFFFF),
+    ):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not valid(value)
+        ):
+            raise RuntimeError(f"invalid TP4 split MoE epoch {name}: {value!r}")
+
+    _tp4_moe_local_slice_shared_mhc_post_epoch_split_custom_op(
+        *partials,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        *flags,
+        rank,
+        slot,
+        epoch,
+    )
+    return output
+
+
+@debug_kernel_api
+def tp4_moe_local_slice_shared_mhc_post_epoch_counter(
+    partials: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    flags: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    completion_state: torch.Tensor,
+    rank: int,
+    slot: int,
+    epoch: int,
+) -> torch.Tensor:
+    """Double-buffered single-kernel GPU epoch consumer.
+
+    A local 64-bit CTA counter replaces cooperative grid barriers.  The last
+    CTA publishes the current slot's done epoch and waits until the alternate
+    slot is reusable, so the next producer needs no standalone wait launch.
+    """
+
+    if not isinstance(partials, tuple) or len(partials) != 4:
+        raise RuntimeError(
+            "TP4 counter-epoch local-slice fused MoE/mHC post requires four "
+            "partials"
+        )
+    tensors = (
+        *partials,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+    if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise RuntimeError(
+            "TP4 counter-epoch local-slice fused MoE/mHC post accepts only "
+            "torch tensors"
+        )
+    if not isinstance(local_row_offset, int) or isinstance(
+        local_row_offset, bool
+    ):
+        raise RuntimeError(
+            "TP4 counter-epoch local-slice offset must be an integer"
+        )
+    if partials[0].ndim != 2 or partials[0].shape[1] != 4096:
+        raise RuntimeError(
+            "TP4 counter-epoch partials must be contiguous CUDA BF16 "
+            "[global_M,4096]"
+        )
+    global_m = partials[0].shape[0]
+    if global_m < 4096 or global_m > 131072 or global_m % 4096 != 0:
+        raise RuntimeError(
+            "TP4 counter-epoch requires global_M in [4096,131072] and "
+            "divisible by 4096"
+        )
+    if shared_hidden.ndim != 2 or shared_hidden.shape[1] != 4096:
+        raise RuntimeError(
+            "TP4 counter-epoch shared_hidden must be contiguous CUDA BF16 "
+            "[local_M,4096]"
+        )
+    local_m = shared_hidden.shape[0]
+    if local_m < 4096 or local_m > 32768 or local_m % 4096 != 0:
+        raise RuntimeError(
+            "TP4 counter-epoch requires local_M in [4096,32768] and "
+            "divisible by 4096"
+        )
+    if (
+        local_row_offset < 0
+        or local_row_offset % 4096 != 0
+        or local_row_offset + local_m > global_m
+    ):
+        raise RuntimeError(
+            "TP4 counter-epoch requires a 4096-row-aligned in-bounds local "
+            "interval"
+        )
+    expected = (
+        *((tensor, (global_m, 4096), torch.bfloat16) for tensor in partials),
+        (shared_hidden, (local_m, 4096), torch.bfloat16),
+        (residual, (local_m, 4, 4096), torch.bfloat16),
+        (post_mix, (local_m, 4), torch.float32),
+        (comb_mix, (local_m, 4, 4), torch.float32),
+        (output, (local_m, 4, 4096), torch.bfloat16),
+    )
+    device = shared_hidden.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid TP4 counter-epoch local-slice fused MoE/mHC tensor: "
+                f"expected contiguous {shape} {dtype}, got "
+                f"{tuple(tensor.shape)} {tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError(
+                "all TP4 counter-epoch fused MoE/mHC tensors must share one "
+                "CUDA device"
+            )
+    _validate_tp4_moe_epoch_flags(flags, device)
+    if (
+        not isinstance(completion_state, torch.Tensor)
+        or completion_state.shape != (2,)
+        or completion_state.dtype != torch.int64
+        or completion_state.device != device
+        or not completion_state.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 counter-epoch completion_state must be contiguous CUDA "
+            "int64 [2] on the data device"
+        )
+    for value, name, valid in (
+        (rank, "rank", lambda item: item in range(4)),
+        (slot, "slot", lambda item: item in (0, 1)),
+        (epoch, "epoch", lambda item: 1 <= item <= 0xFFFFFFFF),
+    ):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not valid(value)
+        ):
+            raise RuntimeError(
+                f"invalid TP4 counter MoE epoch {name}: {value!r}"
+            )
+
+    _tp4_moe_local_slice_shared_mhc_post_epoch_counter_custom_op(
+        *partials,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        *flags,
+        completion_state,
+        rank,
+        slot,
+        epoch,
+    )
+    return output
+
+
+@debug_kernel_api
+def tp4_moe_local_slice_shared_mhc_post_epoch_counter_multimem(
+    multicast_local_ptr: int,
+    local_partial_anchor: torch.Tensor,
+    local_row_offset: int,
+    shared_hidden: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    output: torch.Tensor,
+    flags: Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    completion_state: torch.Tensor,
+    rank: int,
+    slot: int,
+    epoch: int,
+) -> torch.Tensor:
+    """NVLS-reduce a local TP4 slice and fuse shared-add plus mHC post.
+
+    ``multicast_local_ptr`` already identifies the selected physical slot and
+    this rank's first local row.  ``local_partial_anchor`` is the matching
+    unicast tensor written by FlashInfer; it remains an explicit custom-op
+    input for allocator lifetime, stream dependency, global-M, and device
+    validation even though CUDA reads the payload only through multimem PTX.
+    """
+
+    if (
+        not isinstance(multicast_local_ptr, int)
+        or isinstance(multicast_local_ptr, bool)
+        or not 0 < multicast_local_ptr <= 0x7FFFFFFFFFFFFFFF
+        or multicast_local_ptr % 16 != 0
+    ):
+        raise RuntimeError(
+            "TP4 NVLS counter-epoch requires a positive signed-int64 "
+            "16-byte aligned multicast VA"
+        )
+    tensors = (
+        local_partial_anchor,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+    )
+    if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise RuntimeError(
+            "TP4 NVLS counter-epoch local-slice fused MoE/mHC post accepts "
+            "only torch tensors"
+        )
+    if not isinstance(local_row_offset, int) or isinstance(
+        local_row_offset, bool
+    ):
+        raise RuntimeError(
+            "TP4 NVLS counter-epoch local-slice offset must be an integer"
+        )
+    if (
+        local_partial_anchor.ndim != 2
+        or local_partial_anchor.shape[1] != 4096
+    ):
+        raise RuntimeError(
+            "TP4 NVLS counter-epoch anchor must be contiguous CUDA BF16 "
+            "[global_M,4096]"
+        )
+    global_m = local_partial_anchor.shape[0]
+    if global_m < 4096 or global_m > 131072 or global_m % 4096 != 0:
+        raise RuntimeError(
+            "TP4 NVLS counter-epoch requires global_M in [4096,131072] "
+            "and divisible by 4096"
+        )
+    if shared_hidden.ndim != 2 or shared_hidden.shape[1] != 4096:
+        raise RuntimeError(
+            "TP4 NVLS counter-epoch shared_hidden must be contiguous CUDA "
+            "BF16 [local_M,4096]"
+        )
+    local_m = shared_hidden.shape[0]
+    if local_m < 4096 or local_m > 32768 or local_m % 4096 != 0:
+        raise RuntimeError(
+            "TP4 NVLS counter-epoch requires local_M in [4096,32768] and "
+            "divisible by 4096"
+        )
+    if (
+        local_row_offset < 0
+        or local_row_offset % 4096 != 0
+        or local_row_offset + local_m > global_m
+    ):
+        raise RuntimeError(
+            "TP4 NVLS counter-epoch requires a 4096-row-aligned in-bounds "
+            "local interval"
+        )
+    expected = (
+        (local_partial_anchor, (global_m, 4096), torch.bfloat16),
+        (shared_hidden, (local_m, 4096), torch.bfloat16),
+        (residual, (local_m, 4, 4096), torch.bfloat16),
+        (post_mix, (local_m, 4), torch.float32),
+        (comb_mix, (local_m, 4, 4), torch.float32),
+        (output, (local_m, 4, 4096), torch.bfloat16),
+    )
+    device = shared_hidden.device
+    for tensor, shape, dtype in expected:
+        if (
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid TP4 NVLS counter-epoch local-slice fused MoE/mHC "
+                f"tensor: expected contiguous {shape} {dtype}, got "
+                f"{tuple(tensor.shape)} {tensor.dtype}"
+            )
+        if device.type != "cuda" or tensor.device != device:
+            raise RuntimeError(
+                "all TP4 NVLS counter-epoch fused MoE/mHC tensors must "
+                "share one CUDA device"
+            )
+    _validate_tp4_moe_epoch_flags(flags, device)
+    if (
+        not isinstance(completion_state, torch.Tensor)
+        or completion_state.shape != (2,)
+        or completion_state.dtype != torch.int64
+        or completion_state.device != device
+        or not completion_state.is_contiguous()
+    ):
+        raise RuntimeError(
+            "TP4 NVLS counter-epoch completion_state must be contiguous "
+            "CUDA int64 [2] on the data device"
+        )
+    for value, name, valid in (
+        (rank, "rank", lambda item: item in range(4)),
+        (slot, "slot", lambda item: item in (0, 1)),
+        (epoch, "epoch", lambda item: 1 <= item <= 0xFFFFFFFF),
+    ):
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not valid(value)
+        ):
+            raise RuntimeError(
+                f"invalid TP4 NVLS counter MoE epoch {name}: {value!r}"
+            )
+
+    _tp4_moe_local_slice_shared_mhc_post_epoch_counter_multimem_custom_op(
+        multicast_local_ptr,
+        local_partial_anchor,
+        local_row_offset,
+        shared_hidden,
+        residual,
+        post_mix,
+        comb_mix,
+        output,
+        *flags,
+        completion_state,
+        rank,
+        slot,
+        epoch,
     )
     return output
 
@@ -1836,11 +2908,17 @@ __all__ = [
     "tp4_direct_push_bf16_gather",
     "tp4_fused_reduce_push_bf16_gather",
     "tp4_fused_reduce_push_bf16_gather_ready",
+    "tp4_moe_local_slice_shared_mhc_post",
+    "tp4_moe_local_slice_shared_mhc_post_epoch",
+    "tp4_moe_local_slice_shared_mhc_post_epoch_counter",
+    "tp4_moe_local_slice_shared_mhc_post_epoch_counter_multimem",
+    "tp4_moe_local_slice_shared_mhc_post_epoch_split",
     "tp4_moe_mhc_post",
     "tp4_moe_owner_mhc_post",
     "tp4_moe_owner_persistent",
     "tp4_moe_owner_reduce",
     "tp4_moe_mhc_post_multimem",
+    "tp4_moe_wait_slot_reusable",
     "tp4_nccl_ring_bf16_reduce",
     "tp4_peer_pull_wo_b_input_ue8m0",
     "tp4_quantize_local_wo_b_input_ue8m0",

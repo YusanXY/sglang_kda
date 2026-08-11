@@ -58,7 +58,15 @@ def _make_forward_batch(
     )
 
 
-def _make_runtime_with_bound_route_workspace():
+def _make_runtime_with_bound_route_workspace(
+    *,
+    symmetric_moe_post: bool = False,
+    symmetric_rank: int = 0,
+    moe_epoch: bool = False,
+    moe_epoch_split: bool = False,
+    moe_epoch_counter: bool = False,
+    moe_nvls: bool = False,
+):
     runtime = object.__new__(dsv4_whole_layer_runtime.DSV4WholeLayerRuntime)
     route_storage = torch.empty((131072, 6), dtype=torch.int32)
     # Keep the unit fixture small while retaining the production tensor shapes.
@@ -80,6 +88,15 @@ def _make_runtime_with_bound_route_workspace():
     runtime._use_tp4_token_shard_attention = False
     runtime._use_clustered_mqa = False
     runtime._use_dp_local_routing = True
+    runtime._use_dp_symmetric_moe_post = symmetric_moe_post
+    runtime._use_dp_moe_epoch = moe_epoch
+    runtime._use_dp_moe_epoch_split = moe_epoch_split
+    runtime._use_dp_moe_epoch_counter = moe_epoch_counter
+    runtime._use_dp_moe_nvls = moe_nvls
+    runtime._tp4_symmetric_moe_epoch_workspace = None
+    runtime._dp_moe_epoch_layer_count = 2
+    runtime._dp_moe_last_planned_epoch = 0
+    runtime._dp_moe_epoch_poisoned = False
     runtime._use_tp4_local_wob = False
     runtime._dp_packed_route_workspace = (route_storage.device, route_storage)
     runtime._dp_routed_quant_workspace = (
@@ -87,6 +104,55 @@ def _make_runtime_with_bound_route_workspace():
         routed_q_storage,
         routed_scale_storage,
     )
+    if symmetric_moe_post:
+        # One physical row expanded to max capacity keeps this CPU orchestration
+        # fixture small. Production binding is separately inspected to require
+        # a real contiguous symmetric [131072,4096] allocation per rank.
+        partials = tuple(
+            torch.empty((1, 4096), dtype=torch.bfloat16).expand(131072, 4096)
+            for _ in range(4)
+        )
+        if moe_epoch_counter:
+            double_partials = tuple(
+                torch.empty((1, 1, 4096), dtype=torch.bfloat16).expand(
+                    2, 131072, 4096
+                )
+                for _ in range(4)
+            )
+            runtime._tp4_symmetric_moe_workspace = None
+            runtime._tp4_symmetric_moe_epoch_workspace = (
+                double_partials[0].device,
+                SimpleNamespace(barrier=mock.Mock()),
+                double_partials[symmetric_rank],
+                double_partials,
+                symmetric_rank,
+                torch.zeros((2,), dtype=torch.int64),
+                0x100000000 if moe_nvls else 0,
+            )
+        else:
+            runtime._tp4_symmetric_moe_workspace = (
+                partials[0].device,
+                SimpleNamespace(barrier=mock.Mock()),
+                partials[symmetric_rank],
+                partials,
+                symmetric_rank,
+            )
+        if moe_epoch:
+            epoch_flags = tuple(
+                torch.zeros((4,), dtype=torch.int32) for _ in range(4)
+            )
+            runtime._tp4_moe_epoch_flags_workspace = (
+                epoch_flags[0].device,
+                object(),
+                epoch_flags[symmetric_rank],
+                epoch_flags,
+                symmetric_rank,
+            )
+        else:
+            runtime._tp4_moe_epoch_flags_workspace = None
+    else:
+        runtime._tp4_symmetric_moe_workspace = None
+        runtime._tp4_moe_epoch_flags_workspace = None
     runtime._get_wo_a_workspace = mock.Mock(
         return_value=(scratch, scratch, scratch, scratch)
     )
@@ -107,6 +173,7 @@ def _begin_forward(
     *,
     global_sizes: tuple[int, ...] | None = None,
     attn_dp_rank: int = 0,
+    is_graph_capture: bool = False,
 ):
     local_rows = sum(extend_lens)
     forward_batch = _make_forward_batch(
@@ -120,7 +187,9 @@ def _begin_forward(
     attn_backend = SimpleNamespace(forward_metadata=metadata)
 
     with mock.patch.object(
-        dsv4_whole_layer_runtime, "get_is_capture_mode", return_value=False
+        dsv4_whole_layer_runtime,
+        "get_is_capture_mode",
+        return_value=is_graph_capture,
     ), mock.patch.object(
         dsv4_whole_layer_runtime, "get_attn_backend", return_value=attn_backend
     ), mock.patch.object(
@@ -212,25 +281,27 @@ def test_runtime_binds_route_storage_once_outside_the_forward_hot_path():
     assert "routed_quant_workspace[2][:moe_num_tokens]" in begin_source
 
 
-def test_local_route_selection_uses_only_rank_shared_metadata():
+def test_local_route_and_symmetric_post_selection_use_only_rank_shared_metadata():
     begin_source = textwrap.dedent(
         inspect.getsource(
             dsv4_whole_layer_runtime.DSV4WholeLayerRuntime.begin_forward
         )
     )
     begin_tree = ast.parse(begin_source)
-    selection = next(
+    shared_bucket_selection = next(
         node.value
         for node in ast.walk(begin_tree)
         if isinstance(node, ast.Assign)
         and any(
             isinstance(target, ast.Name)
-            and target.id == "use_dp_local_routing"
+            and target.id == "shared_dp_bucket"
             for target in node.targets
         )
     )
     selection_names = {
-        node.id for node in ast.walk(selection) if isinstance(node, ast.Name)
+        node.id
+        for node in ast.walk(shared_bucket_selection)
+        if isinstance(node, ast.Name)
     }
 
     assert "global_dp_sizes" in selection_names
@@ -238,6 +309,27 @@ def test_local_route_selection_uses_only_rank_shared_metadata():
     assert "num_tokens" not in selection_names
     assert "attn_dp_rank" not in selection_names
     assert "get_parallel" not in selection_names
+
+    for selected_name in (
+        "use_dp_local_routing",
+        "use_dp_symmetric_moe_post",
+    ):
+        selection = next(
+            node.value
+            for node in ast.walk(begin_tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == selected_name
+                for target in node.targets
+            )
+        )
+        dynamic_names = {
+            node.id for node in ast.walk(selection) if isinstance(node, ast.Name)
+        }
+        assert "shared_dp_bucket" in dynamic_names
+        assert "num_tokens" not in dynamic_names
+        assert "attn_dp_rank" not in dynamic_names
+        assert "get_parallel" not in dynamic_names
 
 
 def test_runtime_descriptors_reuse_fixed_packed_route_storage_across_buckets():
@@ -328,6 +420,727 @@ def test_selected_tp4_vector_rejects_rank_local_size_mismatch():
             20480,
             global_sizes=(4096, 8192, 4096, 4096),
             attn_dp_rank=1,
+        )
+
+
+def test_symmetric_moe_workspace_is_bound_once_at_max_global_capacity():
+    bind_source = textwrap.dedent(
+        inspect.getsource(
+            dsv4_whole_layer_runtime.DSV4WholeLayerRuntime.bind_after_weight_load
+        )
+    )
+    assert "self._use_dp_symmetric_moe_post" in bind_source
+    assert "self._bind_tp4_symmetric_moe_workspace(workspace_device)" in bind_source
+
+    bind_workspace = getattr(
+        dsv4_whole_layer_runtime.DSV4WholeLayerRuntime,
+        "_bind_tp4_symmetric_moe_workspace",
+    )
+    workspace_source = textwrap.dedent(
+        inspect.getsource(bind_workspace)
+    )
+    assert workspace_source.count("symm_mem.empty(") == 1
+    assert "(_MAX_FORWARD_TOKENS, 4096)" in workspace_source
+    assert "dtype=torch.bfloat16" in workspace_source
+    assert "symm_mem.rendezvous" in workspace_source
+
+
+def test_symmetric_moe_descriptor_uses_rank_shared_vector_and_local_offset():
+    global_sizes = (16384, 16384, 12288, 12288)
+    global_rows = sum(global_sizes)
+    expected_offsets = (0, 16384, 32768, 45056)
+
+    for rank, (local_rows, expected_offset) in enumerate(
+        zip(global_sizes, expected_offsets, strict=True)
+    ):
+        runtime, _ = _make_runtime_with_bound_route_workspace(
+            symmetric_moe_post=True, symmetric_rank=rank
+        )
+        descriptor = _begin_forward(
+            runtime,
+            (4096,) * (local_rows // 4096),
+            global_rows,
+            global_sizes=global_sizes,
+            attn_dp_rank=rank,
+        )
+
+        assert descriptor.dp_symmetric_moe_post_selected
+        assert descriptor.dp_moe_global_num_tokens == global_rows
+        assert descriptor.dp_moe_attention_rank == rank
+        assert descriptor.dp_moe_local_row_offset == expected_offset
+        assert descriptor.moe_partial_local.shape == (global_rows, 4096)
+        assert descriptor.moe_partial_local is descriptor.__getattribute__(
+            f"moe_partial_peer{rank}"
+        )
+        runtime.end_forward(descriptor)
+
+
+@pytest.mark.parametrize(
+    ("global_rows", "global_sizes"),
+    [
+        (12288, (4096, 4096, 4096, 0)),
+        (14336, (4096, 4096, 4096, 2048)),
+        (12288, (4096, 4096, 4096)),
+        (20480, (4096, 4096, 4096, 4096)),
+        (49152, (4096, 36864, 4096, 4096)),
+    ],
+)
+def test_invalid_shared_vector_keeps_symmetric_post_on_existing_huge_path(
+    global_rows, global_sizes
+):
+    runtime, _ = _make_runtime_with_bound_route_workspace(
+        symmetric_moe_post=True
+    )
+    descriptor = _begin_forward(
+        runtime,
+        (4096,),
+        global_rows,
+        global_sizes=global_sizes,
+    )
+
+    assert not descriptor.dp_symmetric_moe_post_selected
+    assert descriptor.dp_moe_attention_rank == -1
+    assert descriptor.dp_moe_local_row_offset == 0
+    assert descriptor.moe_partial_local is None
+    runtime.end_forward(descriptor)
+
+
+def test_explicit_nvls_leaves_unbalanced_prefix_build_on_existing_huge_path():
+    runtime, _ = _make_runtime_with_bound_route_workspace(
+        symmetric_moe_post=True,
+        moe_epoch=True,
+        moe_epoch_counter=True,
+        moe_nvls=True,
+    )
+    descriptor = _begin_forward(
+        runtime,
+        (4096,),
+        12288,
+        global_sizes=(4096, 4096, 4096, 0),
+    )
+
+    assert not descriptor.dp_symmetric_moe_post_selected
+    assert not descriptor.dp_moe_epoch_counter_selected
+    assert not descriptor.dp_moe_nvls_selected
+    assert descriptor.moe_partial_local is None
+    runtime.end_forward(descriptor)
+
+
+def test_selected_symmetric_post_rejects_local_size_and_rank_mismatch():
+    runtime, _ = _make_runtime_with_bound_route_workspace(
+        symmetric_moe_post=True, symmetric_rank=0
+    )
+    with pytest.raises(RuntimeError, match="local_M to match"):
+        _begin_forward(
+            runtime,
+            (4096,),
+            20480,
+            global_sizes=(4096, 8192, 4096, 4096),
+            attn_dp_rank=1,
+        )
+
+    runtime, _ = _make_runtime_with_bound_route_workspace(
+        symmetric_moe_post=True, symmetric_rank=0
+    )
+    with pytest.raises(RuntimeError, match="TP rank must match"):
+        _begin_forward(
+            runtime,
+            (4096,),
+            16384,
+            global_sizes=(4096, 4096, 4096, 4096),
+            attn_dp_rank=1,
+        )
+
+
+def test_symmetric_post_gate_is_one_time_and_rejects_tp_only(monkeypatch):
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST", "1")
+    with mock.patch.object(
+        dsv4_whole_layer_runtime.DSV4WholeLayerRuntime,
+        "_validate_static_config",
+    ), pytest.raises(RuntimeError, match="attention-DP4 Eager"):
+        dsv4_whole_layer_runtime.DSV4WholeLayerRuntime(
+            config=object(),
+            server_args=SimpleNamespace(enable_dp_attention=False),
+        )
+
+    with mock.patch.object(
+        dsv4_whole_layer_runtime.DSV4WholeLayerRuntime,
+        "_validate_static_config",
+    ), mock.patch(
+        "sglang.srt.layers.dp_attention.enable_dp_gatherv_for_dsv4_huge"
+    ):
+        runtime = dsv4_whole_layer_runtime.DSV4WholeLayerRuntime(
+            config=object(),
+            server_args=SimpleNamespace(enable_dp_attention=True),
+        )
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST", "0")
+    assert runtime._use_dp_symmetric_moe_post is True
+
+
+def test_nvls_gate_requires_the_full_epoch_counter_stack(monkeypatch):
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST", "1")
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_MOE_NVLS", "1")
+    monkeypatch.delenv("SGLANG_DSV4_HUGE_DP_MOE_EPOCH", raising=False)
+    monkeypatch.delenv(
+        "SGLANG_DSV4_HUGE_DP_MOE_EPOCH_COUNTER", raising=False
+    )
+    with mock.patch.object(
+        dsv4_whole_layer_runtime.DSV4WholeLayerRuntime,
+        "_validate_static_config",
+    ), mock.patch(
+        "sglang.srt.layers.dp_attention.enable_dp_gatherv_for_dsv4_huge"
+    ), pytest.raises(RuntimeError, match="epoch-counter"):
+        dsv4_whole_layer_runtime.DSV4WholeLayerRuntime(
+            config=object(),
+            server_args=SimpleNamespace(enable_dp_attention=True),
+        )
+
+
+def test_symmetric_post_gate_rejects_graph_capture_before_hot_path():
+    runtime, _ = _make_runtime_with_bound_route_workspace(
+        symmetric_moe_post=True
+    )
+    with pytest.raises(RuntimeError, match="symmetric MoE post is Eager-only"):
+        _begin_forward(
+            runtime,
+            (4096,),
+            16384,
+            global_sizes=(4096, 4096, 4096, 4096),
+            is_graph_capture=True,
+        )
+
+
+def test_symmetric_post_dispatch_requires_a_shared_expert_layer():
+    selected = SimpleNamespace(dp_symmetric_moe_post_selected=True)
+    unselected = SimpleNamespace(dp_symmetric_moe_post_selected=False)
+    shared_layer = SimpleNamespace(mlp=SimpleNamespace(shared_experts=object()))
+    dense_layer = SimpleNamespace(mlp=SimpleNamespace())
+
+    assert dsv4_whole_layer_runtime._should_run_dp_symmetric_moe_post(
+        shared_layer, selected
+    )
+    assert not dsv4_whole_layer_runtime._should_run_dp_symmetric_moe_post(
+        dense_layer, selected
+    )
+    assert not dsv4_whole_layer_runtime._should_run_dp_symmetric_moe_post(
+        shared_layer, unselected
+    )
+
+
+def test_symmetric_moe_post_uses_external_buffer_fused_cuda_and_two_barriers():
+    global_m = 8
+    local_m = 2
+    partials = tuple(
+        torch.empty((global_m, 4096), dtype=torch.bfloat16) for _ in range(4)
+    )
+    barrier = mock.Mock()
+    shared_hidden = torch.empty((local_m, 4096), dtype=torch.bfloat16)
+    output = torch.empty((local_m, 4, 4096), dtype=torch.bfloat16)
+    descriptor = SimpleNamespace(
+        moe_partial_local=partials[1],
+        moe_partial_peer0=partials[0],
+        moe_partial_peer1=partials[1],
+        moe_partial_peer2=partials[2],
+        moe_partial_peer3=partials[3],
+        moe_partial_handle=SimpleNamespace(barrier=barrier),
+        dp_moe_global_num_tokens=global_m,
+        dp_moe_attention_rank=1,
+        dp_moe_local_row_offset=2,
+        dp_moe_epoch_selected=False,
+        moe_epoch_flag0=None,
+        moe_epoch_flag1=None,
+        moe_epoch_flag2=None,
+        moe_epoch_flag3=None,
+        num_tokens=local_m,
+        forward_batch=object(),
+        input_ids=torch.arange(local_m),
+        input_ids_global=torch.arange(global_m),
+        moe_packed_route=None,
+        moe_routed_q_global=None,
+        moe_routed_scale_global=None,
+        mhc_residual_out=output,
+    )
+    run_moe = mock.Mock(return_value=(partials[1], shared_hidden))
+    layer = SimpleNamespace(_run_moe_ffn_dp_sync=run_moe)
+    hidden_states = torch.empty((local_m, 4096), dtype=torch.bfloat16)
+    residual = torch.empty((local_m, 4, 4096), dtype=torch.bfloat16)
+    post = torch.empty((local_m, 4), dtype=torch.float32)
+    comb = torch.empty((local_m, 4, 4), dtype=torch.float32)
+
+    from sglang.jit_kernel.dsv4 import e2e
+    from sglang.srt.layers.moe.moe_runner import base
+
+    fused_post = mock.Mock(return_value=output)
+    output_ctx = mock.Mock(side_effect=lambda *_args, **_kwargs: nullcontext())
+    with mock.patch.object(
+        base, "moe_output_buffer_ctx", output_ctx
+    ), mock.patch.object(
+        e2e,
+        "tp4_moe_local_slice_shared_mhc_post",
+        fused_post,
+    ):
+        result = dsv4_whole_layer_runtime._run_dp_symmetric_moe_mhc_post(
+            layer=layer,
+            handle=SimpleNamespace(layer_id=2, dp_moe_sequence_index=-1),
+            descriptor=descriptor,
+            hidden_states=hidden_states,
+            shared_x_quant=(torch.empty(0), torch.empty(0)),
+            routed_x_quant=None,
+            use_dp_routed_prequant=False,
+            residual=residual,
+            post=post,
+            comb=comb,
+        )
+
+    assert result is output
+    output_ctx.assert_called_once_with(partials[1], external_symmetric=True)
+    assert run_moe.call_args.kwargs["defer_shared_expert_add"] is True
+    assert run_moe.call_args.kwargs["defer_dp_output_combine"] is True
+    assert run_moe.call_args.kwargs["dp_routed_quant_output"] is None
+    fused_post.assert_called_once_with(
+        partials,
+        2,
+        shared_hidden,
+        residual,
+        post,
+        comb,
+        output,
+    )
+    assert barrier.call_args_list == [mock.call(channel=0), mock.call(channel=1)]
+
+
+def test_gpu_epoch_moe_post_waits_before_producer_and_uses_no_barrier():
+    global_m = 8
+    local_m = 2
+    partials = tuple(
+        torch.empty((global_m, 4096), dtype=torch.bfloat16) for _ in range(4)
+    )
+    flags = tuple(torch.zeros((4,), dtype=torch.int32) for _ in range(4))
+    barrier = mock.Mock()
+    shared_hidden = torch.empty((local_m, 4096), dtype=torch.bfloat16)
+    output = torch.empty((local_m, 4, 4096), dtype=torch.bfloat16)
+    descriptor = SimpleNamespace(
+        moe_partial_local=partials[1],
+        moe_partial_peer0=partials[0],
+        moe_partial_peer1=partials[1],
+        moe_partial_peer2=partials[2],
+        moe_partial_peer3=partials[3],
+        moe_partial_handle=SimpleNamespace(barrier=barrier),
+        dp_moe_global_num_tokens=global_m,
+        dp_moe_attention_rank=1,
+        dp_moe_local_row_offset=2,
+        dp_moe_epoch_selected=True,
+        dp_moe_epoch_split_selected=True,
+        dp_moe_epoch_counter_selected=False,
+        dp_moe_epoch_base=41,
+        dp_moe_expected_done_epoch=40,
+        moe_epoch_flag0=flags[0],
+        moe_epoch_flag1=flags[1],
+        moe_epoch_flag2=flags[2],
+        moe_epoch_flag3=flags[3],
+        num_tokens=local_m,
+        forward_batch=object(),
+        input_ids=torch.arange(local_m),
+        input_ids_global=torch.arange(global_m),
+        moe_packed_route=None,
+        moe_routed_q_global=None,
+        moe_routed_scale_global=None,
+        mhc_residual_out=output,
+    )
+    order = []
+    run_moe = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: (
+            order.append("producer") or (partials[1], shared_hidden)
+        )
+    )
+    layer = SimpleNamespace(_run_moe_ffn_dp_sync=run_moe)
+
+    from sglang.jit_kernel.dsv4 import e2e
+    from sglang.srt.layers.moe.moe_runner import base
+
+    wait = mock.Mock(side_effect=lambda *_args: order.append("wait"))
+    fused_epoch_split = mock.Mock(
+        side_effect=lambda *_args: order.append("consumer") or output
+    )
+    with mock.patch.object(
+        base, "moe_output_buffer_ctx", return_value=nullcontext()
+    ), mock.patch.object(
+        e2e, "tp4_moe_wait_slot_reusable", wait
+    ), mock.patch.object(
+        e2e,
+        "tp4_moe_local_slice_shared_mhc_post_epoch_split",
+        fused_epoch_split,
+    ):
+        result = dsv4_whole_layer_runtime._run_dp_symmetric_moe_mhc_post(
+            layer=layer,
+            handle=SimpleNamespace(layer_id=7, dp_moe_sequence_index=1),
+            descriptor=descriptor,
+            hidden_states=torch.empty((local_m, 4096), dtype=torch.bfloat16),
+            shared_x_quant=(torch.empty(0), torch.empty(0)),
+            routed_x_quant=None,
+            use_dp_routed_prequant=False,
+            residual=torch.empty((local_m, 4, 4096), dtype=torch.bfloat16),
+            post=torch.empty((local_m, 4), dtype=torch.float32),
+            comb=torch.empty((local_m, 4, 4), dtype=torch.float32),
+        )
+
+    assert result is output
+    assert order == ["wait", "producer", "consumer"]
+    wait.assert_called_once_with(flags, 0, 41)
+    assert fused_epoch_split.call_args.args[-4:] == (flags, 1, 0, 42)
+    barrier.assert_not_called()
+
+
+def test_counter_epoch_uses_alternate_data_slot_and_removes_wait_launch():
+    global_m = 8
+    local_m = 2
+    slot0 = tuple(
+        torch.empty((global_m, 4096), dtype=torch.bfloat16) for _ in range(4)
+    )
+    slot1 = tuple(
+        torch.empty((global_m, 4096), dtype=torch.bfloat16) for _ in range(4)
+    )
+    flags = tuple(torch.zeros((4,), dtype=torch.int32) for _ in range(4))
+    completion = torch.zeros((2,), dtype=torch.int64)
+    shared_hidden = torch.empty((local_m, 4096), dtype=torch.bfloat16)
+    output = torch.empty((local_m, 4, 4096), dtype=torch.bfloat16)
+    descriptor = SimpleNamespace(
+        moe_partial_local=slot0[1],
+        moe_partial_peer0=slot0[0],
+        moe_partial_peer1=slot0[1],
+        moe_partial_peer2=slot0[2],
+        moe_partial_peer3=slot0[3],
+        moe_partial_slot1_local=slot1[1],
+        moe_partial_slot1_peer0=slot1[0],
+        moe_partial_slot1_peer1=slot1[1],
+        moe_partial_slot1_peer2=slot1[2],
+        moe_partial_slot1_peer3=slot1[3],
+        moe_partial_handle=SimpleNamespace(barrier=mock.Mock()),
+        dp_moe_global_num_tokens=global_m,
+        dp_moe_attention_rank=1,
+        dp_moe_local_row_offset=2,
+        dp_moe_epoch_selected=True,
+        dp_moe_epoch_split_selected=False,
+        dp_moe_epoch_counter_selected=True,
+        dp_moe_nvls_selected=False,
+        dp_moe_epoch_base=1,
+        dp_moe_expected_done_epoch=0,
+        moe_epoch_flag0=flags[0],
+        moe_epoch_flag1=flags[1],
+        moe_epoch_flag2=flags[2],
+        moe_epoch_flag3=flags[3],
+        moe_epoch_completion_state=completion,
+        moe_multicast_local_slot0_ptr=0,
+        moe_multicast_local_slot1_ptr=0,
+        num_tokens=local_m,
+        forward_batch=object(),
+        input_ids=torch.arange(local_m),
+        input_ids_global=torch.arange(global_m),
+        moe_packed_route=None,
+        moe_routed_q_global=None,
+        moe_routed_scale_global=None,
+        mhc_residual_out=output,
+    )
+    run_moe = mock.Mock(return_value=(slot1[1], shared_hidden))
+    layer = SimpleNamespace(_run_moe_ffn_dp_sync=run_moe)
+
+    from sglang.jit_kernel.dsv4 import e2e
+    from sglang.srt.layers.moe.moe_runner import base
+
+    output_ctx = mock.Mock(return_value=nullcontext())
+    counter_post = mock.Mock(return_value=output)
+    with mock.patch.object(
+        base, "moe_output_buffer_ctx", output_ctx
+    ), mock.patch.object(
+        e2e,
+        "tp4_moe_wait_slot_reusable",
+        side_effect=AssertionError("counter path must not launch slot wait"),
+    ), mock.patch.object(
+        e2e,
+        "tp4_moe_local_slice_shared_mhc_post_epoch_counter",
+        counter_post,
+    ):
+        result = dsv4_whole_layer_runtime._run_dp_symmetric_moe_mhc_post(
+            layer=layer,
+            handle=SimpleNamespace(layer_id=7, dp_moe_sequence_index=1),
+            descriptor=descriptor,
+            hidden_states=torch.empty((local_m, 4096), dtype=torch.bfloat16),
+            shared_x_quant=(torch.empty(0), torch.empty(0)),
+            routed_x_quant=None,
+            use_dp_routed_prequant=False,
+            residual=torch.empty((local_m, 4, 4096), dtype=torch.bfloat16),
+            post=torch.empty((local_m, 4), dtype=torch.float32),
+            comb=torch.empty((local_m, 4, 4), dtype=torch.float32),
+        )
+
+    assert result is output
+    output_ctx.assert_called_once_with(slot1[1], external_symmetric=True)
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            counter_post.call_args.args[0], slot1, strict=True
+        )
+    )
+    assert counter_post.call_args.args[-4:] == (completion, 1, 1, 2)
+
+
+def test_nvls_counter_epoch_selects_multicast_slot_without_peer_fallback():
+    global_m = 8
+    local_m = 2
+    slot0 = tuple(
+        torch.empty((global_m, 4096), dtype=torch.bfloat16) for _ in range(4)
+    )
+    slot1 = tuple(
+        torch.empty((global_m, 4096), dtype=torch.bfloat16) for _ in range(4)
+    )
+    flags = tuple(torch.zeros((4,), dtype=torch.int32) for _ in range(4))
+    completion = torch.zeros((2,), dtype=torch.int64)
+    shared_hidden = torch.empty((local_m, 4096), dtype=torch.bfloat16)
+    output = torch.empty((local_m, 4, 4096), dtype=torch.bfloat16)
+    multicast_slot0 = 0x100000000
+    multicast_slot1 = multicast_slot0 + (1 << 30)
+    descriptor = SimpleNamespace(
+        moe_partial_local=slot0[1],
+        moe_partial_peer0=slot0[0],
+        moe_partial_peer1=slot0[1],
+        moe_partial_peer2=slot0[2],
+        moe_partial_peer3=slot0[3],
+        moe_partial_slot1_local=slot1[1],
+        moe_partial_slot1_peer0=slot1[0],
+        moe_partial_slot1_peer1=slot1[1],
+        moe_partial_slot1_peer2=slot1[2],
+        moe_partial_slot1_peer3=slot1[3],
+        moe_partial_handle=SimpleNamespace(barrier=mock.Mock()),
+        dp_moe_global_num_tokens=global_m,
+        dp_moe_attention_rank=1,
+        dp_moe_local_row_offset=2,
+        dp_moe_epoch_selected=True,
+        dp_moe_epoch_split_selected=False,
+        dp_moe_epoch_counter_selected=True,
+        dp_moe_nvls_selected=True,
+        dp_moe_epoch_base=1,
+        dp_moe_expected_done_epoch=0,
+        moe_epoch_flag0=flags[0],
+        moe_epoch_flag1=flags[1],
+        moe_epoch_flag2=flags[2],
+        moe_epoch_flag3=flags[3],
+        moe_epoch_completion_state=completion,
+        moe_multicast_local_slot0_ptr=multicast_slot0,
+        moe_multicast_local_slot1_ptr=multicast_slot1,
+        num_tokens=local_m,
+        forward_batch=object(),
+        input_ids=torch.arange(local_m),
+        input_ids_global=torch.arange(global_m),
+        moe_packed_route=None,
+        moe_routed_q_global=None,
+        moe_routed_scale_global=None,
+        mhc_residual_out=output,
+    )
+    run_moe = mock.Mock(return_value=(slot1[1], shared_hidden))
+    layer = SimpleNamespace(_run_moe_ffn_dp_sync=run_moe)
+
+    from sglang.jit_kernel.dsv4 import e2e
+    from sglang.srt.layers.moe.moe_runner import base
+
+    output_ctx = mock.Mock(return_value=nullcontext())
+    nvls_post = mock.Mock(return_value=output)
+    with mock.patch.object(
+        base, "moe_output_buffer_ctx", output_ctx
+    ), mock.patch.object(
+        e2e,
+        "tp4_moe_local_slice_shared_mhc_post_epoch_counter_multimem",
+        nvls_post,
+    ), mock.patch.object(
+        e2e,
+        "tp4_moe_local_slice_shared_mhc_post_epoch_counter",
+        side_effect=AssertionError("NVLS must not use the peer-load consumer"),
+    ):
+        result = dsv4_whole_layer_runtime._run_dp_symmetric_moe_mhc_post(
+            layer=layer,
+            handle=SimpleNamespace(layer_id=7, dp_moe_sequence_index=1),
+            descriptor=descriptor,
+            hidden_states=torch.empty((local_m, 4096), dtype=torch.bfloat16),
+            shared_x_quant=(torch.empty(0), torch.empty(0)),
+            routed_x_quant=None,
+            use_dp_routed_prequant=False,
+            residual=torch.empty((local_m, 4, 4096), dtype=torch.bfloat16),
+            post=torch.empty((local_m, 4), dtype=torch.float32),
+            comb=torch.empty((local_m, 4, 4), dtype=torch.float32),
+        )
+
+    assert result is output
+    output_ctx.assert_called_once_with(slot1[1], external_symmetric=True)
+    assert nvls_post.call_args.args[0] == multicast_slot1
+    assert nvls_post.call_args.args[1] is slot1[1]
+    assert nvls_post.call_args.args[2] == 2
+    assert nvls_post.call_args.args[-4:] == (completion, 1, 1, 2)
+
+
+def test_gpu_epoch_descriptor_advances_only_for_selected_batches_and_poison_fails_closed():
+    runtime, _ = _make_runtime_with_bound_route_workspace(
+        symmetric_moe_post=True,
+        symmetric_rank=0,
+        moe_epoch=True,
+        moe_epoch_split=True,
+    )
+    first = _begin_forward(
+        runtime,
+        (4096,),
+        16384,
+        global_sizes=(4096, 4096, 4096, 4096),
+    )
+    assert first.dp_moe_epoch_selected
+    assert first.dp_moe_epoch_split_selected
+    assert first.dp_moe_epoch_base == 1
+    assert first.dp_moe_expected_done_epoch == 0
+    runtime.end_forward(first)
+
+    # This invalid shared vector stays on the existing Huge path and must not
+    # consume an epoch that a peer will never publish.
+    unselected = _begin_forward(
+        runtime,
+        (4096,),
+        12288,
+        global_sizes=(4096, 4096, 4096, 0),
+    )
+    assert not unselected.dp_moe_epoch_selected
+    runtime.end_forward(unselected)
+
+    second = _begin_forward(
+        runtime,
+        (4096,),
+        16384,
+        global_sizes=(4096, 4096, 4096, 4096),
+    )
+    assert second.dp_moe_epoch_base == 3
+    assert second.dp_moe_expected_done_epoch == 2
+    runtime.abort_forward(second)
+    with pytest.raises(RuntimeError, match="poisoned"):
+        _begin_forward(
+            runtime,
+            (4096,),
+            12288,
+            global_sizes=(4096, 4096, 4096, 0),
+        )
+
+
+def test_counter_epoch_descriptor_binds_two_real_slots_and_local_counter():
+    runtime, _ = _make_runtime_with_bound_route_workspace(
+        symmetric_moe_post=True,
+        symmetric_rank=2,
+        moe_epoch=True,
+        moe_epoch_counter=True,
+    )
+    descriptor = _begin_forward(
+        runtime,
+        (4096,),
+        16384,
+        global_sizes=(4096, 4096, 4096, 4096),
+        attn_dp_rank=2,
+    )
+
+    assert descriptor.dp_moe_epoch_counter_selected
+    assert not descriptor.dp_moe_epoch_split_selected
+    assert descriptor.moe_partial_local.shape == (16384, 4096)
+    assert descriptor.moe_partial_slot1_local.shape == (16384, 4096)
+    assert (
+        descriptor.moe_partial_slot1_local
+        is descriptor.moe_partial_slot1_peer2
+    )
+    assert descriptor.moe_epoch_completion_state.shape == (2,)
+    assert descriptor.moe_epoch_completion_state.dtype == torch.int64
+    runtime.end_forward(descriptor)
+
+
+def test_nvls_descriptor_precomputes_fixed_capacity_local_slot_addresses():
+    runtime, _ = _make_runtime_with_bound_route_workspace(
+        symmetric_moe_post=True,
+        symmetric_rank=2,
+        moe_epoch=True,
+        moe_epoch_counter=True,
+        moe_nvls=True,
+    )
+    descriptor = _begin_forward(
+        runtime,
+        (4096,),
+        16384,
+        global_sizes=(4096, 4096, 4096, 4096),
+        attn_dp_rank=2,
+    )
+
+    multicast_base = 0x100000000
+    row_bytes = (4096 + 4096) * 4096 * 2
+    assert descriptor.dp_moe_nvls_selected
+    assert descriptor.moe_multicast_local_slot0_ptr == (
+        multicast_base + row_bytes
+    )
+    assert descriptor.moe_multicast_local_slot1_ptr == (
+        multicast_base
+        + dsv4_whole_layer_runtime._TP4_MOE_SLOT_BYTES
+        + row_bytes
+    )
+    # The physical slot stride is fixed at the 131072-token allocation
+    # capacity, independent of this forward's active global_M=16384.
+    assert (
+        descriptor.moe_multicast_local_slot1_ptr
+        - descriptor.moe_multicast_local_slot0_ptr
+        == 1 << 30
+    )
+    runtime.end_forward(descriptor)
+
+
+def test_symmetric_moe_post_fails_closed_when_flashinfer_ignores_buffer():
+    partials = tuple(
+        torch.empty((8, 4096), dtype=torch.bfloat16) for _ in range(4)
+    )
+    descriptor = SimpleNamespace(
+        moe_partial_local=partials[0],
+        moe_partial_peer0=partials[0],
+        moe_partial_peer1=partials[1],
+        moe_partial_peer2=partials[2],
+        moe_partial_peer3=partials[3],
+        moe_partial_handle=SimpleNamespace(barrier=mock.Mock()),
+        dp_moe_global_num_tokens=8,
+        dp_moe_attention_rank=0,
+        dp_moe_local_row_offset=0,
+        dp_moe_epoch_selected=False,
+        moe_epoch_flag0=None,
+        moe_epoch_flag1=None,
+        moe_epoch_flag2=None,
+        moe_epoch_flag3=None,
+        num_tokens=2,
+        forward_batch=object(),
+        input_ids=torch.arange(2),
+        input_ids_global=torch.arange(8),
+        moe_packed_route=None,
+        moe_routed_q_global=None,
+        moe_routed_scale_global=None,
+        mhc_residual_out=torch.empty((2, 4, 4096), dtype=torch.bfloat16),
+    )
+    layer = SimpleNamespace(
+        _run_moe_ffn_dp_sync=mock.Mock(
+            return_value=(
+                torch.empty((8, 4096), dtype=torch.bfloat16),
+                torch.empty((2, 4096), dtype=torch.bfloat16),
+            )
+        )
+    )
+    from sglang.srt.layers.moe.moe_runner import base
+
+    with mock.patch.object(
+        base, "moe_output_buffer_ctx", return_value=nullcontext()
+    ), pytest.raises(RuntimeError, match="did not honor"):
+        dsv4_whole_layer_runtime._run_dp_symmetric_moe_mhc_post(
+            layer=layer,
+            handle=SimpleNamespace(layer_id=2, dp_moe_sequence_index=-1),
+            descriptor=descriptor,
+            hidden_states=torch.empty((2, 4096), dtype=torch.bfloat16),
+            shared_x_quant=(torch.empty(0), torch.empty(0)),
+            routed_x_quant=None,
+            use_dp_routed_prequant=False,
+            residual=torch.empty((2, 4, 4096), dtype=torch.bfloat16),
+            post=torch.empty((2, 4), dtype=torch.float32),
+            comb=torch.empty((2, 4, 4), dtype=torch.float32),
         )
 
 
