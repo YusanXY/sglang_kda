@@ -2046,6 +2046,7 @@ def _execute_common(
             residual=residual,
             post=post,
             comb=comb,
+            emit_routed_quant=not runtime._attention_dp4,
         )
     )
 
@@ -2218,13 +2219,14 @@ def _separate_mhc_post_ffn_pre(
     residual: torch.Tensor,
     post: torch.Tensor,
     comb: torch.Tensor,
+    emit_routed_quant: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     tuple[torch.Tensor, torch.Tensor],
-    tuple[torch.Tensor, torch.Tensor],
+    Optional[tuple[torch.Tensor, torch.Tensor]],
 ]:
     """Numerically stable Huge CUDA path with graph-stable post storage."""
 
@@ -2272,7 +2274,7 @@ def _separate_mhc_post_ffn_pre(
             descriptor.mhc_output_scale_storage,
             descriptor.mhc_routed_output_fp8,
             descriptor.mhc_routed_output_scale,
-            True,
+            emit_routed_quant,
         ),
     )
     if not norm_fused:
@@ -2284,8 +2286,12 @@ def _separate_mhc_post_ffn_pre(
         hidden_states,
         (descriptor.mhc_output_fp8, descriptor.mhc_output_scale),
         (
-            descriptor.mhc_routed_output_fp8,
-            descriptor.mhc_routed_output_scale,
+            (
+                descriptor.mhc_routed_output_fp8,
+                descriptor.mhc_routed_output_scale,
+            )
+            if emit_routed_quant
+            else None
         ),
     )
 
