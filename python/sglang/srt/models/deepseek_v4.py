@@ -2217,12 +2217,19 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "DSV4 fused MoE/mHC post requires Huge DP1 without CP or "
                 "attention/MoE gather-scatter"
             )
-        if (shared_x_quant is not None or routed_x_quant is not None) and (
+        unsupported_shared_prequant = shared_x_quant is not None and (
+            _use_cp
+            or _use_tp_attn_a2a_scatter
+            or (_use_tp_moe_gather and not defer_shared_expert_add)
+        )
+        unsupported_routed_prequant = routed_x_quant is not None and (
             _use_cp or _use_tp_moe_gather or _use_tp_attn_a2a_scatter
-        ):
+        )
+        if unsupported_shared_prequant or unsupported_routed_prequant:
             raise RuntimeError(
-                "DSV4 Huge MoE prequantization requires DP1 without "
-                "CP or attention/MoE gather-scatter"
+                "DSV4 Huge routed MoE prequantization requires DP1; shared "
+                "prequantization is additionally supported by the deferred "
+                "TP1 shared-expert path under attention-DP"
             )
         # symmetric gather+scatter for the no-EP TP-MoE dp-attn path:
         # all_gatherv gather (in self.mlp's dp_gather) + reduce_scatterv combine.
@@ -2304,12 +2311,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.mlp.alt_stream.wait_stream(current_stream)
                     with torch.cuda.stream(self.mlp.alt_stream):
                         _shared_local = self.mlp._forward_shared_experts(
-                            local_hidden_states
+                            local_hidden_states, x_quant=shared_x_quant
                         )
                     _shared_local_stream = self.mlp.alt_stream
                 else:
                     _shared_local = self.mlp._forward_shared_experts(
-                        local_hidden_states
+                        local_hidden_states, x_quant=shared_x_quant
                     )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
@@ -2329,7 +2336,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids=input_ids,
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
-                shared_x_quant=shared_x_quant,
+                shared_x_quant=(
+                    None if _use_tp_moe_gather else shared_x_quant
+                ),
                 routed_x_quant=routed_x_quant,
             )
         if _use_cp and get_moe_a2a_backend().is_none():

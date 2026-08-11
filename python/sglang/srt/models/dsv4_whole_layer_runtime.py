@@ -2059,14 +2059,16 @@ def _execute_common(
     if runtime._attention_dp4:
         # Attention-DP owns disjoint local token sets. Reuse SGLang's existing
         # device-side gather + TP-sharded MoE + scatter semantics, then finish
-        # the local residual in the Huge CUDA epilogue. The local FP8 tensors
-        # produced above cannot be reused after the gather until that boundary
-        # is fused in a later DP-specific optimization.
+        # the local residual in the Huge CUDA epilogue.  The shared-expert input
+        # stays local, so its FP8/UE8M0 representation from the fused mHC-pre
+        # producer can be consumed directly by the replicated TP1 projection.
+        # The routed prequantization still cannot cross the DP gather boundary.
         hidden_states, shared_hidden = layer._run_moe_ffn_dp_sync(
             hidden_states,
             descriptor.forward_batch,
             input_ids=descriptor.input_ids,
             input_ids_global=descriptor.input_ids_global,
+            shared_x_quant=shared_x_quant,
             defer_shared_expert_add=True,
         )
         hidden_states = _huge_mhc_post(
