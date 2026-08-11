@@ -2344,20 +2344,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # each rank its own token slice, in one op. Correct because the
                 # MoE-internal all_reduce was skipped (mlp_reduce_scatter above).
                 # This is the symmetric inverse of the all_gatherv gather.
-                dp_sizes = get_dp_global_num_tokens()
-                # PyNccl's variable-size path is four grouped root Reduce
-                # operations. When Huge has equal host-known DP slices, select
-                # the native single ncclReduceScatter without any device sync.
-                # Unequal SUM_LEN batches retain the exact reduce_scatterv ABI.
-                reduce_scatter_sizes = dp_sizes
-                if defer_shared_expert_add and all(
-                    size == dp_sizes[0] for size in dp_sizes
-                ):
-                    reduce_scatter_sizes = None
                 get_tp_group().reduce_scatterv(
                     global_hidden_states,
                     output=hidden_states,
-                    sizes=reduce_scatter_sizes,
+                    sizes=get_dp_global_num_tokens(),
                 )
             elif _use_reduce_scatter:
                 # Equal-chunk reduce_scatter: SUM the TP-sharded per-rank partial
