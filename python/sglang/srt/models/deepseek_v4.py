@@ -2289,6 +2289,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
+        if (
+            shared_x_quant is not None
+            and _use_tp_moe_gather
+            and getattr(self.mlp, "shared_experts", None) is not None
+            and not _do_shared_local
+        ):
+            raise RuntimeError(
+                "DSV4 Huge attention-DP shared prequantization requires the "
+                "replicated TP1 local shared-expert path"
+            )
         if _use_cp:
             if get_moe_a2a_backend().is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
