@@ -75,24 +75,55 @@ def test_patch_moves_prepare_before_routing() -> None:
     assert "result[0], topk_weights, result[2]" not in patched
     assert (
         _DSV4_JIT_MODULE_NAME
-        == "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v72"
+        == "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v74"
     )
 
 
-def test_dp_routed_finalize_preserves_two_bf16_rounds_without_shared_add() -> None:
+def test_dp_routed_finalize_packs_two_bf16_rounds_without_shared_add() -> None:
     patched = _patch_launcher(_source())
     kernel_start = patched.index("__global__ void dsv4MoeFinalizeDpRoutedKernel")
     kernel_end = patched.index("void dsv4_launch_dp_routed_finalize", kernel_start)
     kernel = patched[kernel_start:kernel_end]
 
-    first_round = kernel.index(
-        "__nv_bfloat16 const finalized = __float2bfloat16_rn(accum[element])"
-    )
-    scale = kernel.index("__bfloat162float(finalized) * routed_scale")
+    first_round = kernel.index("__floats2bfloat162_rn(")
+    scale = kernel.index("__hmul2_rn(finalized, scale2)")
     output_store = kernel.index("output_vec[token * hidden_vecs + vec] = result")
     assert first_round < scale < output_store
+    assert "for (int pair = 0; pair < 4; ++pair)" in kernel
+    assert "__float2bfloat16_rn(accum[element])" not in kernel
     assert "shared_output" not in kernel
     assert "shared_vec" not in kernel
+
+
+def test_dp_routed_finalize_rejects_non_dsv4_or_non_bf16_scale() -> None:
+    patched = _patch_launcher(_source())
+    setter_start = patched.index("void dsv4_set_dp_routed_finalize")
+    setter_end = patched.index("struct alignas(16) Dsv4Bf16x8", setter_start)
+    setter = patched[setter_start:setter_end]
+
+    round_to_bf16 = setter.index("__float2bfloat16(routed_scale_float)")
+    exact_check = setter.index(
+        "__bfloat162float(routed_scale_bf16), routed_scale_float"
+    )
+    dsv4_check = setter.index("TVM_FFI_ICHECK_EQ(routed_scale, 1.5)")
+    state_write = setter.index(
+        "dsv4_dp_routed_finalize_state.routed_scale = routed_scale_float"
+    )
+    assert round_to_bf16 < exact_check < dsv4_check < state_write
+    assert "must be exactly BF16-representable" in setter
+    assert "requires routed_scale=1.5" in setter
+
+
+def test_packed_epilogue_does_not_modify_shared_finalize() -> None:
+    patched = _patch_launcher(_source())
+    kernel_start = patched.index("__global__ void dsv4MoeFinalizeSharedKernel")
+    kernel_end = patched.index("void dsv4_launch_shared_finalize", kernel_start)
+    kernel = patched[kernel_start:kernel_end]
+
+    assert "__floats2bfloat162_rn" not in kernel
+    assert "__hmul2_rn" not in kernel
+    assert "__float2bfloat16_rn(accum[element])" in kernel
+    assert "__bfloat162float(shared.value[element])" in kernel
 
 
 def test_dp_routed_finalize_is_one_shot_and_mutually_exclusive() -> None:

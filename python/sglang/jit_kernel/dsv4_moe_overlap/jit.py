@@ -7,7 +7,7 @@ from pathlib import Path
 
 _DSV4_JIT_SPEC = None
 _DSV4_RAW_MODULE = None
-_DSV4_JIT_MODULE_NAME = "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v72"
+_DSV4_JIT_MODULE_NAME = "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v74"
 
 
 _EXPECTED_LAUNCHER_SHA256 = (
@@ -345,12 +345,19 @@ void dsv4_set_dp_routed_finalize(TensorView output, double routed_scale) {
   TVM_FFI_ICHECK_EQ(output.ndim(), 2);
   TVM_FFI_ICHECK(output.IsContiguous());
   TVM_FFI_ICHECK_EQ(output.size(1), 4096);
+  float const routed_scale_float = static_cast<float>(routed_scale);
+  __nv_bfloat16 const routed_scale_bf16 =
+      __float2bfloat16(routed_scale_float);
+  TVM_FFI_ICHECK_EQ(
+      __bfloat162float(routed_scale_bf16), routed_scale_float)
+      << "DSV4 DP routed-finalize scale must be exactly BF16-representable";
+  TVM_FFI_ICHECK_EQ(routed_scale, 1.5)
+      << "DSV4 DP routed-finalize requires routed_scale=1.5";
   dsv4_dp_routed_finalize_state.output =
       static_cast<__nv_bfloat16*>(output.data_ptr());
   dsv4_dp_routed_finalize_state.num_tokens = output.size(0);
   dsv4_dp_routed_finalize_state.hidden_dim = output.size(1);
-  dsv4_dp_routed_finalize_state.routed_scale =
-      static_cast<float>(routed_scale);
+  dsv4_dp_routed_finalize_state.routed_scale = routed_scale_float;
   dsv4_dp_routed_finalize_state.active = true;
 }
 
@@ -531,15 +538,18 @@ __global__ void dsv4MoeFinalizeDpRoutedKernel(
         accum[element] += weight * __bfloat162float(values.value[element]);
       }
     }
+    // routed_scale is host-validated as exactly BF16-representable. A
+    // BF16*BF16 product is exact in FP32, so packed __hmul2_rn preserves the
+    // eager path's two observable BF16 boundaries bit-for-bit.
+    __nv_bfloat162 const scale2 =
+        __floats2bfloat162_rn(routed_scale, routed_scale);
     Dsv4Bf16x8 result;
+    auto* result2 = reinterpret_cast<__nv_bfloat162*>(result.value);
 #pragma unroll
-    for (int element = 0; element < 8; ++element) {
-      // Preserve the eager path's two observable BF16 boundaries:
-      // FlashInfer finalize stores BF16 first, then routed.mul_(alpha) stores
-      // BF16 again.  Do not fold the multiply into the FP32 accumulator.
-      __nv_bfloat16 const finalized = __float2bfloat16_rn(accum[element]);
-      result.value[element] = __float2bfloat16_rn(
-          __bfloat162float(finalized) * routed_scale);
+    for (int pair = 0; pair < 4; ++pair) {
+      __nv_bfloat162 const finalized = __floats2bfloat162_rn(
+          accum[pair * 2], accum[pair * 2 + 1]);
+      result2[pair] = __hmul2_rn(finalized, scale2);
     }
     output_vec[token * hidden_vecs + vec] = result;
   }
