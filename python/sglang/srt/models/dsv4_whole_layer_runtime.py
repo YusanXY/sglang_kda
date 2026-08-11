@@ -169,6 +169,8 @@ class DSV4ForwardDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     shared_down_fp8: torch.Tensor
     shared_down_scale: torch.Tensor
     moe_packed_route: Optional[torch.Tensor]
+    moe_routed_q_global: Optional[torch.Tensor]
+    moe_routed_scale_global: Optional[torch.Tensor]
     wo_a_output_q: torch.Tensor
     wo_a_output_s_storage: torch.Tensor
     wo_a_gemm_output: torch.Tensor
@@ -322,14 +324,21 @@ class DSV4WholeLayerRuntime:
         # Stage-1 Attention-DP localization: every layer writes its compact
         # global packed route into this fixed address.  The payload is only
         # 6 int32 values per token (3 MiB at M=131072), so it can be gathered
-        # alongside the BF16 activation without materializing global router
-        # logits, top-k ids, or weights.
+        # alongside the routed activation payload without materializing global
+        # router logits, top-k ids, or weights.
         self._use_dp_local_routing = (
             self._attention_dp4
             and os.environ.get("SGLANG_DSV4_HUGE_DP_LOCAL_ROUTING", "0") == "1"
         )
         self._dp_packed_route_workspace: Optional[
             tuple[torch.device, torch.Tensor]
+        ] = None
+        # Stage-2 Attention-DP localization: the second mHC producer already
+        # emits the local routed activation in MXFP8 form.  Keep fixed-address
+        # global destinations for the grouped q-bytes + scale + route gather so
+        # the hot path never materializes or requantizes a global BF16 input.
+        self._dp_routed_quant_workspace: Optional[
+            tuple[torch.device, torch.Tensor, torch.Tensor]
         ] = None
         self._shared_down_workspace: Optional[
             tuple[torch.device, torch.Tensor, torch.Tensor]
@@ -412,6 +421,23 @@ class DSV4WholeLayerRuntime:
                 torch.empty(
                     (_MAX_FORWARD_TOKENS, 6),
                     dtype=torch.int32,
+                    device=workspace_device,
+                ),
+            )
+        if self._use_dp_local_routing and (
+            self._dp_routed_quant_workspace is None
+            or self._dp_routed_quant_workspace[0] != workspace_device
+        ):
+            self._dp_routed_quant_workspace = (
+                workspace_device,
+                torch.empty(
+                    (_MAX_FORWARD_TOKENS, 4096),
+                    dtype=torch.float8_e4m3fn,
+                    device=workspace_device,
+                ),
+                torch.empty(
+                    (_MAX_FORWARD_TOKENS, 128),
+                    dtype=torch.uint8,
                     device=workspace_device,
                 ),
             )
@@ -1253,8 +1279,21 @@ class DSV4WholeLayerRuntime:
                     "DSV4 Huge local routing workspace was not bound on this device"
                 )
             moe_packed_route = route_workspace[1][:moe_num_tokens]
+            routed_quant_workspace = self._dp_routed_quant_workspace
+            if (
+                routed_quant_workspace is None
+                or routed_quant_workspace[0] != positions.device
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge routed-MXFP8 gather workspace was not bound on "
+                    "this device"
+                )
+            moe_routed_q_global = routed_quant_workspace[1][:moe_num_tokens]
+            moe_routed_scale_global = routed_quant_workspace[2][:moe_num_tokens]
         else:
             moe_packed_route = None
+            moe_routed_q_global = None
+            moe_routed_scale_global = None
         # Huge attention-DP evaluates a replicated TP1 shared expert on this
         # rank's local tokens. Keep its 2048-wide activation workspace local;
         # the gathered token count is only for the TP-sharded routed experts.
@@ -1352,6 +1391,8 @@ class DSV4WholeLayerRuntime:
             shared_down_fp8=shared_down_fp8,
             shared_down_scale=shared_down_scale,
             moe_packed_route=moe_packed_route,
+            moe_routed_q_global=moe_routed_q_global,
+            moe_routed_scale_global=moe_routed_scale_global,
             wo_a_output_q=output_q,
             wo_a_output_s_storage=output_s_storage,
             wo_a_gemm_output=wo_a_gemm_output,
@@ -2102,6 +2143,22 @@ def _execute_common(
 
     # Consume attention post state, then let the second fused mHC producer
     # directly generate the shared-expert gate input in FP8/UE8M0 form.
+    route_builder = getattr(
+        layer.mlp, "build_dsv4_huge_local_packed_route", None
+    )
+    use_dp_routed_prequant = (
+        runtime._attention_dp4
+        and descriptor.moe_packed_route is not None
+        and route_builder is not None
+    )
+    if use_dp_routed_prequant and (
+        descriptor.moe_routed_q_global is None
+        or descriptor.moe_routed_scale_global is None
+    ):
+        raise RuntimeError(
+            "DSV4 Huge local routing selected without its global routed-MXFP8 "
+            "workspace"
+        )
     residual, post, comb, hidden_states, shared_x_quant, routed_x_quant = (
         _separate_mhc_post_ffn_pre(
             layer=layer,
@@ -2110,7 +2167,9 @@ def _execute_common(
             residual=residual,
             post=post,
             comb=comb,
-            emit_routed_quant=not runtime._attention_dp4,
+            emit_routed_quant=(
+                not runtime._attention_dp4 or use_dp_routed_prequant
+            ),
         )
     )
 
@@ -2127,15 +2186,25 @@ def _execute_common(
         # the local residual in the Huge CUDA epilogue.  The shared-expert input
         # stays local, so its FP8/UE8M0 representation from the fused mHC-pre
         # producer can be consumed directly by the replicated TP1 projection.
-        # The routed prequantization still cannot cross the DP gather boundary.
+        # For the formal balanced buckets, the same mHC launch also emits the
+        # routed MXFP8 payload and the grouped gather carries q + scale + route.
         hidden_states, shared_hidden = layer._run_moe_ffn_dp_sync(
             hidden_states,
             descriptor.forward_batch,
             input_ids=descriptor.input_ids,
             input_ids_global=descriptor.input_ids_global,
             shared_x_quant=shared_x_quant,
+            routed_x_quant=routed_x_quant,
             defer_shared_expert_add=True,
             dp_packed_route_output=descriptor.moe_packed_route,
+            dp_routed_quant_output=(
+                (
+                    descriptor.moe_routed_q_global,
+                    descriptor.moe_routed_scale_global,
+                )
+                if use_dp_routed_prequant
+                else None
+            ),
         )
         hidden_states = _huge_mhc_post(
             hidden_states=hidden_states,

@@ -2188,6 +2188,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         huge_fused_moe_post: bool = False,
         defer_shared_expert_add: bool = False,
         dp_packed_route_output: Optional[torch.Tensor] = None,
+        dp_routed_quant_output: Optional[
+            tuple[torch.Tensor, torch.Tensor]
+        ] = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]]:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -2230,17 +2233,32 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "precomputed packed routing requires Huge attention-DP "
                 "TP-MoE gather/scatter"
             )
+        if dp_routed_quant_output is not None and (
+            get_server_args().dsv4_worker_backend != "huge_kernel"
+            or not _use_tp_moe_gather
+            or _use_cp
+            or _use_tp_attn_a2a_scatter
+            or dp_packed_route_output is None
+            or routed_x_quant is None
+        ):
+            raise RuntimeError(
+                "global routed-MXFP8 gather output requires the complete DSV4 "
+                "Huge local-route descriptor under attention-DP TP-MoE gather"
+            )
         unsupported_shared_prequant = shared_x_quant is not None and (
             _use_cp
             or _use_tp_attn_a2a_scatter
             or (_use_tp_moe_gather and not defer_shared_expert_add)
         )
         unsupported_routed_prequant = routed_x_quant is not None and (
-            _use_cp or _use_tp_moe_gather or _use_tp_attn_a2a_scatter
+            _use_cp
+            or _use_tp_attn_a2a_scatter
+            or (_use_tp_moe_gather and dp_routed_quant_output is None)
         )
         if unsupported_shared_prequant or unsupported_routed_prequant:
             raise RuntimeError(
-                "DSV4 Huge routed MoE prequantization requires DP1; shared "
+                "DSV4 Huge routed MoE prequantization requires DP1 or the "
+                "complete local-route MXFP8 gather descriptor; shared "
                 "prequantization is additionally supported by the deferred "
                 "TP1 shared-expert path under attention-DP"
             )
@@ -2312,6 +2330,15 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "DSV4 Huge attention-DP shared prequantization requires the "
                 "replicated TP1 local shared-expert path"
             )
+        if (
+            dp_routed_quant_output is not None
+            and getattr(self.mlp, "shared_experts", None) is not None
+            and not _do_shared_local
+        ):
+            raise RuntimeError(
+                "DSV4 Huge routed-MXFP8 carrier requires shared experts to stay "
+                "on the local BF16 shard"
+            )
         precomputed_topk_output = None
         if _use_cp:
             if get_moe_a2a_backend().is_none():
@@ -2322,10 +2349,81 @@ class DeepseekV4DecoderLayer(nn.Module):
                     "Only DeepEP is tested with CP's per-rank token split."
                 )
         elif _use_tp_moe_gather:
-            hidden_states, local_hidden_states = (
-                get_global_dp_buffer(get_tp_group()),
-                hidden_states,
+            local_hidden_states = hidden_states
+            route_builder = getattr(
+                self.mlp, "build_dsv4_huge_local_packed_route", None
             )
+            if (
+                dp_packed_route_output is not None
+                and isinstance(self.mlp, deepseek_v2.DeepseekV2MoE)
+                and route_builder is None
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge routed MoE is missing its local packed-route "
+                    "producer"
+                )
+            if dp_routed_quant_output is not None and route_builder is None:
+                raise RuntimeError(
+                    "DSV4 Huge routed-MXFP8 gather requires the local packed-route "
+                    "producer"
+                )
+            if dp_routed_quant_output is None:
+                hidden_states = get_global_dp_buffer(get_tp_group())
+            else:
+                try:
+                    local_routed_q, local_routed_scale = routed_x_quant
+                    global_routed_q, global_routed_scale = dp_routed_quant_output
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "invalid DSV4 Huge routed-MXFP8 gather descriptor"
+                    ) from exc
+                if (
+                    not isinstance(dp_packed_route_output, torch.Tensor)
+                    or not isinstance(local_routed_q, torch.Tensor)
+                    or not isinstance(local_routed_scale, torch.Tensor)
+                    or not isinstance(global_routed_q, torch.Tensor)
+                    or not isinstance(global_routed_scale, torch.Tensor)
+                    or local_hidden_states.ndim != 2
+                    or dp_packed_route_output.ndim != 2
+                ):
+                    raise RuntimeError(
+                        "invalid DSV4 Huge routed-MXFP8 gather descriptor"
+                    )
+                global_rows = dp_packed_route_output.shape[0]
+                local_rows = local_hidden_states.shape[0]
+                if (
+                    local_hidden_states.shape != (local_rows, 4096)
+                    or local_hidden_states.dtype != torch.bfloat16
+                    or not local_hidden_states.is_contiguous()
+                    or local_routed_q.shape != (local_rows, 4096)
+                    or local_routed_q.dtype != torch.float8_e4m3fn
+                    or local_routed_q.device != local_hidden_states.device
+                    or not local_routed_q.is_contiguous()
+                    or local_routed_scale.shape != (local_rows, 128)
+                    or local_routed_scale.dtype != torch.uint8
+                    or local_routed_scale.device != local_hidden_states.device
+                    or not local_routed_scale.is_contiguous()
+                    or global_routed_q.shape != (global_rows, 4096)
+                    or global_routed_q.dtype != torch.float8_e4m3fn
+                    or global_routed_q.device != local_hidden_states.device
+                    or not global_routed_q.is_contiguous()
+                    or global_routed_scale.shape != (global_rows, 128)
+                    or global_routed_scale.dtype != torch.uint8
+                    or global_routed_scale.device != local_hidden_states.device
+                    or not global_routed_scale.is_contiguous()
+                    or dp_packed_route_output.shape != (global_rows, 6)
+                    or dp_packed_route_output.dtype != torch.int32
+                    or dp_packed_route_output.device != local_hidden_states.device
+                    or not dp_packed_route_output.is_contiguous()
+                ):
+                    raise RuntimeError(
+                        "invalid DSV4 Huge local/global routed-MXFP8 gather "
+                        "workspace"
+                    )
+                # The packed-only route skips every consumer of the BF16 values.
+                # Use the global q tensor as the row/device carrier and pass the
+                # same tensor through ``prequant`` to FlashInfer below.
+                hidden_states = global_routed_q
             if _do_shared_local and local_hidden_states.shape[0] > 0:
                 # The replicated TP1 shared expert is independent of DP gather
                 # and routed MoE. Issue it on the pre-created model stream and
@@ -2342,18 +2440,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     _shared_local = self.mlp._forward_shared_experts(
                         local_hidden_states, x_quant=shared_x_quant
                     )
-            route_builder = getattr(
-                self.mlp, "build_dsv4_huge_local_packed_route", None
-            )
-            if (
-                dp_packed_route_output is not None
-                and isinstance(self.mlp, deepseek_v2.DeepseekV2MoE)
-                and route_builder is None
-            ):
-                raise RuntimeError(
-                    "DSV4 Huge routed MoE is missing its local packed-route "
-                    "producer"
-                )
             if dp_packed_route_output is not None and route_builder is not None:
                 local_packed_route = route_builder(
                     local_hidden_states,
@@ -2368,11 +2454,34 @@ class DeepseekV4DecoderLayer(nn.Module):
                         f"{tuple(local_packed_route.shape)}, expected "
                         f"({local_hidden_states.shape[0]}, 6)"
                     )
-                dp_gather_partial_grouped(
-                    [hidden_states, dp_packed_route_output],
-                    [local_hidden_states, local_packed_route],
-                    forward_batch,
-                )
+                if dp_routed_quant_output is None:
+                    dp_gather_partial_grouped(
+                        [hidden_states, dp_packed_route_output],
+                        [local_hidden_states, local_packed_route],
+                        forward_batch,
+                    )
+                else:
+                    if routed_x_quant is None:
+                        raise RuntimeError(
+                            "DSV4 Huge routed-MXFP8 gather lost its local producer "
+                            "output"
+                        )
+                    local_routed_q, local_routed_scale = routed_x_quant
+                    global_routed_q, global_routed_scale = dp_routed_quant_output
+                    dp_gather_partial_grouped(
+                        [
+                            global_routed_q.view(torch.uint8),
+                            global_routed_scale,
+                            dp_packed_route_output,
+                        ],
+                        [
+                            local_routed_q.view(torch.uint8),
+                            local_routed_scale,
+                            local_packed_route,
+                        ],
+                        forward_batch,
+                    )
+                    routed_x_quant = (global_routed_q, global_routed_scale)
                 precomputed_topk_output = PackedOnlyTopKOutput(
                     dp_packed_route_output
                 )
