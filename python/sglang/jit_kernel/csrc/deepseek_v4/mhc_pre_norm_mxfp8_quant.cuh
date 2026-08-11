@@ -213,14 +213,16 @@ __device__ __forceinline__ void mhc_process_norm_quant_tile(
         0xffffffffu, exponent, static_cast<int>(lane & ~15u));
     const float inv_scale = inv_scale_ue8m0(exponent);
 
-    auto* output = reinterpret_cast<fp8x2_e4m3_t*>(
-        params.output_fp8 + token * 4096 + offset);
+    alignas(8) fp8x2_e4m3_t packed_output[4];
 #pragma unroll
     for (uint32_t pair = 0; pair < 4; ++pair) {
-      output[pair] = pack_fp8(
+      packed_output[pair] = pack_fp8(
           values[pair * 2] * inv_scale,
           values[pair * 2 + 1] * inv_scale);
     }
+    reinterpret_cast<uint64_t*>(
+        params.output_fp8 + token * 4096 + offset)[0] =
+        reinterpret_cast<const uint64_t*>(packed_output)[0];
 
     if constexpr (kEmitRoutedQuant) {
       float routed_absmax = thread_absmax;
@@ -238,14 +240,16 @@ __device__ __forceinline__ void mhc_process_norm_quant_tile(
       routed_exponent = __shfl_sync(
           0xffffffffu, routed_exponent, static_cast<int>(lane & ~3u));
       const float routed_inv_scale = inv_scale_ue8m0(routed_exponent);
-      auto* routed_output = reinterpret_cast<fp8x2_e4m3_t*>(
-          params.routed_output_fp8 + token * 4096 + offset);
+      alignas(8) fp8x2_e4m3_t packed_routed_output[4];
 #pragma unroll
       for (uint32_t pair = 0; pair < 4; ++pair) {
-        routed_output[pair] = pack_fp8(
+        packed_routed_output[pair] = pack_fp8(
             values[pair * 2] * routed_inv_scale,
             values[pair * 2 + 1] * routed_inv_scale);
       }
+      reinterpret_cast<uint64_t*>(
+          params.routed_output_fp8 + token * 4096 + offset)[0] =
+          reinterpret_cast<const uint64_t*>(packed_routed_output)[0];
       if ((lane & 3) == 0) {
         const uint32_t routed_group = (tile * 1024 + tile_offset) / 32;
         params.routed_output_scale[token * 128 + routed_group] =
