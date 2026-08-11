@@ -608,15 +608,15 @@ SGL_DEVICE uint32_t tp4_moe_local_slice_multimem_shared_mhc_post_pair(
     const uint4 residual_raw3,
     const float* coefficients,
     const uint32_t output_route) {
-  const float2 reduced_value = __bfloat1622float2(
+  // Both inputs are already BF16 and the original boundary is exactly one
+  // FP32 add followed by an RN conversion back to BF16.  Blackwell HADD2
+  // implements that same per-lane BF16 result directly, avoiding two input
+  // unpacks, the scalar FP32 adds, and the explicit repack for every pair.
+  const __nv_bfloat162 rounded_sum = __hadd2(
       tp4_moe_mhc_uint_to_bf16x2(
-          tp4_moe_mhc_uint4_pair<kPair>(reduced_raw)));
-  const float2 shared_value = __bfloat1622float2(
+          tp4_moe_mhc_uint4_pair<kPair>(reduced_raw)),
       tp4_moe_mhc_uint_to_bf16x2(
           tp4_moe_mhc_uint4_pair<kPair>(shared_raw)));
-  const __nv_bfloat162 rounded_sum = __float22bfloat162_rn(make_float2(
-      reduced_value.x + shared_value.x,
-      reduced_value.y + shared_value.y));
   const float2 hidden_value = __bfloat1622float2(rounded_sum);
 
   const float2 residual_value0 = __bfloat1622float2(
