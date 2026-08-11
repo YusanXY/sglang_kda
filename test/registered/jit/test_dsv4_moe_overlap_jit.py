@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from sglang.jit_kernel.dsv4_moe_overlap.jit import (
+    _DSV4_JIT_MODULE_NAME,
     _EXPORT_ANCHOR,
     _FP4_MULTI_TILE_END,
     _FP4_MULTI_TILE_START,
@@ -55,9 +56,52 @@ def test_patch_moves_prepare_before_routing() -> None:
     assert "launchers_map" not in patched
     assert patched.count("std::make_unique<FP4BlockScaleLauncher>") == 1
     assert patched.count("dsv4MoeFinalizeSharedKernel") >= 2
+    assert patched.count("dsv4MoeFinalizeDpRoutedKernel") >= 2
     assert patched.count("dsv4_set_shared_finalize") >= 3
-    assert "args->do_finalize = do_finalize && !dsv4_fuse_shared" in patched
-    assert "result[0], topk_weights, result[2]" in patched
+    assert patched.count("dsv4_set_dp_routed_finalize") >= 3
+    assert (
+        "do_finalize && !dsv4_fuse_shared && !dsv4_fuse_dp_routed"
+        in patched
+    )
+    assert "result[0], topk_ids, result[2]" in patched
+    assert "RoutingInputMode::PackedPrecomputed" in patched
+    assert "static_cast<uint32_t>(packed) & 0xffffu" in patched
+    assert "__ushort_as_bfloat16(bits)" in patched
+    assert (
+        patched.count("dsv4_packed_weight_to_float(packed_topk[expanded])")
+        == 2
+    )
+    assert "result[0], result[1], result[2]" not in patched
+    assert "result[0], topk_weights, result[2]" not in patched
+    assert (
+        _DSV4_JIT_MODULE_NAME
+        == "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v72"
+    )
+
+
+def test_dp_routed_finalize_preserves_two_bf16_rounds_without_shared_add() -> None:
+    patched = _patch_launcher(_source())
+    kernel_start = patched.index("__global__ void dsv4MoeFinalizeDpRoutedKernel")
+    kernel_end = patched.index("void dsv4_launch_dp_routed_finalize", kernel_start)
+    kernel = patched[kernel_start:kernel_end]
+
+    first_round = kernel.index(
+        "__nv_bfloat16 const finalized = __float2bfloat16_rn(accum[element])"
+    )
+    scale = kernel.index("__bfloat162float(finalized) * routed_scale")
+    output_store = kernel.index("output_vec[token * hidden_vecs + vec] = result")
+    assert first_round < scale < output_store
+    assert "shared_output" not in kernel
+    assert "shared_vec" not in kernel
+
+
+def test_dp_routed_finalize_is_one_shot_and_mutually_exclusive() -> None:
+    patched = _patch_launcher(_source())
+
+    assert "DSV4 finalize modes are mutually exclusive" in patched
+    assert "Dsv4FinalizeStateResetGuard" in patched
+    assert "dsv4_cancel_finalize" in patched
+    assert "DSV4 DP routed-finalize descriptor was not consumed" in patched
 
 
 @pytest.mark.parametrize(

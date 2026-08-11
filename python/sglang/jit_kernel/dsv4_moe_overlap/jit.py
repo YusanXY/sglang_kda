@@ -7,6 +7,7 @@ from pathlib import Path
 
 _DSV4_JIT_SPEC = None
 _DSV4_RAW_MODULE = None
+_DSV4_JIT_MODULE_NAME = "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v72"
 
 
 _EXPECTED_LAUNCHER_SHA256 = (
@@ -85,7 +86,7 @@ _DSV4_MOE_RUNNER_CONSTRUCTION = """    auto make_runner = [&]() -> std::shared_p
           this->use_shuffled_weight, this->weight_layout,
           usePerTokenScalingGemm1, usePerTokenScalingGemm2);
     };
-    if (dsv4_shared_finalize_state.active) {
+    if (dsv4_any_finalize_active()) {
       auto& persistent = dsv4_persistent_moe_state;
       int const act_dtype = static_cast<int>(this->mDtypeAct);
       int const weight_dtype = static_cast<int>(this->mDtypeWeights);
@@ -147,7 +148,7 @@ _MOE_TACTIC_AND_WORKSPACE = """    if (moe_tactic == -1) {
 """
 
 _DSV4_MOE_TACTIC_AND_WORKSPACE = """    auto& persistent = dsv4_persistent_moe_state;
-    bool const use_persistent = dsv4_shared_finalize_state.active;
+    bool const use_persistent = dsv4_any_finalize_active();
     // Tactic validity and workspace byte counts depend on aggregate M.  Prefix
     // construction and the true req=16 batch deliberately alternate between
     // M=4096 and M=65536, so retain the runner but refresh the shape-dependent
@@ -228,6 +229,39 @@ struct Dsv4SharedFinalizeState {
 // upstream FlashInfer public ABI.
 thread_local Dsv4SharedFinalizeState dsv4_shared_finalize_state;
 
+struct Dsv4DpRoutedFinalizeState {
+  __nv_bfloat16* output = nullptr;
+  int64_t num_tokens = 0;
+  int64_t hidden_dim = 0;
+  float routed_scale = 1.0f;
+  bool active = false;
+};
+
+// Unlike the TP-only shared-finalize state above, this is a one-shot DP
+// descriptor.  Each selected decoder layer refreshes it immediately before
+// entering the FlashInfer launcher, and the launcher consumes it exactly once.
+thread_local Dsv4DpRoutedFinalizeState dsv4_dp_routed_finalize_state;
+
+bool dsv4_any_finalize_active() {
+  return dsv4_shared_finalize_state.active ||
+      dsv4_dp_routed_finalize_state.active;
+}
+
+struct Dsv4FinalizeStateResetGuard {
+  bool reset_shared = false;
+  bool reset_dp_routed = false;
+
+  ~Dsv4FinalizeStateResetGuard() {
+    if (reset_shared) dsv4_shared_finalize_state.active = false;
+    if (reset_dp_routed) dsv4_dp_routed_finalize_state.active = false;
+  }
+};
+
+void dsv4_cancel_finalize() {
+  dsv4_shared_finalize_state.active = false;
+  dsv4_dp_routed_finalize_state.active = false;
+}
+
 struct Dsv4PersistentMoeState {
   size_t tensor_cursor = 0;
   // A logical allocator slot can request different routing-dependent shapes
@@ -259,7 +293,7 @@ void dsv4_begin_persistent_moe_call() {
 }
 
 Tensor dsv4_alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice device) {
-  if (!dsv4_shared_finalize_state.active) {
+  if (!dsv4_any_finalize_active()) {
     return alloc_tensor(shape, dtype, device);
   }
   auto& persistent = dsv4_persistent_moe_state;
@@ -285,6 +319,10 @@ Tensor dsv4_alloc_tensor(tvm::ffi::Shape shape, DLDataType dtype, DLDevice devic
 }
 
 void dsv4_set_shared_finalize(TensorView shared_output, double routed_scale) {
+  TVM_FFI_ICHECK(!dsv4_dp_routed_finalize_state.active)
+      << "DSV4 TP shared-finalize and DP routed-finalize are mutually exclusive";
+  TVM_FFI_ICHECK(!dsv4_shared_finalize_state.active)
+      << "DSV4 TP shared-finalize descriptor was not consumed";
   TVM_FFI_ICHECK(shared_output.device().device_type == kDLCUDA);
   TVM_FFI_ICHECK((shared_output.dtype() == DLDataType{kDLBfloat, 16, 1}));
   TVM_FFI_ICHECK_EQ(shared_output.ndim(), 2);
@@ -297,19 +335,72 @@ void dsv4_set_shared_finalize(TensorView shared_output, double routed_scale) {
   dsv4_shared_finalize_state.active = true;
 }
 
+void dsv4_set_dp_routed_finalize(TensorView output, double routed_scale) {
+  TVM_FFI_ICHECK(!dsv4_shared_finalize_state.active)
+      << "DSV4 DP routed-finalize and TP shared-finalize are mutually exclusive";
+  TVM_FFI_ICHECK(!dsv4_dp_routed_finalize_state.active)
+      << "DSV4 DP routed-finalize descriptor was not consumed";
+  TVM_FFI_ICHECK(output.device().device_type == kDLCUDA);
+  TVM_FFI_ICHECK((output.dtype() == DLDataType{kDLBfloat, 16, 1}));
+  TVM_FFI_ICHECK_EQ(output.ndim(), 2);
+  TVM_FFI_ICHECK(output.IsContiguous());
+  TVM_FFI_ICHECK_EQ(output.size(1), 4096);
+  dsv4_dp_routed_finalize_state.output =
+      static_cast<__nv_bfloat16*>(output.data_ptr());
+  dsv4_dp_routed_finalize_state.num_tokens = output.size(0);
+  dsv4_dp_routed_finalize_state.hidden_dim = output.size(1);
+  dsv4_dp_routed_finalize_state.routed_scale =
+      static_cast<float>(routed_scale);
+  dsv4_dp_routed_finalize_state.active = true;
+}
+
 struct alignas(16) Dsv4Bf16x8 {
   __nv_bfloat16 value[8];
 };
 
-__device__ __forceinline__ float dsv4_weight_to_float(float value) {
-  return value;
+bool dsv4_same_device(DLDevice lhs, DLDevice rhs) {
+  return lhs.device_type == rhs.device_type &&
+      lhs.device_id == rhs.device_id;
 }
 
-__device__ __forceinline__ float dsv4_weight_to_float(__nv_bfloat16 value) {
-  return __bfloat162float(value);
+void dsv4_check_finalize_inputs(
+    Tensor const& gemm2_output,
+    TensorView packed_topk,
+    Tensor const& expanded_to_permuted,
+    TensorView output,
+    int64_t num_tokens,
+    int64_t hidden_dim,
+    int top_k) {
+  TVM_FFI_ICHECK_GT(top_k, 0);
+  TVM_FFI_ICHECK_LE(top_k, 64);
+  TVM_FFI_ICHECK_EQ(gemm2_output.ndim(), 2);
+  TVM_FFI_ICHECK((gemm2_output.dtype() == DLDataType{kDLBfloat, 16, 1}));
+  TVM_FFI_ICHECK(gemm2_output.IsContiguous());
+  TVM_FFI_ICHECK_GE(gemm2_output.size(1), hidden_dim);
+  TVM_FFI_ICHECK_EQ(gemm2_output.size(1) % 8, 0);
+  TVM_FFI_ICHECK(dsv4_same_device(gemm2_output.device(), output.device()));
+  TVM_FFI_ICHECK_EQ(packed_topk.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(packed_topk.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(packed_topk.size(1), top_k);
+  TVM_FFI_ICHECK((packed_topk.dtype() == DLDataType{kDLInt, 32, 1}));
+  TVM_FFI_ICHECK(packed_topk.IsContiguous());
+  TVM_FFI_ICHECK(dsv4_same_device(packed_topk.device(), output.device()));
+  TVM_FFI_ICHECK_EQ(expanded_to_permuted.ndim(), 1);
+  TVM_FFI_ICHECK_EQ(
+      expanded_to_permuted.numel(), num_tokens * static_cast<int64_t>(top_k));
+  TVM_FFI_ICHECK(
+      (expanded_to_permuted.dtype() == DLDataType{kDLInt, 32, 1}));
+  TVM_FFI_ICHECK(expanded_to_permuted.IsContiguous());
+  TVM_FFI_ICHECK(dsv4_same_device(
+      expanded_to_permuted.device(), output.device()));
 }
 
-template <typename WeightType>
+__device__ __forceinline__ float dsv4_packed_weight_to_float(int32_t packed) {
+  auto const bits = static_cast<unsigned short>(
+      static_cast<uint32_t>(packed) & 0xffffu);
+  return __bfloat162float(__ushort_as_bfloat16(bits));
+}
+
 __global__ void dsv4MoeFinalizeSharedKernel(
     int num_tokens,
     int hidden_dim,
@@ -317,7 +408,7 @@ __global__ void dsv4MoeFinalizeSharedKernel(
     int top_k,
     __nv_bfloat16 const* __restrict__ gemm2_output,
     int const* __restrict__ expanded_to_permuted,
-    WeightType const* __restrict__ expert_weights,
+    int32_t const* __restrict__ packed_topk,
     __nv_bfloat16 const* __restrict__ shared_output,
     float routed_scale,
     __nv_bfloat16* __restrict__ output) {
@@ -331,7 +422,7 @@ __global__ void dsv4MoeFinalizeSharedKernel(
   for (int k = threadIdx.x; k < top_k; k += blockDim.x) {
     int const expanded = token * top_k + k;
     permuted[k] = expanded_to_permuted[expanded];
-    weights[k] = dsv4_weight_to_float(expert_weights[expanded]);
+    weights[k] = dsv4_packed_weight_to_float(packed_topk[expanded]);
   }
   __syncthreads();
 
@@ -356,8 +447,10 @@ __global__ void dsv4MoeFinalizeSharedKernel(
     Dsv4Bf16x8 result;
 #pragma unroll
     for (int element = 0; element < 8; ++element) {
+      __nv_bfloat16 const finalized = __float2bfloat16_rn(accum[element]);
       result.value[element] = __float2bfloat16_rn(
-          accum[element] * routed_scale + __bfloat162float(shared.value[element]));
+          __bfloat162float(finalized) * routed_scale +
+          __bfloat162float(shared.value[element]));
     }
     output_vec[token * hidden_vecs + vec] = result;
   }
@@ -368,7 +461,7 @@ __global__ void dsv4MoeFinalizeSharedKernel(
 
 void dsv4_launch_shared_finalize(
     Tensor const& gemm2_output,
-    TensorView expert_weights,
+    TensorView packed_topk,
     Tensor const& expanded_to_permuted,
     TensorView output,
     int top_k,
@@ -379,42 +472,115 @@ void dsv4_launch_shared_finalize(
   TVM_FFI_ICHECK_EQ(output.size(0), state.num_tokens);
   TVM_FFI_ICHECK_EQ(output.size(1), state.hidden_dim);
   TVM_FFI_ICHECK_EQ(output.size(1) % 8, 0);
-  bool const weights_are_bf16 =
-      expert_weights.dtype() == DLDataType{kDLBfloat, 16, 1};
-  bool const weights_are_fp32 =
-      expert_weights.dtype() == DLDataType{kDLFloat, 32, 1};
-  TVM_FFI_ICHECK(weights_are_bf16 || weights_are_fp32)
-      << "DSV4 fused finalize expects BF16 or FP32 routing weights";
-  TVM_FFI_ICHECK((expanded_to_permuted.dtype() == DLDataType{kDLInt, 32, 1}));
-  TVM_FFI_ICHECK_LE(top_k, 64);
+  dsv4_check_finalize_inputs(
+      gemm2_output, packed_topk, expanded_to_permuted, output,
+      state.num_tokens, state.hidden_dim, top_k);
 
   cudaStream_t const stream = get_stream(output.device());
-  if (weights_are_bf16) {
-    dsv4MoeFinalizeSharedKernel<__nv_bfloat16>
-        <<<state.num_tokens, 256, 0, stream>>>(
-            static_cast<int>(state.num_tokens),
-            static_cast<int>(state.hidden_dim),
-            static_cast<int>(gemm2_output.size(1)), top_k,
-            static_cast<__nv_bfloat16 const*>(gemm2_output.data_ptr()),
-            static_cast<int const*>(expanded_to_permuted.data_ptr()),
-            static_cast<__nv_bfloat16 const*>(expert_weights.data_ptr()),
-            state.shared_output, state.routed_scale,
-            static_cast<__nv_bfloat16*>(output.data_ptr()));
-  } else {
-    dsv4MoeFinalizeSharedKernel<float>
-        <<<state.num_tokens, 256, 0, stream>>>(
-            static_cast<int>(state.num_tokens),
-            static_cast<int>(state.hidden_dim),
-            static_cast<int>(gemm2_output.size(1)), top_k,
-            static_cast<__nv_bfloat16 const*>(gemm2_output.data_ptr()),
-            static_cast<int const*>(expanded_to_permuted.data_ptr()),
-            static_cast<float const*>(expert_weights.data_ptr()),
-            state.shared_output, state.routed_scale,
-            static_cast<__nv_bfloat16*>(output.data_ptr()));
-  }
+  dsv4MoeFinalizeSharedKernel<<<state.num_tokens, 256, 0, stream>>>(
+      static_cast<int>(state.num_tokens),
+      static_cast<int>(state.hidden_dim),
+      static_cast<int>(gemm2_output.size(1)), top_k,
+      static_cast<__nv_bfloat16 const*>(gemm2_output.data_ptr()),
+      static_cast<int const*>(expanded_to_permuted.data_ptr()),
+      static_cast<int32_t const*>(packed_topk.data_ptr()),
+      state.shared_output, state.routed_scale,
+      static_cast<__nv_bfloat16*>(output.data_ptr()));
   cudaError_t const error = cudaGetLastError();
   TVM_FFI_ICHECK(error == cudaSuccess)
       << "dsv4 fused MoE finalize launch failed: " << cudaGetErrorString(error);
+}
+
+__global__ void dsv4MoeFinalizeDpRoutedKernel(
+    int num_tokens,
+    int hidden_dim,
+    int hidden_dim_padded,
+    int top_k,
+    __nv_bfloat16 const* __restrict__ gemm2_output,
+    int const* __restrict__ expanded_to_permuted,
+    int32_t const* __restrict__ packed_topk,
+    float routed_scale,
+    __nv_bfloat16* __restrict__ output) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  cudaGridDependencySynchronize();
+#endif
+  constexpr int kMaxTopK = 64;
+  int const token = static_cast<int>(blockIdx.x);
+  __shared__ int permuted[kMaxTopK];
+  __shared__ float weights[kMaxTopK];
+  for (int k = threadIdx.x; k < top_k; k += blockDim.x) {
+    int const expanded = token * top_k + k;
+    permuted[k] = expanded_to_permuted[expanded];
+    weights[k] = dsv4_packed_weight_to_float(packed_topk[expanded]);
+  }
+  __syncthreads();
+
+  int const hidden_vecs = hidden_dim / 8;
+  int const padded_vecs = hidden_dim_padded / 8;
+  auto const* gemm_vec = reinterpret_cast<Dsv4Bf16x8 const*>(gemm2_output);
+  auto* output_vec = reinterpret_cast<Dsv4Bf16x8*>(output);
+  for (int vec = threadIdx.x; vec < hidden_vecs; vec += blockDim.x) {
+    float accum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k = 0; k < top_k; ++k) {
+      int const source = permuted[k];
+      if (source < 0) continue;
+      float const weight = weights[k];
+      Dsv4Bf16x8 const values = gemm_vec[source * padded_vecs + vec];
+#pragma unroll
+      for (int element = 0; element < 8; ++element) {
+        accum[element] += weight * __bfloat162float(values.value[element]);
+      }
+    }
+    Dsv4Bf16x8 result;
+#pragma unroll
+    for (int element = 0; element < 8; ++element) {
+      // Preserve the eager path's two observable BF16 boundaries:
+      // FlashInfer finalize stores BF16 first, then routed.mul_(alpha) stores
+      // BF16 again.  Do not fold the multiply into the FP32 accumulator.
+      __nv_bfloat16 const finalized = __float2bfloat16_rn(accum[element]);
+      result.value[element] = __float2bfloat16_rn(
+          __bfloat162float(finalized) * routed_scale);
+    }
+    output_vec[token * hidden_vecs + vec] = result;
+  }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+void dsv4_launch_dp_routed_finalize(
+    Tensor const& gemm2_output,
+    TensorView packed_topk,
+    Tensor const& expanded_to_permuted,
+    TensorView output,
+    int top_k,
+    bool enable_pdl) {
+  auto const& state = dsv4_dp_routed_finalize_state;
+  TVM_FFI_ICHECK(state.active);
+  TVM_FFI_ICHECK_EQ(output.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(output.size(0), state.num_tokens);
+  TVM_FFI_ICHECK_EQ(output.size(1), state.hidden_dim);
+  TVM_FFI_ICHECK_EQ(output.size(1) % 8, 0);
+  auto* const output_ptr = static_cast<__nv_bfloat16*>(output.data_ptr());
+  TVM_FFI_ICHECK_EQ(output_ptr, state.output);
+  dsv4_check_finalize_inputs(
+      gemm2_output, packed_topk, expanded_to_permuted, output,
+      state.num_tokens, state.hidden_dim, top_k);
+
+  cudaStream_t const stream = get_stream(output.device());
+  dsv4MoeFinalizeDpRoutedKernel<<<state.num_tokens, 256, 0, stream>>>(
+      static_cast<int>(state.num_tokens),
+      static_cast<int>(state.hidden_dim),
+      static_cast<int>(gemm2_output.size(1)), top_k,
+      static_cast<__nv_bfloat16 const*>(gemm2_output.data_ptr()),
+      static_cast<int const*>(expanded_to_permuted.data_ptr()),
+      static_cast<int32_t const*>(packed_topk.data_ptr()),
+      state.routed_scale,
+      output_ptr);
+  cudaError_t const error = cudaGetLastError();
+  TVM_FFI_ICHECK(error == cudaSuccess)
+      << "dsv4 DP routed finalize launch failed: "
+      << cudaGetErrorString(error);
 }
 """
 
@@ -449,13 +615,26 @@ _FP4_SINGLE_TILE_BLOCK = """  // Resolve the autotuner tactic first. Huge mode i
   args->intermediate_size = intermediate_size;
   args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
   bool const dsv4_fuse_shared = dsv4_shared_finalize_state.active;
+  bool const dsv4_fuse_dp_routed = dsv4_dp_routed_finalize_state.active;
+  Dsv4FinalizeStateResetGuard dsv4_finalize_reset_guard{
+      dsv4_fuse_shared, dsv4_fuse_dp_routed};
+  TVM_FFI_ICHECK(!(dsv4_fuse_shared && dsv4_fuse_dp_routed))
+      << "DSV4 finalize modes are mutually exclusive";
   TVM_FFI_ICHECK(!dsv4_fuse_shared || do_finalize)
       << "DSV4 shared finalize requires do_finalize=true";
-  args->do_finalize = do_finalize && !dsv4_fuse_shared;
+  TVM_FFI_ICHECK(!dsv4_fuse_dp_routed || do_finalize)
+      << "DSV4 DP routed finalize requires do_finalize=true";
+  TVM_FFI_ICHECK(
+      !(dsv4_fuse_shared || dsv4_fuse_dp_routed) ||
+      routing_input_mode ==
+          static_cast<int64_t>(RoutingInputMode::PackedPrecomputed))
+      << "DSV4 custom finalize requires packed precomputed routing";
+  args->do_finalize =
+      do_finalize && !dsv4_fuse_shared && !dsv4_fuse_dp_routed;
   args->output = output.data_ptr();
   args->output_scale = nullptr;
 
-  if (dsv4_fuse_shared) {
+  if (dsv4_fuse_shared || dsv4_fuse_dp_routed) {
     dsv4_begin_persistent_moe_call();
   }
 
@@ -470,10 +649,19 @@ _FP4_SINGLE_TILE_BLOCK = """  // Resolve the autotuner tactic first. Huge mode i
                  static_cast<ActivationType>(act_type), mDtypeAct, mDtypeWeights, norm_topk_prob);
   launcher->set_routing_replay_out(routing_replay_out);
   Array<Tensor> result = launcher->run(config, enable_pdl);
+  if (dsv4_fuse_dp_routed) {
+    TVM_FFI_ICHECK_EQ(result.size(), 3);
+    dsv4_launch_dp_routed_finalize(
+        result[0], topk_ids, result[2], output, top_k, enable_pdl);
+    // `do_finalize=false` deliberately returns the three internal tensors.
+    // The SGLang wrapper keeps them alive through the persistent arena and
+    // returns its externally-owned symmetric output instead of result[0].
+    return result;
+  }
   if (dsv4_fuse_shared) {
     TVM_FFI_ICHECK_EQ(result.size(), 3);
     dsv4_launch_shared_finalize(
-        result[0], topk_weights, result[2], output, top_k, enable_pdl);
+        result[0], topk_ids, result[2], output, top_k, enable_pdl);
     // The Python wrapper owns `output` and returns it whenever the public
     // do_finalize argument is true; the intermediate array is ignored there.
     return result;
@@ -558,7 +746,12 @@ def _patch_launcher(source: str) -> str:
     return source.replace(
         _EXPORT_ANCHOR,
         "TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_set_shared_finalize, "
-        "dsv4_set_shared_finalize);\n" + _EXPORT_ANCHOR,
+        "dsv4_set_shared_finalize);\n"
+        "TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_set_dp_routed_finalize, "
+        "dsv4_set_dp_routed_finalize);\n"
+        "TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_cancel_finalize, "
+        "dsv4_cancel_finalize);\n"
+        + _EXPORT_ANCHOR,
     )
 
 
@@ -649,7 +842,7 @@ def gen_dsv4_trtllm_gen_fused_moe_sm100_module():
     )
 
     _DSV4_JIT_SPEC = gen_jit_spec(
-        "sgl_dsv4_fused_moe_trtllm_sm100_overlap",
+        _DSV4_JIT_MODULE_NAME,
         [
             flashinfer_csrc_dir / "nv_internal/cpp/kernels/quantization.cu",
             flashinfer_csrc_dir / "nv_internal/cpp/common/envUtils.cpp",
@@ -707,3 +900,24 @@ def set_dsv4_shared_finalize(shared_output, routed_scaling_factor: float) -> Non
     _DSV4_RAW_MODULE.dsv4_set_shared_finalize(
         shared_output, float(routed_scaling_factor)
     )
+
+
+def set_dsv4_dp_routed_finalize(output, routed_scaling_factor: float) -> None:
+    global _DSV4_RAW_MODULE
+    if _DSV4_RAW_MODULE is None:
+        # Reuse the exact patched module selected by the FlashInfer wrapper;
+        # loading a second copy would create independent thread-local state.
+        from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+
+        get_trtllm_moe_sm100_module()
+        if _DSV4_JIT_SPEC is None:
+            raise RuntimeError("DSV4 Huge MoE JIT module was not initialized")
+        _DSV4_RAW_MODULE = _DSV4_JIT_SPEC.build_and_load()
+    _DSV4_RAW_MODULE.dsv4_set_dp_routed_finalize(
+        output, float(routed_scaling_factor)
+    )
+
+
+def cancel_dsv4_finalize() -> None:
+    if _DSV4_RAW_MODULE is not None:
+        _DSV4_RAW_MODULE.dsv4_cancel_finalize()

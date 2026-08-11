@@ -829,6 +829,9 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         self._shared_expert_tp1 = False
+        # Bound once by DSV4WholeLayerRuntime.  The flag is deliberately not
+        # inferred from a mutable environment variable in the per-layer path.
+        self._dsv4_huge_dp_finalize_scale = False
         # Shared experts: skip when fused into MoE kernel
         # (self.num_fused_shared_experts > 0) or when DeepEP/MegaMOE fusion is enabled.
         if (
@@ -1436,7 +1439,36 @@ class DeepseekV2MoE(nn.Module):
             and not self._shared_expert_tp1
             and routed_x_quant is not None
         )
-        if fuse_moe_shared_finalize:
+        fuse_moe_dp_finalize_scale = bool(
+            getattr(self, "_dsv4_huge_dp_finalize_scale", False)
+            and get_forward().moe_output_buffer_external_symmetric
+        )
+        if fuse_moe_dp_finalize_scale:
+            server_args = get_server_args()
+            if (
+                server_args.dsv4_worker_backend != "huge_kernel"
+                or not server_args.enable_dp_attention
+                or not _is_cuda
+                or hidden_states.shape[0] <= 0
+                or not skip_shared_experts
+                or not hasattr(self, "shared_experts")
+                or not self._shared_expert_tp1
+                or self.num_fused_shared_experts != 0
+                or not isinstance(routed_x_quant, tuple)
+                or len(routed_x_quant) != 2
+                or fuse_moe_shared_finalize
+            ):
+                raise RuntimeError(
+                    "DSV4 Huge DP routed-only finalize-scale requires an "
+                    "external symmetric output, replicated TP1 shared experts "
+                    "kept outside MoE, and a two-tensor routed prequant descriptor"
+                )
+            moe_prequant = (
+                routed_x_quant[0],
+                routed_x_quant[1],
+                self.routed_scaling_factor,
+            )
+        elif fuse_moe_shared_finalize:
             if defer_shared or shared_output is None:
                 raise RuntimeError(
                     "DSV4 Huge in-launcher MoE finalize requires shared experts "
@@ -1479,7 +1511,7 @@ class DeepseekV2MoE(nn.Module):
                 x_quant=shared_x_quant,
             )
 
-        if not fuse_moe_shared_finalize:
+        if not (fuse_moe_shared_finalize or fuse_moe_dp_finalize_scale):
             final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
                 self.experts,
                 final_hidden_states,

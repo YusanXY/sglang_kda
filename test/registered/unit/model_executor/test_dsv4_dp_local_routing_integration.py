@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.topk import (
     PackedOnlyTopKOutput,
     StandardTopKOutputPacked,
 )
+from sglang.srt.layers.quantization import mxfp4_flashinfer_trtllm_moe
 from sglang.srt.models import deepseek_v2, deepseek_v4, dsv4_whole_layer_runtime
 
 
@@ -594,6 +595,149 @@ def test_nvls_gate_requires_the_full_epoch_counter_stack(monkeypatch):
             config=object(),
             server_args=SimpleNamespace(enable_dp_attention=True),
         )
+
+
+def test_finalize_scale_gate_requires_complete_nvls_stack(monkeypatch):
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE", "1")
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST", "1")
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_MOE_EPOCH", "1")
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_MOE_EPOCH_COUNTER", "1")
+    monkeypatch.delenv("SGLANG_DSV4_HUGE_DP_MOE_NVLS", raising=False)
+    monkeypatch.delenv("SGLANG_DSV4_HUGE_DP_MOE_EPOCH_SPLIT", raising=False)
+
+    with mock.patch.object(
+        dsv4_whole_layer_runtime.DSV4WholeLayerRuntime,
+        "_validate_static_config",
+    ), mock.patch(
+        "sglang.srt.layers.dp_attention.enable_dp_gatherv_for_dsv4_huge"
+    ), pytest.raises(RuntimeError, match="FINALIZE_SCALE.*NVLS"):
+        dsv4_whole_layer_runtime.DSV4WholeLayerRuntime(
+            config=object(),
+            server_args=SimpleNamespace(enable_dp_attention=True),
+        )
+
+
+def test_finalize_scale_gate_is_bound_once_when_full_stack_is_valid(monkeypatch):
+    for name in (
+        "SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE",
+        "SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST",
+        "SGLANG_DSV4_HUGE_DP_MOE_EPOCH",
+        "SGLANG_DSV4_HUGE_DP_MOE_EPOCH_COUNTER",
+        "SGLANG_DSV4_HUGE_DP_MOE_NVLS",
+    ):
+        monkeypatch.setenv(name, "1")
+    monkeypatch.delenv("SGLANG_DSV4_HUGE_DP_MOE_EPOCH_SPLIT", raising=False)
+
+    with mock.patch.object(
+        dsv4_whole_layer_runtime.DSV4WholeLayerRuntime,
+        "_validate_static_config",
+    ), mock.patch(
+        "sglang.srt.layers.dp_attention.enable_dp_gatherv_for_dsv4_huge"
+    ):
+        runtime = dsv4_whole_layer_runtime.DSV4WholeLayerRuntime(
+            config=object(),
+            server_args=SimpleNamespace(enable_dp_attention=True),
+        )
+
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE", "0")
+    assert runtime._use_dp_moe_finalize_scale is True
+
+
+def test_dp_finalize_overlay_is_default_off_and_rejects_partial_stack(
+    monkeypatch,
+):
+    server_args = SimpleNamespace(
+        dsv4_worker_backend="huge_kernel", enable_dp_attention=True
+    )
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "_install_writable_flashinfer_cubin_overlay",
+        mock.Mock(),
+    )
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "get_server_args",
+        mock.Mock(return_value=server_args),
+    )
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "_DSV4_MOE_OVERLAP_INSTALLED",
+        False,
+    )
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "_DSV4_DP_FINALIZE_SCALE_INSTALLED",
+        False,
+    )
+    monkeypatch.delenv("SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE", raising=False)
+
+    # Default-off Attention-DP returns before selecting/building the patched
+    # launcher (the pre-existing writable include staging remains harmless).
+    mxfp4_flashinfer_trtllm_moe._install_dsv4_huge_moe_overlap()
+
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE", "1")
+    for name in (
+        "SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST",
+        "SGLANG_DSV4_HUGE_DP_MOE_EPOCH",
+        "SGLANG_DSV4_HUGE_DP_MOE_EPOCH_COUNTER",
+        "SGLANG_DSV4_HUGE_DP_MOE_NVLS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="complete symmetric NVLS"):
+        mxfp4_flashinfer_trtllm_moe._install_dsv4_huge_moe_overlap()
+    assert not mxfp4_flashinfer_trtllm_moe._DSV4_DP_FINALIZE_SCALE_INSTALLED
+
+
+def test_dp_finalize_overlay_accepts_only_the_full_staging_stack(monkeypatch):
+    server_args = SimpleNamespace(
+        dsv4_worker_backend="huge_kernel", enable_dp_attention=True
+    )
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "_install_writable_flashinfer_cubin_overlay",
+        mock.Mock(),
+    )
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "get_server_args",
+        mock.Mock(return_value=server_args),
+    )
+    # Stop immediately after the strict validation so this protocol test never
+    # imports FlashInfer or builds CUDA code.
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "_DSV4_MOE_OVERLAP_INSTALLED",
+        True,
+    )
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "_DSV4_DP_FINALIZE_SCALE_INSTALLED",
+        False,
+    )
+    for name in (
+        "SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE",
+        "SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST",
+        "SGLANG_DSV4_HUGE_DP_MOE_EPOCH",
+        "SGLANG_DSV4_HUGE_DP_MOE_EPOCH_COUNTER",
+        "SGLANG_DSV4_HUGE_DP_MOE_NVLS",
+    ):
+        monkeypatch.setenv(name, "1")
+
+    mxfp4_flashinfer_trtllm_moe._install_dsv4_huge_moe_overlap()
+    assert mxfp4_flashinfer_trtllm_moe._DSV4_DP_FINALIZE_SCALE_INSTALLED
+
+
+def test_custom_finalize_returns_external_symmetric_output_not_gemm2():
+    source = textwrap.dedent(
+        inspect.getsource(
+            mxfp4_flashinfer_trtllm_moe.Mxfp4FlashinferTrtllmMoEMethod.apply
+        )
+    )
+
+    assert "moe_outputs = trtllm_fp4_block_scale_routed_moe" in source
+    assert "output = symm_output" in source
+    assert "output = moe_outputs[0]" in source
+    assert "cancel_dsv4_finalize()" in source
 
 
 def test_symmetric_post_gate_rejects_graph_capture_before_hot_path():
@@ -1221,6 +1365,111 @@ class _DenseMlp:
 class _TensorRouteMlp(_DenseMlp):
     def build_dsv4_huge_local_packed_route(self, hidden_states, input_ids=None):
         return torch.empty((hidden_states.shape[0], 6), dtype=torch.int32)
+
+
+def test_dp_finalize_scale_passes_alpha_and_skips_python_routed_mul():
+    global_rows = 8
+    moe = _RouteAwareMoe(local_rows=2)
+    moe._shared_expert_tp1 = True
+    moe._dsv4_huge_dp_finalize_scale = True
+    moe.routed_scaling_factor = 2.5
+    moe.shared_experts = SimpleNamespace(gate_up_proj=object())
+    routed_q = torch.empty(
+        (global_rows, 4096), dtype=torch.float8_e4m3fn
+    )
+    routed_scale = torch.empty((global_rows, 128), dtype=torch.uint8)
+    packed = PackedOnlyTopKOutput(
+        torch.zeros((global_rows, 6), dtype=torch.int32)
+    )
+    server_args = SimpleNamespace(
+        dsv4_worker_backend="huge_kernel", enable_dp_attention=True
+    )
+    forward_context = SimpleNamespace(
+        moe_output_buffer_external_symmetric=True
+    )
+
+    with mock.patch.object(
+        deepseek_v2, "get_server_args", return_value=server_args
+    ), mock.patch.object(
+        deepseek_v2, "get_forward", return_value=forward_context
+    ), mock.patch.object(
+        deepseek_v2, "use_intel_amx_backend", return_value=False
+    ), mock.patch.object(
+        deepseek_v2, "_is_cuda", True
+    ), mock.patch.object(
+        deepseek_v2,
+        "maybe_fuse_routed_scale_and_shared_add",
+        side_effect=AssertionError("v72 must skip the Python routed.mul_"),
+    ):
+        output = deepseek_v2.DeepseekV2MoE.forward_normal(
+            moe,
+            routed_q,
+            skip_shared_experts=True,
+            routed_x_quant=(routed_q, routed_scale),
+            precomputed_topk_output=packed,
+        )
+
+    assert output.shape == routed_q.shape
+    assert len(moe.experts.calls) == 1
+    prequant = moe.experts.calls[0][2]
+    assert prequant[0] is routed_q
+    assert prequant[1] is routed_scale
+    assert prequant[2] == 2.5
+
+
+def test_dp_finalize_scale_reference_keeps_both_bf16_boundaries():
+    accum = torch.linspace(-4.0, 4.0, 10001, dtype=torch.float32)
+    alpha = 2.5
+    eager_reference = (accum.to(torch.bfloat16).float() * alpha).to(
+        torch.bfloat16
+    )
+    incorrectly_folded = (accum * alpha).to(torch.bfloat16)
+
+    # The two formulations are observably different, so the first conversion
+    # in the v72 CUDA kernel is a correctness boundary rather than a comment.
+    assert torch.any(eager_reference != incorrectly_folded)
+
+
+@pytest.mark.parametrize(
+    ("skip_shared_experts", "shared_tp1", "routed_x_quant"),
+    [
+        (False, True, (torch.empty(0), torch.empty(0))),
+        (True, False, (torch.empty(0), torch.empty(0))),
+        (True, True, None),
+    ],
+)
+def test_dp_finalize_scale_rejects_invalid_dynamic_contract(
+    skip_shared_experts, shared_tp1, routed_x_quant
+):
+    moe = _RouteAwareMoe(local_rows=2)
+    moe._shared_expert_tp1 = shared_tp1
+    moe._dsv4_huge_dp_finalize_scale = True
+    moe.shared_experts = SimpleNamespace(gate_up_proj=object())
+    moe._forward_shared_experts = mock.Mock(
+        return_value=torch.empty((2, 4096), dtype=torch.bfloat16)
+    )
+    server_args = SimpleNamespace(
+        dsv4_worker_backend="huge_kernel", enable_dp_attention=True
+    )
+    forward_context = SimpleNamespace(
+        moe_output_buffer_external_symmetric=True
+    )
+
+    with mock.patch.object(
+        deepseek_v2, "get_server_args", return_value=server_args
+    ), mock.patch.object(
+        deepseek_v2, "get_forward", return_value=forward_context
+    ), mock.patch.object(
+        deepseek_v2, "use_intel_amx_backend", return_value=False
+    ), mock.patch.object(
+        deepseek_v2, "_is_cuda", True
+    ), pytest.raises(RuntimeError, match="routed-only finalize-scale"):
+        deepseek_v2.DeepseekV2MoE.forward_normal(
+            moe,
+            torch.empty((2, 4096), dtype=torch.bfloat16),
+            skip_shared_experts=skip_shared_experts,
+            routed_x_quant=routed_x_quant,
+        )
 
 
 def _invoke_dp_moe_path(

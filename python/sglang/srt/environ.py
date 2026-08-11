@@ -895,6 +895,10 @@ class Envs:
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
+    # Experimental Huge Attention-DP staging.  FlashInfer's routed-MoE
+    # finalize writes the external symmetric partial with the same two BF16
+    # rounding boundaries as the eager finalize + in-place scale sequence.
+    SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

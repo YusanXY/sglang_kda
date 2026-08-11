@@ -16,6 +16,7 @@ import msgspec
 import torch
 
 from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
@@ -291,6 +292,21 @@ class DSV4WholeLayerRuntime:
             raise RuntimeError(
                 "SGLANG_DSV4_HUGE_DP_MOE_NVLS=1 requires the symmetric "
                 "MoE epoch-counter path"
+            )
+        self._use_dp_moe_finalize_scale = (
+            envs.SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE.get()
+        )
+        if self._use_dp_moe_finalize_scale and not (
+            self._attention_dp4
+            and self._use_dp_symmetric_moe_post
+            and self._use_dp_moe_epoch
+            and self._use_dp_moe_epoch_counter
+            and self._use_dp_moe_nvls
+        ):
+            raise RuntimeError(
+                "SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE=1 requires strict "
+                "Huge Attention-DP4 with the symmetric MoE NVLS "
+                "epoch-counter stack"
             )
         self._attention_groups = 8 if self._attention_dp4 else 2
         self._max_local_tokens = (
@@ -599,6 +615,9 @@ class DSV4WholeLayerRuntime:
             # The DecoderLayer.forward boundary owns dispatch.  Re-loading
             # weights refreshes all generation-tagged handles in one pass.
             handle.layer._dsv4_huge_dp_shared_expert_local = self._attention_dp4
+            handle.layer.mlp._dsv4_huge_dp_finalize_scale = (
+                self._use_dp_moe_finalize_scale
+            )
             handle.layer.enable_huge_kernel_runner(self, handle)
             shared_experts = getattr(handle.layer.mlp, "shared_experts", None)
             if shared_experts is not None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.runtime_context import get_forward, get_server_args
@@ -46,6 +48,7 @@ _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
 )
 
 _DSV4_MOE_OVERLAP_INSTALLED = False
+_DSV4_DP_FINALIZE_SCALE_INSTALLED = False
 _FLASHINFER_CUBIN_OVERLAY_INSTALLED = False
 _DSV4_HUGE_TOP_K = 6
 
@@ -144,19 +147,44 @@ def _install_writable_flashinfer_cubin_overlay() -> None:
 
 def _install_dsv4_huge_moe_overlap() -> None:
     """Select the Huge-only TRTLLM MoE module before FlashInfer builds it."""
-    global _DSV4_MOE_OVERLAP_INSTALLED
+    global _DSV4_DP_FINALIZE_SCALE_INSTALLED, _DSV4_MOE_OVERLAP_INSTALLED
 
     _install_writable_flashinfer_cubin_overlay()
     server_args = get_server_args()
+    dp_finalize_scale = envs.SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE.get()
+    if dp_finalize_scale and (
+        server_args.dsv4_worker_backend != "huge_kernel"
+        or not server_args.enable_dp_attention
+    ):
+        raise RuntimeError(
+            "SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE=1 requires the DSV4 "
+            "Huge Attention-DP backend"
+        )
     if server_args.dsv4_worker_backend != "huge_kernel":
         return
     if server_args.enable_dp_attention:
-        # This module fuses the TP-only Huge owner/output protocol into the
-        # TRTLLM MoE epilogue. Attention-DP uses gather -> TP-sharded MoE ->
-        # scatter and never requests that external symmetric output contract;
-        # installing the TP module here is both semantically unnecessary and
-        # creates a second multi-minute SM103 JIT artifact.
-        return
+        if not dp_finalize_scale:
+            # The patched module is otherwise TP-only and creates a second
+            # multi-minute SM103 JIT artifact.  Keep the production DP path on
+            # the packaged FlashInfer launcher unless the v72 gate is explicit.
+            return
+        required_dp_stack = (
+            "SGLANG_DSV4_HUGE_DP_SYMM_MOE_POST",
+            "SGLANG_DSV4_HUGE_DP_MOE_EPOCH",
+            "SGLANG_DSV4_HUGE_DP_MOE_EPOCH_COUNTER",
+            "SGLANG_DSV4_HUGE_DP_MOE_NVLS",
+        )
+        missing = tuple(
+            name
+            for name in required_dp_stack
+            if os.environ.get(name, "0") != "1"
+        )
+        if missing:
+            raise RuntimeError(
+                "DSV4 Huge DP finalize-scale requires the complete symmetric "
+                "NVLS epoch-counter stack; missing " + ", ".join(missing)
+            )
+        _DSV4_DP_FINALIZE_SCALE_INSTALLED = True
     if _DSV4_MOE_OVERLAP_INSTALLED:
         return
 
@@ -397,6 +425,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+        shared_output = None
+        routed_scaling_factor = None
+        dp_routed_scaling_factor = None
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
@@ -420,6 +451,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         precision = self.flashinfer_mxfp4_moe_precision
+        if prequant is not None and len(prequant) == 3 and precision != "default":
+            raise RuntimeError(
+                "DSV4 Huge DP routed-only finalize-scale requires default "
+                "MXFP4/MXFP8 precision"
+            )
         if precision == "bf16":
             assert hidden_states.dtype == torch.bfloat16
             x_quant = hidden_states
@@ -447,8 +483,16 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     )
                 if len(prequant) == 2:
                     x_quant, x_scale = prequant
-                    shared_output = None
-                    routed_scaling_factor = None
+                elif len(prequant) == 3:
+                    x_quant, x_scale, dp_routed_scaling_factor = prequant
+                    try:
+                        dp_routed_scaling_factor = float(
+                            dp_routed_scaling_factor
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            "invalid DSV4 Huge DP routed finalize scale"
+                        ) from exc
                 elif len(prequant) == 4:
                     (
                         x_quant,
@@ -458,7 +502,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     ) = prequant
                 else:
                     raise RuntimeError(
-                        "DSV4 Huge routed-MoE prequant must have 2 or 4 tensors/values"
+                        "DSV4 Huge routed-MoE prequant must have 2, 3, or 4 "
+                        "tensors/values"
                     )
                 expected_scale_shape = (hidden_states.shape[0], hidden_size // 32)
                 if (
@@ -514,7 +559,24 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     device=x_quant.device,
                 )
 
-        if prequant is not None and shared_output is not None:
+        if dp_routed_scaling_factor is not None:
+            if (
+                not _DSV4_DP_FINALIZE_SCALE_INSTALLED
+                or get_server_args().dsv4_worker_backend != "huge_kernel"
+                or not get_server_args().enable_dp_attention
+                or not external_symmetric_output
+                or not math.isfinite(dp_routed_scaling_factor)
+                or dp_routed_scaling_factor <= 0.0
+            ):
+                raise RuntimeError(
+                    "invalid DSV4 Huge DP routed-only finalize-scale descriptor"
+                )
+            from sglang.jit_kernel.dsv4_moe_overlap.jit import (
+                set_dsv4_dp_routed_finalize,
+            )
+
+            set_dsv4_dp_routed_finalize(symm_output, dp_routed_scaling_factor)
+        elif prequant is not None and shared_output is not None:
             if (
                 shared_output.shape != (num_tokens, out_hidden_size)
                 or shared_output.dtype != torch.bfloat16
@@ -531,36 +593,56 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
             set_dsv4_shared_finalize(shared_output, routed_scaling_factor)
 
-        output = trtllm_fp4_block_scale_routed_moe(
-            topk_ids=packed_topk,
-            routing_bias=None,
-            hidden_states=x_quant,
-            hidden_states_scale=x_scale,
-            gemm1_weights=w13,
-            gemm1_weights_scale=w13_scale,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
-            gemm2_weights=w2,
-            gemm2_weights_scale=w2_scale,
-            gemm2_bias=None,
-            output1_scale_scalar=layer.output1_scale_scalar,
-            output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
-            output2_scale_scalar=layer.output2_scale_scalar,
-            num_experts=layer.num_experts,
-            top_k=top_k,
-            n_group=1,
-            topk_group=1,
-            intermediate_size=intermediate_size,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            local_num_experts=num_local_experts,
-            routed_scaling_factor=1.0,
-            routing_method_type=int(RoutingMethodType.TopK),
-            do_finalize=True,
-            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
-            output=symm_output,
-        )[0]
+        custom_finalize_armed = (
+            dp_routed_scaling_factor is not None or shared_output is not None
+        )
+        try:
+            moe_outputs = trtllm_fp4_block_scale_routed_moe(
+                topk_ids=packed_topk,
+                routing_bias=None,
+                hidden_states=x_quant,
+                hidden_states_scale=x_scale,
+                gemm1_weights=w13,
+                gemm1_weights_scale=w13_scale,
+                gemm1_bias=None,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
+                gemm2_weights=w2,
+                gemm2_weights_scale=w2_scale,
+                gemm2_bias=None,
+                output1_scale_scalar=layer.output1_scale_scalar,
+                output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
+                output2_scale_scalar=layer.output2_scale_scalar,
+                num_experts=layer.num_experts,
+                top_k=top_k,
+                n_group=1,
+                topk_group=1,
+                intermediate_size=intermediate_size,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=num_local_experts,
+                routed_scaling_factor=1.0,
+                routing_method_type=int(RoutingMethodType.TopK),
+                do_finalize=True,
+                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+                output=symm_output,
+            )
+        except BaseException:
+            if custom_finalize_armed:
+                from sglang.jit_kernel.dsv4_moe_overlap.jit import (
+                    cancel_dsv4_finalize,
+                )
+
+                cancel_dsv4_finalize()
+            raise
+        if dp_routed_scaling_factor is not None or shared_output is not None:
+            # The patched launcher sets do_finalize=false so FlashInfer exposes
+            # GEMM2/routing intermediates to the custom epilogue.  The epilogue
+            # writes the caller-owned symmetric buffer; never leak result[0]
+            # (the padded GEMM2 intermediate) into the model dataflow.
+            output = symm_output
+        else:
+            output = moe_outputs[0]
 
         return StandardCombineInput(hidden_states=output)
 
