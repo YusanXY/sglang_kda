@@ -128,6 +128,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    Dsv4DpRawMoeRequest,
     maybe_fuse_routed_scale_and_shared_add,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -1148,6 +1149,7 @@ class DeepseekV2MoE(nn.Module):
         shared_x_quant=None,
         routed_x_quant=None,
         precomputed_topk_output: Optional[TopKOutput] = None,
+        defer_dp_raw_output: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
@@ -1165,6 +1167,12 @@ class DeepseekV2MoE(nn.Module):
                 shared_x_quant=shared_x_quant,
                 routed_x_quant=routed_x_quant,
                 precomputed_topk_output=precomputed_topk_output,
+                defer_dp_raw_output=defer_dp_raw_output,
+            )
+
+        if defer_dp_raw_output:
+            raise RuntimeError(
+                "DSV4 deferred raw MoE requires a precomputed packed route"
             )
 
         if should_use_mega_moe(self, hidden_states):
@@ -1341,7 +1349,8 @@ class DeepseekV2MoE(nn.Module):
         shared_x_quant=None,
         routed_x_quant=None,
         precomputed_topk_output: Optional[TopKOutput] = None,
-    ) -> torch.Tensor:
+        defer_dp_raw_output: bool = False,
+    ):
         if precomputed_topk_output is not None:
             self._validate_dsv4_huge_local_packed_route()
             if not TopKOutputChecker.format_is_packed_only(
@@ -1442,8 +1451,46 @@ class DeepseekV2MoE(nn.Module):
         fuse_moe_dp_finalize_scale = bool(
             getattr(self, "_dsv4_huge_dp_finalize_scale", False)
             and get_forward().moe_output_buffer_external_symmetric
+            and not defer_dp_raw_output
         )
-        if fuse_moe_dp_finalize_scale:
+        if defer_dp_raw_output:
+            server_args = get_server_args()
+            symmetric_slot_anchor = get_forward().moe_output_buffer
+            if (
+                server_args.dsv4_worker_backend != "huge_kernel"
+                or not server_args.enable_dp_attention
+                or not getattr(self, "_dsv4_huge_dp_deferred_raw", False)
+                or not get_forward().moe_output_buffer_external_symmetric
+                or not _is_cuda
+                or hidden_states.shape[0] <= 0
+                or not skip_shared_experts
+                or not hasattr(self, "shared_experts")
+                or not self._shared_expert_tp1
+                or self.num_fused_shared_experts != 0
+                or not isinstance(routed_x_quant, tuple)
+                or len(routed_x_quant) != 2
+                or fuse_moe_shared_finalize
+                or not isinstance(symmetric_slot_anchor, torch.Tensor)
+                or symmetric_slot_anchor.shape != (hidden_states.shape[0], 4096)
+                or symmetric_slot_anchor.dtype != torch.bfloat16
+                or symmetric_slot_anchor.device != hidden_states.device
+                or not symmetric_slot_anchor.is_contiguous()
+                or precomputed_topk_output is None
+                or not TopKOutputChecker.format_is_packed_only(
+                    precomputed_topk_output
+                )
+            ):
+                raise RuntimeError(
+                    "DSV4 deferred raw MoE requires the strict Huge DP4 "
+                    "packed-route/prequant/local-shared/symmetric-slot contract"
+                )
+            moe_prequant = Dsv4DpRawMoeRequest(
+                x_quant=routed_x_quant[0],
+                x_scale=routed_x_quant[1],
+                symmetric_slot_anchor=symmetric_slot_anchor,
+                routed_scale=float(self.routed_scaling_factor),
+            )
+        elif fuse_moe_dp_finalize_scale:
             server_args = get_server_args()
             if (
                 server_args.dsv4_worker_backend != "huge_kernel"
@@ -1484,10 +1531,17 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             moe_prequant = routed_x_quant
+        if defer_dp_raw_output:
+            final_hidden_states = self.experts.forward_dsv4_deferred_raw(
+                hidden_states,
+                topk_output,
+                prequant=moe_prequant,
+            )
+            # The raw holder is not a Tensor and must never reach routed-scale,
+            # shared-add, generic combine, slicing, or TP reduction logic.
+            return final_hidden_states
         final_hidden_states = self.experts(
-            hidden_states,
-            topk_output,
-            prequant=moe_prequant,
+            hidden_states, topk_output, prequant=moe_prequant
         )
         if (
             not _is_cuda

@@ -7,7 +7,7 @@ from pathlib import Path
 
 _DSV4_JIT_SPEC = None
 _DSV4_RAW_MODULE = None
-_DSV4_JIT_MODULE_NAME = "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v75"
+_DSV4_JIT_MODULE_NAME = "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v76_stage1"
 
 
 _EXPECTED_LAUNCHER_SHA256 = (
@@ -242,24 +242,33 @@ struct Dsv4DpRoutedFinalizeState {
 // entering the FlashInfer launcher, and the launcher consumes it exactly once.
 thread_local Dsv4DpRoutedFinalizeState dsv4_dp_routed_finalize_state;
 
+// Stage-1 owns no Tensor pointers in thread-local state. FlashInfer returns the
+// owning Array<Tensor> to Python, where Dsv4DpRawMoeOutput keeps every storage
+// live until the whole-layer runtime submits its consumer.
+thread_local bool dsv4_dp_deferred_raw_active = false;
+
 bool dsv4_any_finalize_active() {
   return dsv4_shared_finalize_state.active ||
-      dsv4_dp_routed_finalize_state.active;
+      dsv4_dp_routed_finalize_state.active ||
+      dsv4_dp_deferred_raw_active;
 }
 
 struct Dsv4FinalizeStateResetGuard {
   bool reset_shared = false;
   bool reset_dp_routed = false;
+  bool reset_dp_deferred_raw = false;
 
   ~Dsv4FinalizeStateResetGuard() {
     if (reset_shared) dsv4_shared_finalize_state.active = false;
     if (reset_dp_routed) dsv4_dp_routed_finalize_state.active = false;
+    if (reset_dp_deferred_raw) dsv4_dp_deferred_raw_active = false;
   }
 };
 
 void dsv4_cancel_finalize() {
   dsv4_shared_finalize_state.active = false;
   dsv4_dp_routed_finalize_state.active = false;
+  dsv4_dp_deferred_raw_active = false;
 }
 
 struct Dsv4PersistentMoeState {
@@ -323,6 +332,8 @@ void dsv4_set_shared_finalize(TensorView shared_output, double routed_scale) {
       << "DSV4 TP shared-finalize and DP routed-finalize are mutually exclusive";
   TVM_FFI_ICHECK(!dsv4_shared_finalize_state.active)
       << "DSV4 TP shared-finalize descriptor was not consumed";
+  TVM_FFI_ICHECK(!dsv4_dp_deferred_raw_active)
+      << "DSV4 TP shared-finalize and DP deferred-raw are mutually exclusive";
   TVM_FFI_ICHECK(shared_output.device().device_type == kDLCUDA);
   TVM_FFI_ICHECK((shared_output.dtype() == DLDataType{kDLBfloat, 16, 1}));
   TVM_FFI_ICHECK_EQ(shared_output.ndim(), 2);
@@ -340,6 +351,8 @@ void dsv4_set_dp_routed_finalize(TensorView output, double routed_scale) {
       << "DSV4 DP routed-finalize and TP shared-finalize are mutually exclusive";
   TVM_FFI_ICHECK(!dsv4_dp_routed_finalize_state.active)
       << "DSV4 DP routed-finalize descriptor was not consumed";
+  TVM_FFI_ICHECK(!dsv4_dp_deferred_raw_active)
+      << "DSV4 DP routed-finalize and deferred-raw are mutually exclusive";
   TVM_FFI_ICHECK(output.device().device_type == kDLCUDA);
   TVM_FFI_ICHECK((output.dtype() == DLDataType{kDLBfloat, 16, 1}));
   TVM_FFI_ICHECK_EQ(output.ndim(), 2);
@@ -359,6 +372,16 @@ void dsv4_set_dp_routed_finalize(TensorView output, double routed_scale) {
   dsv4_dp_routed_finalize_state.hidden_dim = output.size(1);
   dsv4_dp_routed_finalize_state.routed_scale = routed_scale_float;
   dsv4_dp_routed_finalize_state.active = true;
+}
+
+void dsv4_set_dp_deferred_raw() {
+  TVM_FFI_ICHECK(!dsv4_shared_finalize_state.active)
+      << "DSV4 DP deferred-raw and TP shared-finalize are mutually exclusive";
+  TVM_FFI_ICHECK(!dsv4_dp_routed_finalize_state.active)
+      << "DSV4 DP deferred-raw and routed-finalize are mutually exclusive";
+  TVM_FFI_ICHECK(!dsv4_dp_deferred_raw_active)
+      << "DSV4 DP deferred-raw descriptor was not consumed";
+  dsv4_dp_deferred_raw_active = true;
 }
 
 struct alignas(16) Dsv4Bf16x8 {
@@ -622,6 +645,62 @@ void dsv4_launch_dp_routed_finalize(
       << "dsv4 DP routed finalize launch failed: "
       << cudaGetErrorString(error);
 }
+
+void dsv4_finalize_dp_routed_raw(
+    TensorView gemm2_output,
+    TensorView expanded_to_permuted,
+    TensorView packed_topk,
+    TensorView output,
+    int64_t top_k,
+    double routed_scale) {
+  // Temporary stage-1 consumer. Commit B replaces this launch and the
+  // subsequent NVLS/mHC launch with one cooperative kernel while preserving
+  // this exact owning-Tensor ABI.
+  dsv4_set_dp_routed_finalize(output, routed_scale);
+  Dsv4FinalizeStateResetGuard reset_guard{/*reset_shared=*/false,
+      /*reset_dp_routed=*/true, /*reset_dp_deferred_raw=*/false};
+  auto const& state = dsv4_dp_routed_finalize_state;
+  TVM_FFI_ICHECK_GT(state.num_tokens, 0);
+  TVM_FFI_ICHECK_LE(state.num_tokens, 131072);
+  TVM_FFI_ICHECK_EQ(state.hidden_dim, 4096);
+  TVM_FFI_ICHECK_EQ(top_k, 6);
+  TVM_FFI_ICHECK_EQ(gemm2_output.ndim(), 2);
+  TVM_FFI_ICHECK((gemm2_output.dtype() == DLDataType{kDLBfloat, 16, 1}));
+  TVM_FFI_ICHECK(gemm2_output.IsContiguous());
+  TVM_FFI_ICHECK_GE(gemm2_output.size(0), state.num_tokens * top_k);
+  TVM_FFI_ICHECK_EQ(gemm2_output.size(1), 4096);
+  TVM_FFI_ICHECK(dsv4_same_device(gemm2_output.device(), output.device()));
+  TVM_FFI_ICHECK_NE(gemm2_output.data_ptr(), output.data_ptr());
+  TVM_FFI_ICHECK_EQ(packed_topk.ndim(), 2);
+  TVM_FFI_ICHECK_EQ(packed_topk.size(0), state.num_tokens);
+  TVM_FFI_ICHECK_EQ(packed_topk.size(1), top_k);
+  TVM_FFI_ICHECK((packed_topk.dtype() == DLDataType{kDLInt, 32, 1}));
+  TVM_FFI_ICHECK(packed_topk.IsContiguous());
+  TVM_FFI_ICHECK(dsv4_same_device(packed_topk.device(), output.device()));
+  TVM_FFI_ICHECK_EQ(expanded_to_permuted.ndim(), 1);
+  TVM_FFI_ICHECK_EQ(
+      expanded_to_permuted.size(0), state.num_tokens * top_k);
+  TVM_FFI_ICHECK(
+      (expanded_to_permuted.dtype() == DLDataType{kDLInt, 32, 1}));
+  TVM_FFI_ICHECK(expanded_to_permuted.IsContiguous());
+  TVM_FFI_ICHECK(dsv4_same_device(
+      expanded_to_permuted.device(), output.device()));
+
+  cudaStream_t const stream = get_stream(output.device());
+  unsigned int const threads = state.num_tokens <= 4096 ? 256u : 128u;
+  dsv4MoeFinalizeDpRoutedTopK6Kernel<<<state.num_tokens, threads, 0, stream>>>(
+      static_cast<int>(state.num_tokens), static_cast<int>(state.hidden_dim),
+      static_cast<int>(gemm2_output.size(1)),
+      static_cast<__nv_bfloat16 const*>(gemm2_output.data_ptr()),
+      static_cast<int const*>(expanded_to_permuted.data_ptr()),
+      static_cast<int32_t const*>(packed_topk.data_ptr()),
+      state.routed_scale,
+      static_cast<__nv_bfloat16*>(output.data_ptr()));
+  cudaError_t const error = cudaGetLastError();
+  TVM_FFI_ICHECK(error == cudaSuccess)
+      << "dsv4 DP deferred raw reference finalize launch failed: "
+      << cudaGetErrorString(error);
+}
 """
 
 _FP4_MULTI_TILE_START = """  // Determine supported tile sizes
@@ -656,25 +735,33 @@ _FP4_SINGLE_TILE_BLOCK = """  // Resolve the autotuner tactic first. Huge mode i
   args->routed_scaling_factor = routed_scaling_factor.value_or(1.0);
   bool const dsv4_fuse_shared = dsv4_shared_finalize_state.active;
   bool const dsv4_fuse_dp_routed = dsv4_dp_routed_finalize_state.active;
+  bool const dsv4_defer_dp_raw = dsv4_dp_deferred_raw_active;
   Dsv4FinalizeStateResetGuard dsv4_finalize_reset_guard{
-      dsv4_fuse_shared, dsv4_fuse_dp_routed};
-  TVM_FFI_ICHECK(!(dsv4_fuse_shared && dsv4_fuse_dp_routed))
+      dsv4_fuse_shared, dsv4_fuse_dp_routed, dsv4_defer_dp_raw};
+  TVM_FFI_ICHECK(
+      static_cast<int>(dsv4_fuse_shared) +
+          static_cast<int>(dsv4_fuse_dp_routed) +
+          static_cast<int>(dsv4_defer_dp_raw) <=
+      1)
       << "DSV4 finalize modes are mutually exclusive";
   TVM_FFI_ICHECK(!dsv4_fuse_shared || do_finalize)
       << "DSV4 shared finalize requires do_finalize=true";
   TVM_FFI_ICHECK(!dsv4_fuse_dp_routed || do_finalize)
       << "DSV4 DP routed finalize requires do_finalize=true";
+  TVM_FFI_ICHECK(!dsv4_defer_dp_raw || do_finalize)
+      << "DSV4 DP deferred raw requires do_finalize=true";
   TVM_FFI_ICHECK(
-      !(dsv4_fuse_shared || dsv4_fuse_dp_routed) ||
+      !(dsv4_fuse_shared || dsv4_fuse_dp_routed || dsv4_defer_dp_raw) ||
       routing_input_mode ==
           static_cast<int64_t>(RoutingInputMode::PackedPrecomputed))
       << "DSV4 custom finalize requires packed precomputed routing";
   args->do_finalize =
-      do_finalize && !dsv4_fuse_shared && !dsv4_fuse_dp_routed;
+      do_finalize && !dsv4_fuse_shared && !dsv4_fuse_dp_routed &&
+      !dsv4_defer_dp_raw;
   args->output = output.data_ptr();
   args->output_scale = nullptr;
 
-  if (dsv4_fuse_shared || dsv4_fuse_dp_routed) {
+  if (dsv4_fuse_shared || dsv4_fuse_dp_routed || dsv4_defer_dp_raw) {
     dsv4_begin_persistent_moe_call();
   }
 
@@ -689,6 +776,12 @@ _FP4_SINGLE_TILE_BLOCK = """  // Resolve the autotuner tactic first. Huge mode i
                  static_cast<ActivationType>(act_type), mDtypeAct, mDtypeWeights, norm_topk_prob);
   launcher->set_routing_replay_out(routing_replay_out);
   Array<Tensor> result = launcher->run(config, enable_pdl);
+  if (dsv4_defer_dp_raw) {
+    TVM_FFI_ICHECK_EQ(result.size(), 3);
+    // No custom finalize launch here. The returned Tensor owners cross the
+    // Huge-only Python ABI and are consumed after the shared-stream join.
+    return result;
+  }
   if (dsv4_fuse_dp_routed) {
     TVM_FFI_ICHECK_EQ(result.size(), 3);
     dsv4_launch_dp_routed_finalize(
@@ -789,6 +882,10 @@ def _patch_launcher(source: str) -> str:
         "dsv4_set_shared_finalize);\n"
         "TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_set_dp_routed_finalize, "
         "dsv4_set_dp_routed_finalize);\n"
+        "TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_set_dp_deferred_raw, "
+        "dsv4_set_dp_deferred_raw);\n"
+        "TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_finalize_dp_routed_raw, "
+        "dsv4_finalize_dp_routed_raw);\n"
         "TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_cancel_finalize, "
         "dsv4_cancel_finalize);\n"
         + _EXPORT_ANCHOR,
@@ -955,6 +1052,40 @@ def set_dsv4_dp_routed_finalize(output, routed_scaling_factor: float) -> None:
         _DSV4_RAW_MODULE = _DSV4_JIT_SPEC.build_and_load()
     _DSV4_RAW_MODULE.dsv4_set_dp_routed_finalize(
         output, float(routed_scaling_factor)
+    )
+
+
+def _load_dsv4_raw_module():
+    global _DSV4_RAW_MODULE
+    if _DSV4_RAW_MODULE is None:
+        from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+
+        get_trtllm_moe_sm100_module()
+        if _DSV4_JIT_SPEC is None:
+            raise RuntimeError("DSV4 Huge MoE JIT module was not initialized")
+        _DSV4_RAW_MODULE = _DSV4_JIT_SPEC.build_and_load()
+    return _DSV4_RAW_MODULE
+
+
+def set_dsv4_dp_deferred_raw() -> None:
+    _load_dsv4_raw_module().dsv4_set_dp_deferred_raw()
+
+
+def finalize_dsv4_dp_routed_raw(
+    gemm2_out,
+    expanded_to_permuted,
+    packed_topk,
+    output,
+    top_k: int,
+    routed_scaling_factor: float,
+) -> None:
+    _load_dsv4_raw_module().dsv4_finalize_dp_routed_raw(
+        gemm2_out,
+        expanded_to_permuted,
+        packed_topk,
+        output,
+        int(top_k),
+        float(routed_scaling_factor),
     )
 
 

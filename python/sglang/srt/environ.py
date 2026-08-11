@@ -899,6 +899,11 @@ class Envs:
     # finalize writes the external symmetric partial with the same two BF16
     # rounding boundaries as the eager finalize + in-place scale sequence.
     SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE = EnvBool(False)
+    # Stage-1 ABI for the future raw-finalize/NVLS/shared/mHC composite kernel.
+    # This is deliberately independent from FINALIZE_SCALE so the v72/v75
+    # launcher-finalize path remains byte-for-byte selected unless explicitly
+    # requested by a strict Huge Attention-DP deployment.
+    SGLANG_DSV4_HUGE_DP_MOE_DEFER_RAW = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")

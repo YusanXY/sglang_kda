@@ -308,6 +308,24 @@ class DSV4WholeLayerRuntime:
                 "Huge Attention-DP4 with the symmetric MoE NVLS "
                 "epoch-counter stack"
             )
+        self._use_dp_moe_deferred_raw = (
+            envs.SGLANG_DSV4_HUGE_DP_MOE_DEFER_RAW.get()
+        )
+        # Raw ownership is specialized only for the balanced/aligned symmetric
+        # MoE buckets. Prefix construction and other legal small EXTEND chunks
+        # remain on the existing Huge path; they never enter native fallback.
+        if self._use_dp_moe_deferred_raw and not (
+            self._use_dp_moe_finalize_scale
+            and self._attention_dp4
+            and self._use_dp_symmetric_moe_post
+            and self._use_dp_moe_epoch
+            and self._use_dp_moe_epoch_counter
+            and self._use_dp_moe_nvls
+        ):
+            raise RuntimeError(
+                "SGLANG_DSV4_HUGE_DP_MOE_DEFER_RAW=1 requires the complete "
+                "strict Huge Attention-DP4 finalize-scale/NVLS epoch stack"
+            )
         self._attention_groups = 8 if self._attention_dp4 else 2
         self._max_local_tokens = (
             _MAX_FORWARD_TOKENS // 4
@@ -617,6 +635,9 @@ class DSV4WholeLayerRuntime:
             handle.layer._dsv4_huge_dp_shared_expert_local = self._attention_dp4
             handle.layer.mlp._dsv4_huge_dp_finalize_scale = (
                 self._use_dp_moe_finalize_scale
+            )
+            handle.layer.mlp._dsv4_huge_dp_deferred_raw = (
+                self._use_dp_moe_deferred_raw
             )
             handle.layer.enable_huge_kernel_runner(self, handle)
             shared_experts = getattr(handle.layer.mlp, "shared_experts", None)
@@ -2820,6 +2841,10 @@ def _run_dp_symmetric_moe_mhc_post(
     host-enqueued barriers while retaining the same one-slot data allocation.
     """
 
+    defer_dp_raw_output = bool(
+        getattr(layer.mlp, "_dsv4_huge_dp_deferred_raw", False)
+    )
+
     epoch_flags = (
         descriptor.moe_epoch_flag0,
         descriptor.moe_epoch_flag1,
@@ -2931,6 +2956,7 @@ def _run_dp_symmetric_moe_mhc_post(
             routed_x_quant=routed_x_quant,
             defer_shared_expert_add=True,
             defer_dp_output_combine=True,
+            defer_dp_raw_output=defer_dp_raw_output,
             dp_packed_route_output=descriptor.moe_packed_route,
             dp_routed_quant_output=(
                 (
@@ -2947,6 +2973,44 @@ def _run_dp_symmetric_moe_mhc_post(
             "(global_partial, local_shared_hidden)"
         )
     moe_result, shared_hidden = result
+    if defer_dp_raw_output:
+        from sglang.jit_kernel.dsv4_moe_overlap.jit import (
+            cancel_dsv4_finalize,
+            finalize_dsv4_dp_routed_raw,
+        )
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+            Dsv4DpRawMoeOutput,
+        )
+
+        if (
+            not isinstance(moe_result, Dsv4DpRawMoeOutput)
+            or moe_result.top_k != 6
+            or moe_result.routed_scale != 1.5
+            or moe_result.symmetric_slot_anchor.data_ptr()
+            != moe_partial_local.data_ptr()
+            or moe_result.symmetric_slot_anchor.shape != moe_partial_local.shape
+        ):
+            raise RuntimeError(
+                "DSV4 deferred raw MoE returned a foreign or invalid slot ABI"
+            )
+        try:
+            # Stage-1 reference consumer: preserves v75's two BF16 rounding
+            # boundaries while moving ownership of finalize to whole-layer code.
+            # The next stage replaces this and the NVLS post below with one op.
+            finalize_dsv4_dp_routed_raw(
+                moe_result.gemm2_out,
+                moe_result.expanded_to_permuted,
+                moe_result.packed_topk,
+                moe_partial_local,
+                moe_result.top_k,
+                moe_result.routed_scale,
+            )
+        except BaseException:
+            # The exported reference consumer has an RAII reset as well; this
+            # closes the Python/JIT boundary if validation or FFI changes later.
+            cancel_dsv4_finalize()
+            raise
+        moe_result = moe_partial_local
     if (
         not isinstance(moe_result, torch.Tensor)
         or tuple(moe_result.shape) != expected_global_shape
@@ -2974,6 +3038,15 @@ def _run_dp_symmetric_moe_mhc_post(
             "DSV4 Huge Attention-DP symmetric MoE post requires a contiguous "
             f"local BF16 shared expert output [{local_m},4096]"
         )
+    if defer_dp_raw_output:
+        shared_stream = getattr(layer.mlp, "alt_stream", None)
+        if shared_stream is None:
+            raise RuntimeError(
+                "DSV4 deferred raw MoE lost its shared-expert producer stream"
+            )
+        current_stream = torch.cuda.current_stream(shared_hidden.device)
+        current_stream.wait_stream(shared_stream)
+        shared_hidden.record_stream(current_stream)
 
     if descriptor.dp_moe_epoch_selected:
         if descriptor.dp_moe_epoch_counter_selected:

@@ -59,6 +59,7 @@ def test_patch_moves_prepare_before_routing() -> None:
     assert patched.count("dsv4MoeFinalizeDpRoutedTopK6Kernel") >= 2
     assert patched.count("dsv4_set_shared_finalize") >= 3
     assert patched.count("dsv4_set_dp_routed_finalize") >= 3
+    assert patched.count("dsv4_set_dp_deferred_raw") >= 3
     assert (
         "do_finalize && !dsv4_fuse_shared && !dsv4_fuse_dp_routed"
         in patched
@@ -75,7 +76,7 @@ def test_patch_moves_prepare_before_routing() -> None:
     assert "result[0], topk_weights, result[2]" not in patched
     assert (
         _DSV4_JIT_MODULE_NAME
-        == "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v75"
+        == "sgl_dsv4_fused_moe_trtllm_sm100_overlap_v76_stage1"
     )
 
 
@@ -183,6 +184,20 @@ def test_dp_routed_finalize_is_one_shot_and_mutually_exclusive() -> None:
     assert "Dsv4FinalizeStateResetGuard" in patched
     assert "dsv4_cancel_finalize" in patched
     assert "DSV4 DP routed-finalize descriptor was not consumed" in patched
+    assert "DSV4 DP deferred-raw descriptor was not consumed" in patched
+    assert "reset_dp_deferred_raw" in patched
+
+
+def test_dp_deferred_raw_returns_owning_tuple_without_launcher_finalize() -> None:
+    patched = _patch_launcher(_source())
+    launch = patched.index("Array<Tensor> result = launcher->run(config, enable_pdl)")
+    raw = patched.index("if (dsv4_defer_dp_raw)", launch)
+    routed = patched.index("if (dsv4_fuse_dp_routed)", raw)
+    block = patched[raw:routed]
+
+    assert "TVM_FFI_ICHECK_EQ(result.size(), 3)" in block
+    assert "return result" in block
+    assert "dsv4_launch_dp_routed_finalize" not in block
 
 
 @pytest.mark.parametrize(

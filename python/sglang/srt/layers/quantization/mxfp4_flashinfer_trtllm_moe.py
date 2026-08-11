@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -51,6 +52,34 @@ _DSV4_MOE_OVERLAP_INSTALLED = False
 _DSV4_DP_FINALIZE_SCALE_INSTALLED = False
 _FLASHINFER_CUBIN_OVERLAY_INSTALLED = False
 _DSV4_HUGE_TOP_K = 6
+
+
+@dataclass(frozen=True, eq=False)
+class Dsv4DpRawMoeRequest:
+    """Strict Huge-only request for FlashInfer's unfinalized GEMM2 ABI."""
+
+    x_quant: torch.Tensor
+    x_scale: torch.Tensor
+    symmetric_slot_anchor: torch.Tensor
+    routed_scale: float
+
+
+@dataclass(frozen=True, eq=False)
+class Dsv4DpRawMoeOutput:
+    """Owning lifetime for the same-main-stream composite input ABI.
+
+    FlashInfer's two internal tensors are also retained by its persistent arena;
+    packed routing and the symmetric slot are descriptor-owned.  The whole-layer
+    consumer is deliberately submitted on the producer stream before this holder
+    is released, so per-layer ``Tensor.record_stream`` host calls are unnecessary.
+    """
+
+    gemm2_out: torch.Tensor
+    expanded_to_permuted: torch.Tensor
+    packed_topk: torch.Tensor
+    symmetric_slot_anchor: torch.Tensor
+    top_k: int
+    routed_scale: float
 
 
 def _resolve_mxfp4_packed_topk(
@@ -152,7 +181,13 @@ def _install_dsv4_huge_moe_overlap() -> None:
     _install_writable_flashinfer_cubin_overlay()
     server_args = get_server_args()
     dp_finalize_scale = envs.SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE.get()
-    if dp_finalize_scale and (
+    dp_defer_raw = envs.SGLANG_DSV4_HUGE_DP_MOE_DEFER_RAW.get()
+    if dp_defer_raw and not dp_finalize_scale:
+        raise RuntimeError(
+            "SGLANG_DSV4_HUGE_DP_MOE_DEFER_RAW=1 requires "
+            "SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE=1"
+        )
+    if (dp_finalize_scale or dp_defer_raw) and (
         server_args.dsv4_worker_backend != "huge_kernel"
         or not server_args.enable_dp_attention
     ):
@@ -428,6 +463,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         shared_output = None
         routed_scaling_factor = None
         dp_routed_scaling_factor = None
+        dp_raw_request = (
+            prequant if isinstance(prequant, Dsv4DpRawMoeRequest) else None
+        )
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
@@ -451,7 +489,16 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         precision = self.flashinfer_mxfp4_moe_precision
-        if prequant is not None and len(prequant) == 3 and precision != "default":
+        if dp_raw_request is not None and precision != "default":
+            raise RuntimeError(
+                "DSV4 Huge deferred raw MoE requires default MXFP4/MXFP8 precision"
+            )
+        if (
+            prequant is not None
+            and dp_raw_request is None
+            and len(prequant) == 3
+            and precision != "default"
+        ):
             raise RuntimeError(
                 "DSV4 Huge DP routed-only finalize-scale requires default "
                 "MXFP4/MXFP8 precision"
@@ -476,6 +523,31 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     alignment=hidden_size,
                     backend=_MXFP8_QUANTIZE_BACKEND,
                 )
+            elif dp_raw_request is not None:
+                x_quant = dp_raw_request.x_quant
+                x_scale = dp_raw_request.x_scale
+                expected_scale_shape = (
+                    hidden_states.shape[0],
+                    hidden_size // 32,
+                )
+                if (
+                    not isinstance(x_quant, torch.Tensor)
+                    or not isinstance(x_scale, torch.Tensor)
+                    or hidden_size != 4096
+                    or x_quant.shape != (hidden_states.shape[0], hidden_size)
+                    or hidden_states.shape != x_quant.shape
+                    or x_quant.dtype != torch.float8_e4m3fn
+                    or not x_quant.is_contiguous()
+                    or x_quant.device != hidden_states.device
+                    or x_quant.device.type != "cuda"
+                    or x_scale.shape != expected_scale_shape
+                    or x_scale.dtype != torch.uint8
+                    or not x_scale.is_contiguous()
+                    or x_scale.device != hidden_states.device
+                ):
+                    raise RuntimeError(
+                        "invalid DSV4 Huge deferred raw MXFP8 workspace"
+                    )
             else:
                 if get_server_args().dsv4_worker_backend != "huge_kernel":
                     raise RuntimeError(
@@ -559,7 +631,40 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                     device=x_quant.device,
                 )
 
-        if dp_routed_scaling_factor is not None:
+        if dp_raw_request is not None:
+            try:
+                dp_raw_scale = float(dp_raw_request.routed_scale)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "invalid DSV4 Huge deferred raw routed scale"
+                ) from exc
+            anchor = dp_raw_request.symmetric_slot_anchor
+            if (
+                not _DSV4_DP_FINALIZE_SCALE_INSTALLED
+                or get_server_args().dsv4_worker_backend != "huge_kernel"
+                or not get_server_args().enable_dp_attention
+                or not external_symmetric_output
+                or not isinstance(anchor, torch.Tensor)
+                or anchor.data_ptr() != symm_output.data_ptr()
+                or anchor.shape != symm_output.shape
+                or anchor.dtype != torch.bfloat16
+                or anchor.device != x_quant.device
+                or not anchor.is_contiguous()
+                or not math.isfinite(dp_raw_scale)
+                or dp_raw_scale != 1.5
+            ):
+                raise RuntimeError(
+                    "invalid DSV4 Huge deferred raw MoE request/slot anchor"
+                )
+            from sglang.jit_kernel.dsv4_moe_overlap.jit import (
+                set_dsv4_dp_deferred_raw,
+            )
+
+            set_dsv4_dp_deferred_raw()
+
+        if dp_raw_request is not None:
+            pass
+        elif dp_routed_scaling_factor is not None:
             if (
                 not _DSV4_DP_FINALIZE_SCALE_INSTALLED
                 or get_server_args().dsv4_worker_backend != "huge_kernel"
@@ -594,7 +699,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             set_dsv4_shared_finalize(shared_output, routed_scaling_factor)
 
         custom_finalize_armed = (
-            dp_routed_scaling_factor is not None or shared_output is not None
+            dp_raw_request is not None
+            or dp_routed_scaling_factor is not None
+            or shared_output is not None
         )
         try:
             moe_outputs = trtllm_fp4_block_scale_routed_moe(
@@ -635,7 +742,40 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
                 cancel_dsv4_finalize()
             raise
-        if dp_routed_scaling_factor is not None or shared_output is not None:
+        if dp_raw_request is not None:
+            if not isinstance(moe_outputs, (tuple, list)) or len(moe_outputs) != 3:
+                raise RuntimeError(
+                    "DSV4 Huge deferred raw FlashInfer launch must return three tensors"
+                )
+            gemm2_out, _, expanded_to_permuted = moe_outputs
+            if (
+                not isinstance(gemm2_out, torch.Tensor)
+                or gemm2_out.ndim != 2
+                or gemm2_out.shape[0] < num_tokens * top_k
+                or gemm2_out.shape[1] != out_hidden_size
+                or out_hidden_size != 4096
+                or gemm2_out.dtype != torch.bfloat16
+                or gemm2_out.device != x_quant.device
+                or not gemm2_out.is_contiguous()
+                or gemm2_out.data_ptr() == anchor.data_ptr()
+                or not isinstance(expanded_to_permuted, torch.Tensor)
+                or expanded_to_permuted.shape != (num_tokens * top_k,)
+                or expanded_to_permuted.dtype != torch.int32
+                or expanded_to_permuted.device != x_quant.device
+                or not expanded_to_permuted.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "invalid DSV4 Huge deferred raw FlashInfer tensor ABI"
+                )
+            output = Dsv4DpRawMoeOutput(
+                gemm2_out=gemm2_out,
+                expanded_to_permuted=expanded_to_permuted,
+                packed_topk=packed_topk,
+                symmetric_slot_anchor=anchor,
+                top_k=top_k,
+                routed_scale=dp_raw_scale,
+            )
+        elif dp_routed_scaling_factor is not None or shared_output is not None:
             # The patched launcher sets do_finalize=false so FlashInfer exposes
             # GEMM2/routing intermediates to the custom epilogue.  The epilogue
             # writes the caller-owned symmetric buffer; never leak result[0]

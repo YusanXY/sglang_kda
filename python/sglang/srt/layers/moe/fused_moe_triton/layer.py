@@ -1323,6 +1323,53 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
+    def forward_dsv4_deferred_raw(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        *,
+        prequant,
+    ):
+        """Run routed MoE but deliberately bypass every generic combine step."""
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+            Dsv4DpRawMoeOutput,
+            Dsv4DpRawMoeRequest,
+        )
+
+        server_args = get_server_args()
+        if (
+            server_args.dsv4_worker_backend != "huge_kernel"
+            or not server_args.enable_dp_attention
+            or not get_forward().moe_output_buffer_external_symmetric
+            or not isinstance(self.dispatcher, StandardDispatcher)
+            or not isinstance(prequant, Dsv4DpRawMoeRequest)
+        ):
+            raise RuntimeError(
+                "DSV4 deferred raw MoE requires strict Huge Attention-DP, "
+                "the standard dispatcher, and an external symmetric slot"
+            )
+
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+        combine_input = self.run_moe_core(
+            dispatch_output=dispatch_output,
+            prequant=prequant,
+        )
+        if not isinstance(combine_input, StandardCombineInput) or not isinstance(
+            combine_input.hidden_states, Dsv4DpRawMoeOutput
+        ):
+            raise RuntimeError(
+                "DSV4 deferred raw MoE core returned an invalid typed output"
+            )
+
+        # Do not call dispatcher.combine, slice to origin_hidden_states_dim,
+        # make contiguous, or enter the generic TP all-reduce. The whole-layer
+        # runtime is the sole consumer of this holder.
+        return combine_input.hidden_states
+
     def forward_deferred_finalize(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ):

@@ -2188,6 +2188,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         huge_fused_moe_post: bool = False,
         defer_shared_expert_add: bool = False,
         defer_dp_output_combine: bool = False,
+        defer_dp_raw_output: bool = False,
         dp_packed_route_output: Optional[torch.Tensor] = None,
         dp_routed_quant_output: Optional[
             tuple[torch.Tensor, torch.Tensor]
@@ -2218,6 +2219,18 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "deferred DP output combine requires Huge attention-DP4 with "
                 "TP-MoE gather, reduce_scatterv combine, and no CP or A2A "
                 "gather-scatter"
+            )
+        if defer_dp_raw_output and (
+            not defer_dp_output_combine
+            or get_server_args().dsv4_worker_backend != "huge_kernel"
+            or not getattr(self.mlp, "_dsv4_huge_dp_deferred_raw", False)
+            or dp_packed_route_output is None
+            or dp_routed_quant_output is None
+            or routed_x_quant is None
+        ):
+            raise RuntimeError(
+                "DSV4 deferred raw MoE requires the complete strict Huge "
+                "deferred-combine packed-route/MXFP8 descriptor"
             )
         # A deferred DP combine necessarily leaves the replicated TP1 shared
         # expert local as well: it cannot be added to a global-M TP partial.
@@ -2534,6 +2547,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                         None if _use_tp_moe_gather else shared_x_quant
                     ),
                     routed_x_quant=routed_x_quant,
+                    defer_dp_raw_output=defer_dp_raw_output,
                 )
             else:
                 hidden_states = self.mlp(
@@ -2545,13 +2559,23 @@ class DeepseekV4DecoderLayer(nn.Module):
                     shared_x_quant=None,
                     routed_x_quant=routed_x_quant,
                     precomputed_topk_output=precomputed_topk_output,
+                    defer_dp_raw_output=defer_dp_raw_output,
                 )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         elif _use_tp_moe_gather:
             global_hidden_states = hidden_states
             if defer_dp_output_combine:
-                if (
+                if defer_dp_raw_output:
+                    from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                        Dsv4DpRawMoeOutput,
+                    )
+
+                    if not isinstance(global_hidden_states, Dsv4DpRawMoeOutput):
+                        raise RuntimeError(
+                            "deferred raw DP output combine lost its typed holder"
+                        )
+                elif (
                     global_hidden_states.ndim != 2
                     or global_hidden_states.dtype != torch.bfloat16
                 ):
@@ -2591,10 +2615,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             # PoC: add the locally-computed shared-expert output to this rank's
             # reduce-scattered / dp-scattered local slice (skipped inside self.mlp
             # above). Covers both prefill (gatherv) and decode (dp_scatter).
-            if _shared_local is not None:
+            if _shared_local is not None and not _defer_shared_expert_add:
                 n = hidden_states.shape[0]
-                if not _defer_shared_expert_add:
-                    hidden_states = hidden_states + _shared_local[:n]
+                hidden_states = hidden_states + _shared_local[:n]
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
             gathered = [torch.empty_like(t) for t in _a2a_scatter_chunks]
@@ -2602,16 +2625,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = torch.cat(gathered)
         if _defer_shared_expert_add:
             if _shared_local_stream is not None:
-                current_stream = torch.cuda.current_stream()
-                current_stream.wait_stream(_shared_local_stream)
                 assert _shared_local is not None
-                _shared_local.record_stream(current_stream)
+                if not defer_dp_raw_output:
+                    current_stream = torch.cuda.current_stream()
+                    current_stream.wait_stream(_shared_local_stream)
+                    _shared_local.record_stream(current_stream)
+                # The raw whole-layer consumer deliberately postpones this
+                # join: routed finalize is submitted first on the main stream,
+                # preserving its overlap with the shared-expert alt stream.
             # The leading dense FFN layers have no shared expert. They still
             # use the Huge mHC CUDA path, just without the optional fused add.
             shared_local = (
                 None
                 if _shared_local is None
-                else _shared_local[: hidden_states.shape[0]]
+                else _shared_local
             )
             return hidden_states, shared_local
         return hidden_states
