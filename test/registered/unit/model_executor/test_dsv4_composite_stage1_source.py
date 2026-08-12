@@ -141,6 +141,8 @@ def test_huge_raw_forward_never_enters_generic_combine_or_tensor_postprocessing(
     assert "gemm2_out.shape[0] < num_tokens * top_k" in quant_source
     assert "gemm2_out.shape[1] != out_hidden_size" in quant_source
     assert "gemm2_out.data_ptr() == anchor.data_ptr()" in quant_source
+    assert "raw_output_count = len(moe_outputs)" in quant_source
+    assert "isinstance(moe_outputs, (tuple, list))" not in quant_source
 
 
 def test_default_off_gate_preserves_old_path_and_runtime_consumes_raw_in_order():

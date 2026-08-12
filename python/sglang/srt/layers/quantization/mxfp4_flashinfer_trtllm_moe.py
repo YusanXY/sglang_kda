@@ -743,11 +743,20 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 cancel_dsv4_finalize()
             raise
         if dp_raw_request is not None:
-            if not isinstance(moe_outputs, (tuple, list)) or len(moe_outputs) != 3:
+            try:
+                raw_output_count = len(moe_outputs)
+            except TypeError as exc:
                 raise RuntimeError(
-                    "DSV4 Huge deferred raw FlashInfer launch must return three tensors"
+                    "DSV4 Huge deferred raw FlashInfer launch returned a "
+                    "non-indexable container"
+                ) from exc
+            if raw_output_count != 3:
+                raise RuntimeError(
+                    "DSV4 Huge deferred raw FlashInfer launch must return three "
+                    f"tensors, got {raw_output_count}"
                 )
-            gemm2_out, _, expanded_to_permuted = moe_outputs
+            gemm2_out = moe_outputs[0]
+            expanded_to_permuted = moe_outputs[2]
             if (
                 not isinstance(gemm2_out, torch.Tensor)
                 or gemm2_out.ndim != 2
