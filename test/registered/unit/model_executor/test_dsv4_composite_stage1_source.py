@@ -136,6 +136,15 @@ def test_huge_raw_forward_never_enters_generic_combine_or_tensor_postprocessing(
     )
     assert "do_finalize=dp_raw_request is None" in quant_source
     assert (
+        "dp_defer_raw and not server_args.disable_flashinfer_autotune"
+        in quant_source
+    )
+    runtime_source = _source(
+        "python/sglang/srt/models/dsv4_whole_layer_runtime.py"
+    )
+    assert "and not view.disable_flashinfer_autotune" in runtime_source
+    assert "--disable-flashinfer-autotune" in runtime_source
+    assert (
         "x_quant.shape != (hidden_states.shape[0], hidden_size)"
         in quant_source
     )

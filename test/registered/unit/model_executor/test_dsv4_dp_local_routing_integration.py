@@ -727,6 +727,29 @@ def test_dp_finalize_overlay_accepts_only_the_full_staging_stack(monkeypatch):
     assert mxfp4_flashinfer_trtllm_moe._DSV4_DP_FINALIZE_SCALE_INSTALLED
 
 
+def test_dp_deferred_raw_rejects_enabled_flashinfer_autotune(monkeypatch):
+    server_args = SimpleNamespace(
+        dsv4_worker_backend="huge_kernel",
+        enable_dp_attention=True,
+        disable_flashinfer_autotune=False,
+    )
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "_install_writable_flashinfer_cubin_overlay",
+        mock.Mock(),
+    )
+    monkeypatch.setattr(
+        mxfp4_flashinfer_trtllm_moe,
+        "get_server_args",
+        mock.Mock(return_value=server_args),
+    )
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE", "1")
+    monkeypatch.setenv("SGLANG_DSV4_HUGE_DP_MOE_DEFER_RAW", "1")
+
+    with pytest.raises(RuntimeError, match="disable-flashinfer-autotune"):
+        mxfp4_flashinfer_trtllm_moe._install_dsv4_huge_moe_overlap()
+
+
 def test_custom_finalize_returns_external_symmetric_output_not_gemm2():
     source = textwrap.dedent(
         inspect.getsource(

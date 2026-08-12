@@ -195,6 +195,12 @@ def _install_dsv4_huge_moe_overlap() -> None:
             "SGLANG_DSV4_HUGE_DP_MOE_FINALIZE_SCALE=1 requires the DSV4 "
             "Huge Attention-DP backend"
         )
+    if dp_defer_raw and not server_args.disable_flashinfer_autotune:
+        raise RuntimeError(
+            "SGLANG_DSV4_HUGE_DP_MOE_DEFER_RAW=1 requires "
+            "--disable-flashinfer-autotune because FlashInfer tuning forwards "
+            "would consume the one-shot raw descriptor before the real call"
+        )
     if server_args.dsv4_worker_backend != "huge_kernel":
         return
     if server_args.enable_dp_attention:

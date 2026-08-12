@@ -2399,6 +2399,15 @@ class DSV4WholeLayerRuntime:
                     f"DSV4 huge runtime requires --{name.replace('_', '-')}="
                     f"{expected!r}, got {actual!r}"
                 )
+        if (
+            envs.SGLANG_DSV4_HUGE_DP_MOE_DEFER_RAW.get()
+            and not view.disable_flashinfer_autotune
+        ):
+            raise RuntimeError(
+                "SGLANG_DSV4_HUGE_DP_MOE_DEFER_RAW=1 requires "
+                "--disable-flashinfer-autotune; tuning forwards can consume "
+                "the one-shot raw descriptor before the real MoE call"
+            )
         attention_dp4 = bool(view.enable_dp_attention)
         if not (
             (attention_dp4 and view.dp_size == 4)
