@@ -198,6 +198,7 @@ def test_dp_deferred_raw_returns_owning_tuple_without_launcher_finalize() -> Non
     assert "TVM_FFI_ICHECK_EQ(result.size(), 3)" in block
     assert "return result" in block
     assert "dsv4_launch_dp_routed_finalize" not in block
+    assert "DSV4 DP deferred raw requires do_finalize=false" in patched
 
 
 @pytest.mark.parametrize(

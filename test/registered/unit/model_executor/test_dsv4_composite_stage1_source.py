@@ -97,6 +97,7 @@ def test_jit_raw_mode_is_mutually_exclusive_one_shot_and_exception_resettable():
     assert "reset_dp_deferred_raw" in source
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_set_dp_deferred_raw" in source
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_finalize_dp_routed_raw" in source
+    assert "DSV4 DP deferred raw requires do_finalize=false" in source
     assert (
         "TVM_FFI_ICHECK_GE(gemm2_output.size(0), state.num_tokens * top_k)"
         in source
@@ -133,6 +134,7 @@ def test_huge_raw_forward_never_enters_generic_combine_or_tensor_postprocessing(
         "python/sglang/srt/layers/quantization/"
         "mxfp4_flashinfer_trtllm_moe.py"
     )
+    assert "do_finalize=dp_raw_request is None" in quant_source
     assert (
         "x_quant.shape != (hidden_states.shape[0], hidden_size)"
         in quant_source

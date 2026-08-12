@@ -748,8 +748,12 @@ _FP4_SINGLE_TILE_BLOCK = """  // Resolve the autotuner tactic first. Huge mode i
       << "DSV4 shared finalize requires do_finalize=true";
   TVM_FFI_ICHECK(!dsv4_fuse_dp_routed || do_finalize)
       << "DSV4 DP routed finalize requires do_finalize=true";
-  TVM_FFI_ICHECK(!dsv4_defer_dp_raw || do_finalize)
-      << "DSV4 DP deferred raw requires do_finalize=true";
+  // Unlike the two in-launcher finalize modes, deferred-raw must preserve the
+  // public FlashInfer do_finalize=false contract.  Its Python custom-op wrapper
+  // only exposes the three owning intermediates for that value; with true it
+  // deliberately collapses the result to the caller-owned output tensor.
+  TVM_FFI_ICHECK(!dsv4_defer_dp_raw || !do_finalize)
+      << "DSV4 DP deferred raw requires do_finalize=false";
   TVM_FFI_ICHECK(
       !(dsv4_fuse_shared || dsv4_fuse_dp_routed || dsv4_defer_dp_raw) ||
       routing_input_mode ==

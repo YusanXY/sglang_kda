@@ -730,7 +730,12 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 local_num_experts=num_local_experts,
                 routed_scaling_factor=1.0,
                 routing_method_type=int(RoutingMethodType.TopK),
-                do_finalize=True,
+                # FlashInfer's public custom-op exposes the owning GEMM2 and
+                # routing intermediates only for do_finalize=False.  The raw
+                # one-shot descriptor tells our patched launcher to defer the
+                # finalize to the whole-layer executor; every other mode keeps
+                # the historical public do_finalize=True ABI.
+                do_finalize=dp_raw_request is None,
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                 output=symm_output,
             )
