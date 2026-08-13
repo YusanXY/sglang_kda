@@ -7,7 +7,7 @@ RUNTIME=${RUNTIME:-/mnt/b300-shared/home/gjy/data/agent4kernel/.runtime/b300}
 MODEL=${MODEL:-/var/b300-shared/models/GLM-5.2-FP8}
 PORT=${PORT:-30000}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
-TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
+GLM52_TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
   echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
@@ -18,7 +18,11 @@ TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
 
 source "$RUNTIME/env.sh"
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
-export TRITON_CACHE_DIR
+# env.sh may contain the cache path of the account that created the runtime.
+# Re-apply the per-experiment directory after sourcing it so all ranks have a
+# writable cache and baseline/candidates reuse the same compiled kernels.
+export TRITON_CACHE_DIR="$GLM52_TRITON_CACHE_DIR"
+mkdir -p "$TRITON_CACHE_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 
 exec "$RUNTIME/venv/bin/python" -m sglang.launch_server \
