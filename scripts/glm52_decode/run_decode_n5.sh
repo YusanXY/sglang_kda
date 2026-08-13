@@ -18,8 +18,8 @@ export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 
 [[ "$RUNS" =~ ^[1-9][0-9]*$ ]] || { echo "RUNS must be positive" >&2; exit 2; }
-[[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
-  echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
+[[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm || "$MOE_RUNNER_BACKEND" == flashinfer_trtllm_routed ]] || {
+  echo "MOE_RUNNER_BACKEND must be auto, deep_gemm, or flashinfer_trtllm_routed" >&2
   exit 2
 }
 [[ "$REUSE_PREFIX_CACHE" == 0 || "$REUSE_PREFIX_CACHE" == 1 ]] || {

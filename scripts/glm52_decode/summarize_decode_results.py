@@ -29,7 +29,9 @@ def main() -> None:
     parser.add_argument("--server-info", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
-        "--expected-moe-runner", choices=("auto", "deep_gemm"), default="auto"
+        "--expected-moe-runner",
+        choices=("auto", "deep_gemm", "flashinfer_trtllm_routed"),
+        default="auto",
     )
     parser.add_argument(
         "--expected-shared-expert-parallelism", choices=("tp1", "tp8"), default="tp8"
@@ -55,7 +57,10 @@ def main() -> None:
             "output_tokens_per_request": 1_000,
             "decode_tokens": 63_936,
             "decode_boundary": "earliest server first token to latest server finish",
-            "context_residency": "at least 99,999 cached prompt tokens per request",
+            "context_residency": (
+                "exactly 99,968 cached prompt tokens per request "
+                "(full 64-token KV pages)"
+            ),
         },
         "decode_throughput": _stats([x["decode_throughput"] for x in samples]),
         "steady_decode_throughput": _stats(

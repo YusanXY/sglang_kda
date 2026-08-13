@@ -7,8 +7,8 @@ RUNTIME=${RUNTIME:-/mnt/b300-shared/home/gjy/data/agent4kernel/.runtime/b300}
 MODEL=${MODEL:-/var/b300-shared/models/GLM-5.2-FP8}
 PORT=${PORT:-30000}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
-GLM52_TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
-GLM52_DEEP_GEMM_CACHE_DIR=${SGLANG_DG_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
+GLM52_TRITON_CACHE_DIR=${GLM52_TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
+GLM52_DEEP_GEMM_CACHE_DIR=${GLM52_DEEP_GEMM_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
 GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
 GLM52_CUSTOM_ALL_REDUCE_IMPL=${GLM52_CUSTOM_ALL_REDUCE_IMPL:-legacy}
 GLM52_DISABLE_CUSTOM_ALL_REDUCE=${GLM52_DISABLE_CUSTOM_ALL_REDUCE:-0}
@@ -17,8 +17,8 @@ GLM52_ENABLE_DP_LM_HEAD=${GLM52_ENABLE_DP_LM_HEAD:-0}
 GLM52_COLOCATE_DP_BATCH=${GLM52_COLOCATE_DP_BATCH:-0}
 GLM52_LOCAL_DP_CONTROL=${GLM52_LOCAL_DP_CONTROL:-0}
 
-[[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
-  echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
+[[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm || "$MOE_RUNNER_BACKEND" == flashinfer_trtllm_routed ]] || {
+  echo "MOE_RUNNER_BACKEND must be auto, deep_gemm, or flashinfer_trtllm_routed" >&2
   exit 2
 }
 [[ "$GLM52_SHARED_EXPERT_TP1" == 0 || "$GLM52_SHARED_EXPERT_TP1" == 1 ]] || {

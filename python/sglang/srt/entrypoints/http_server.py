@@ -794,8 +794,7 @@ async def server_info():
         # MegaMoE on SM100 currently provides an FP8-activation/FP4-weight
         # fused path.  FP8 checkpoints therefore keep using the standard
         # dispatcher; with runner=auto that resolves to Triton, while an
-        # explicit deep_gemm runner selects the registered masked grouped
-        # DeepGEMM path.
+        # explicit runner selects its registered standard-dispatch path.
         "mega_moe_kernel_checkpoint_eligible": bool(
             quantization_config.get("is_fp4_experts", False)
         ),

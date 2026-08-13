@@ -10,12 +10,17 @@ RUN_DIR=${RUN_DIR:-$ROOT/.runtime/glm52_decode_nsys}
 PYTHON=${PYTHON:-$RUNTIME/venv/bin/python}
 PROFILE_STEPS=${PROFILE_STEPS:-200}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
-GLM52_TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
-GLM52_DEEP_GEMM_CACHE_DIR=${SGLANG_DG_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
+GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
+GLM52_TRITON_CACHE_DIR=${GLM52_TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
+GLM52_DEEP_GEMM_CACHE_DIR=${GLM52_DEEP_GEMM_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
 PREFIX=$RUN_DIR/req64_100k_1k_${TAG}
 
-[[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
-  echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
+[[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm || "$MOE_RUNNER_BACKEND" == flashinfer_trtllm_routed ]] || {
+  echo "MOE_RUNNER_BACKEND must be auto, deep_gemm, or flashinfer_trtllm_routed" >&2
+  exit 2
+}
+[[ "$GLM52_SHARED_EXPERT_TP1" == 0 || "$GLM52_SHARED_EXPERT_TP1" == 1 ]] || {
+  echo "GLM52_SHARED_EXPERT_TP1 must be 0 or 1" >&2
   exit 2
 }
 source "$RUNTIME/env.sh"
@@ -24,6 +29,12 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export TRITON_CACHE_DIR="$GLM52_TRITON_CACHE_DIR"
 export SGLANG_DG_CACHE_DIR="$GLM52_DEEP_GEMM_CACHE_DIR"
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+export SGLANG_ENABLE_COLOCATED_BATCH_GEN=1
+export SGLANG_SHARED_EXPERT_TP1="$GLM52_SHARED_EXPERT_TP1"
+# Match launch_server.sh's formal default.  runtime/env.sh may enable V2 for
+# unrelated experiments, but the validated GLM-5.2 baseline uses legacy custom
+# AR because V2 can strand DP8 prefill ranks in long-running GPU kernels.
+export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR" "$RUN_DIR"
 
@@ -46,7 +57,11 @@ done
   echo "commit=$(git -C "$REPO" rev-parse HEAD)"
   echo "model=$MODEL"
   echo "moe_runner_backend=$MOE_RUNNER_BACKEND"
+  echo "shared_expert_parallelism=$([[ "$GLM52_SHARED_EXPERT_TP1" == 1 ]] && echo tp1 || echo tp8)"
+  echo "custom_all_reduce_impl=legacy"
   echo "semantics=req64,input_per_request=100000,output_per_request=1000,decode_tokens=63936"
+  echo "dp_batch_entry=colocated,explicit_dp_routing=1"
+  echo "dp_scheduler_control=global"
   echo "profile_scope=post_last_first_token,steps=$PROFILE_STEPS,cuda_graph_nodes=host_only"
   nvidia-smi -L
   nvidia-smi topo -m
@@ -68,6 +83,7 @@ done
     --cuda-graph-max-bs-decode 544 --dist-timeout 3600 --watchdog-timeout 1800 \
     --batch-size 64 --input-len 100000 --output-len 1000 \
     --temperature 0 --dataset-name random-ids --seed 4199 \
+    --explicit-dp-routing \
     --save-output-token-ids --client-stream-interval 64 --skip-warmup \
     --request-timeout 14400 --no-append-to-github-summary \
     --run-name "glm52_decode_req64_100k_1k_nsys_${TAG}" \

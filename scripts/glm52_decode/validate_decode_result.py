@@ -133,7 +133,9 @@ def _validate_server(server: dict, expected_moe_runner: str) -> None:
             "formal GLM-5.2 decode requires stable legacy custom AR, got "
             f"{runtime!r}"
         )
-    expected_effective = "triton" if expected_moe_runner == "auto" else "deep_gemm"
+    expected_effective = (
+        "triton" if expected_moe_runner == "auto" else expected_moe_runner
+    )
     if runtime.get("effective_fp8_routed_moe_runner") != expected_effective:
         raise ValueError(
             "effective routed MoE runner mismatch: expected "
@@ -240,7 +242,9 @@ def main() -> None:
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--server-info", type=Path, required=True)
     parser.add_argument(
-        "--expected-moe-runner", choices=("auto", "deep_gemm"), default="auto"
+        "--expected-moe-runner",
+        choices=("auto", "deep_gemm", "flashinfer_trtllm_routed"),
+        default="auto",
     )
     parser.add_argument("--require-cached-context", action="store_true")
     parser.add_argument(

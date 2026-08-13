@@ -31,6 +31,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _ensure_writable_flashinfer_cubin_overlay() -> None:
+    """Give FlashInfer a writable alias tree without copying bundled cubins.
+
+    Some FlashInfer wheels resolve ``FLASHINFER_CUBIN_DIR`` to their bundled
+    ``flashinfer_cubin`` package before considering the environment override.
+    The TRT-LLM generator then creates header aliases below that root.  Shared
+    read-only runtimes cannot create those aliases, even though every hashed
+    artifact is already present.  Link the immutable artifact directories into
+    SGLang's cache and leave the overlay root writable for aliases and locks.
+    """
+    import flashinfer
+    from flashinfer.jit import cubin_loader
+    from flashinfer.jit import env as flashinfer_jit_env
+
+    source = Path(flashinfer_jit_env.FLASHINFER_CUBIN_DIR).resolve()
+    overlay = (
+        Path(envs.SGLANG_CACHE_DIR.get())
+        / "flashinfer"
+        / "cubin_overlay"
+        / getattr(flashinfer, "__version__", "unknown")
+    ).resolve()
+    if source == overlay:
+        return
+
+    overlay.mkdir(parents=True, exist_ok=True)
+    for artifact in source.iterdir():
+        link = overlay / artifact.name
+        if link.exists() or link.is_symlink():
+            continue
+        try:
+            link.symlink_to(artifact, target_is_directory=artifact.is_dir())
+        except FileExistsError:
+            # All DP ranks initialize concurrently and converge on the same
+            # immutable link target.
+            pass
+
+    flashinfer_jit_env.FLASHINFER_CUBIN_DIR = overlay
+    cubin_loader.FLASHINFER_CUBIN_DIR = overlay
+    logger.info("Using writable FlashInfer cubin overlay: %s", overlay)
+
+
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
 ) -> bool:
@@ -147,6 +188,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool):
     from flashinfer.autotuner import autotune
 
+    _ensure_writable_flashinfer_cubin_overlay()
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
     if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
@@ -172,12 +214,23 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
             from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
             maybe_skip_logits = autotune_dummy_run_mode()
-        with torch.inference_mode(), autotune(
-            # Autotuning mxfp8_gemm hits an IMA; skip it.
-            True,
-            cache=str(autotune_cache),
-            skip_ops={"mxfp8_gemm"},
-        ), maybe_skip_logits:
+        try:
+            autotune_context = autotune(
+                # Autotuning mxfp8_gemm hits an IMA; skip it when the installed
+                # FlashInfer exposes the selective-op API.
+                True,
+                cache=str(autotune_cache),
+                skip_ops={"mxfp8_gemm"},
+            )
+        except TypeError as exc:
+            if "skip_ops" not in str(exc):
+                raise
+            logger.warning(
+                "Installed FlashInfer autotuner does not support skip_ops; "
+                "running the full autotune set instead."
+            )
+            autotune_context = autotune(True, cache=str(autotune_cache))
+        with torch.inference_mode(), autotune_context, maybe_skip_logits:
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")

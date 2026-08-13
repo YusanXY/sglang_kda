@@ -662,6 +662,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     assert not runner_config.no_combine, "no_combine is not supported for flashinfer."
 
     hidden_states = dispatch_output.hidden_states
+    # DP-attention can legally leave a rank with no local decode tokens.  Avoid
+    # launching the FlashInfer quantization / routed-MoE kernels with M == 0;
+    # the StandardDispatcher combine path and the following EP all-reduce
+    # already preserve the empty-rank semantics.
+    if hidden_states.shape[0] == 0:
+        return StandardCombineInput(hidden_states=hidden_states)
+
     topk_output = dispatch_output.topk_output
     if TopKOutputChecker.format_is_bypassed(topk_output):
         router_logits = topk_output.router_logits
@@ -1305,6 +1312,24 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
         )
     raise TypeError(
         f"Unexpected quant_info type for flashinfer_trtllm_routed: {type(quant_info)}"
+    )
+
+
+@register_fused_func("megamoe", "flashinfer_trtllm_routed")
+def fused_experts_megamoe_to_flashinfer_trtllm_routed(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    """Run TRT-LLM routed MoE behind MegaMoE's standard dispatcher.
+
+    MegaMoE's SM100 fused kernel currently requires FP4 expert weights.  FP8
+    checkpoints therefore use ``StandardDispatcher`` and have the same
+    dispatch/combine ABI as the ``none`` backend.  Registering the alias lets
+    them use FlashInfer's FP8 block-scale kernel without requantizing weights.
+    """
+    return fused_experts_none_to_flashinfer_trtllm_routed(
+        dispatch_output, quant_info, runner_config
     )
 
 
