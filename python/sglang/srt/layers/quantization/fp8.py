@@ -1520,8 +1520,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
             from sglang.srt.layers import deep_gemm_wrapper
-            from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
-
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
@@ -1591,9 +1589,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     weight_block_size,
                     use_deepgemm_runner=will_use_deepgemm,
                 ):
-                    assert isinstance(
-                        layer, DeepEPMoE
-                    ), "DeepGemm MoE is only supported with DeepEPMoE"
+                    # DeepGEMM's masked grouped runner also supports the
+                    # StandardDispatcher used by local EP: the dispatcher
+                    # first maps global expert ids to this rank's local range,
+                    # and pre_permute_standard_to_deep_gemm builds the masked
+                    # expert-major input.  Restricting the UE8M0 transform to
+                    # DeepEPMoE made an explicitly selected DeepGEMM runner
+                    # fail during weight loading even though the complete
+                    # standard -> DeepGEMM -> standard path is registered.
                     requant_block_scale_ue8m0_for_deepgemm(
                         layer.w2_weight,
                         layer.w2_weight_scale_inv,

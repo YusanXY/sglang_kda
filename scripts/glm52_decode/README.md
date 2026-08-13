@@ -24,3 +24,27 @@ GLM-5.2 uses FP8 E4M3 expert weights, so stock SGLang leaves
 `_mega_moe_weights_built` false and executes the standard EP MoE path. Reports
 must call this configuration "MegaMoE-requested" until an FP8-capable fused A2A
 implementation is actually bound and profiled.
+
+Launch the stock baseline with:
+
+The fixed launch command uses a 3600-second process-group timeout. The first
+full-shape DP8 prefill can JIT-compile FlashInfer/CUTLASS kernels on ranks 1-7
+after rank 0 has entered a model-parallel collective; PyTorch's 600-second
+default can therefore abort a healthy cold start. This setting is identical
+for baseline and optimized runs and does not change measured steady decode.
+
+```bash
+MOE_RUNNER_BACKEND=auto scripts/glm52_decode/launch_server.sh
+```
+
+Launch the first optimized candidate with:
+
+```bash
+MOE_RUNNER_BACKEND=deep_gemm scripts/glm52_decode/launch_server.sh
+```
+
+Both commands keep TP8/EP8/DP8, DSA attention, requested MegaMoE, memory
+capacity and CUDA Graph shapes identical. The only intended execution change is
+the FP8 routed-expert runner: stock auto resolves to Triton because the
+checkpoint cannot build FP4 MegaMoE weights; the optimized command uses the
+standard-dispatch masked DeepGEMM runner.

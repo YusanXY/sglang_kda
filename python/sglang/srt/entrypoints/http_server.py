@@ -785,6 +785,26 @@ async def server_info():
         "mega_moe_use_mxf4_kind": (
             envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get()
         ),
+        # MegaMoE on SM100 currently provides an FP8-activation/FP4-weight
+        # fused path.  FP8 checkpoints therefore keep using the standard
+        # dispatcher; with runner=auto that resolves to Triton, while an
+        # explicit deep_gemm runner selects the registered masked grouped
+        # DeepGEMM path.
+        "mega_moe_kernel_checkpoint_eligible": bool(
+            quantization_config.get("is_fp4_experts", False)
+        ),
+        "effective_fp8_routed_moe_runner": (
+            "deep_gemm"
+            if server_args.moe_runner_backend == "deep_gemm"
+            else (
+                "triton"
+                if server_args.moe_a2a_backend == "megamoe"
+                and server_args.moe_runner_backend == "auto"
+                and quantization_config.get("quant_method") == "fp8"
+                and not quantization_config.get("is_fp4_experts", False)
+                else server_args.moe_runner_backend
+            )
+        ),
     }
 
     # server_args.model_config is not serializable but should be excluded by asdict.

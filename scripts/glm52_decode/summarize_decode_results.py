@@ -28,8 +28,14 @@ def main() -> None:
     parser.add_argument("--result", action="append", type=Path, required=True)
     parser.add_argument("--server-info", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--expected-moe-runner", choices=("auto", "deep_gemm"), default="auto"
+    )
     args = parser.parse_args()
-    samples = [validate(path, args.server_info) for path in args.result]
+    samples = [
+        validate(path, args.server_info, args.expected_moe_runner)
+        for path in args.result
+    ]
     summary = {
         "status": "PASS",
         "semantics": {

@@ -59,7 +59,7 @@ def _validate_output_vectors(row: dict) -> tuple[str, list[str]]:
     return input_hash, hashes
 
 
-def _validate_server(server: dict) -> None:
+def _validate_server(server: dict, expected_moe_runner: str) -> None:
     expected = {
         "tp_size": 8,
         "dp_size": 8,
@@ -73,6 +73,7 @@ def _validate_server(server: dict) -> None:
         "dsa_decode_backend": "trtllm",
         "kv_cache_dtype": "fp8_e4m3",
         "chunked_prefill_size": 2048,
+        "moe_runner_backend": expected_moe_runner,
     }
     for key, wanted in expected.items():
         actual = server.get(key)
@@ -120,11 +121,25 @@ def _validate_server(server: dict) -> None:
     if quant.get("weight_block_size") != [128, 128]:
         raise ValueError(f"unexpected FP8 weight block: {quant!r}")
 
+    runtime = server.get("glm52_decode_runtime_config")
+    if not isinstance(runtime, dict):
+        raise ValueError("missing GLM-5.2 decode runtime config")
+    if runtime.get("mega_moe_kernel_checkpoint_eligible") is not False:
+        raise ValueError(f"FP8 checkpoint unexpectedly MegaMoE-eligible: {runtime!r}")
+    expected_effective = "triton" if expected_moe_runner == "auto" else "deep_gemm"
+    if runtime.get("effective_fp8_routed_moe_runner") != expected_effective:
+        raise ValueError(
+            "effective routed MoE runner mismatch: expected "
+            f"{expected_effective!r}, got {runtime!r}"
+        )
 
-def validate(result_path: Path, server_info_path: Path) -> dict:
+
+def validate(
+    result_path: Path, server_info_path: Path, expected_moe_runner: str = "auto"
+) -> dict:
     row = _read_single_result(result_path)
     server = json.loads(server_info_path.read_text(encoding="utf-8"))
-    _validate_server(server)
+    _validate_server(server, expected_moe_runner)
 
     expected_row = {
         "batch_size": EXPECTED_BATCH_SIZE,
@@ -174,8 +189,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--result", type=Path, required=True)
     parser.add_argument("--server-info", type=Path, required=True)
+    parser.add_argument(
+        "--expected-moe-runner", choices=("auto", "deep_gemm"), default="auto"
+    )
     args = parser.parse_args()
-    print(json.dumps(validate(args.result, args.server_info), sort_keys=True))
+    print(
+        json.dumps(
+            validate(args.result, args.server_info, args.expected_moe_runner),
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

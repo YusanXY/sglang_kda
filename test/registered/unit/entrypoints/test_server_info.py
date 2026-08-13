@@ -321,6 +321,26 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         self.assertEqual(
             fingerprint["weight_quantization"]["weight_block_size"], [128, 128]
         )
+        runtime = info["glm52_decode_runtime_config"]
+        self.assertFalse(runtime["mega_moe_kernel_checkpoint_eligible"])
+        self.assertEqual(runtime["effective_fp8_routed_moe_runner"], "triton")
+
+    def test_glm52_explicit_deep_gemm_runner_is_reported(self):
+        args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="megamoe",
+            moe_runner_backend="deep_gemm",
+        )
+        hf_config = SimpleNamespace(
+            quantization_config={"quant_method": "fp8", "is_fp4_experts": False}
+        )
+
+        info = _call_server_info_with(args, hf_config=hf_config)
+
+        self.assertEqual(
+            info["glm52_decode_runtime_config"]["effective_fp8_routed_moe_runner"],
+            "deep_gemm",
+        )
 
     def test_kv_events_config_raw_field_still_surfaced(self):
         # The new structured `kv_events` block sits alongside the
