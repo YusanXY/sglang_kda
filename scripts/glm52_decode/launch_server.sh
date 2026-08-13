@@ -13,6 +13,7 @@ GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
 GLM52_CUSTOM_ALL_REDUCE_IMPL=${GLM52_CUSTOM_ALL_REDUCE_IMPL:-legacy}
 GLM52_DISABLE_CUSTOM_ALL_REDUCE=${GLM52_DISABLE_CUSTOM_ALL_REDUCE:-0}
 GLM52_DISABLE_OVERLAP=${GLM52_DISABLE_OVERLAP:-0}
+GLM52_ENABLE_DP_LM_HEAD=${GLM52_ENABLE_DP_LM_HEAD:-0}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
   echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
@@ -32,6 +33,10 @@ GLM52_DISABLE_OVERLAP=${GLM52_DISABLE_OVERLAP:-0}
 }
 [[ "$GLM52_DISABLE_OVERLAP" == 0 || "$GLM52_DISABLE_OVERLAP" == 1 ]] || {
   echo "GLM52_DISABLE_OVERLAP must be 0 or 1" >&2
+  exit 2
+}
+[[ "$GLM52_ENABLE_DP_LM_HEAD" == 0 || "$GLM52_ENABLE_DP_LM_HEAD" == 1 ]] || {
+  echo "GLM52_ENABLE_DP_LM_HEAD must be 0 or 1" >&2
   exit 2
 }
 [[ -d "$REPO/python/sglang" ]] || { echo "missing repo: $REPO" >&2; exit 2; }
@@ -68,6 +73,9 @@ if [[ "$GLM52_DISABLE_CUSTOM_ALL_REDUCE" == 1 ]]; then
 fi
 if [[ "$GLM52_DISABLE_OVERLAP" == 1 ]]; then
   extra_args+=(--disable-overlap-schedule)
+fi
+if [[ "$GLM52_ENABLE_DP_LM_HEAD" == 1 ]]; then
+  extra_args+=(--enable-dp-lm-head)
 fi
 
 exec "$RUNTIME/venv/bin/python" -m sglang.launch_server \
