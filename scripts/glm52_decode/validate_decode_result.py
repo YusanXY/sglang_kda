@@ -150,11 +150,19 @@ def validate(
     require_cached_context: bool = False,
     expected_shared_expert_parallelism: str = "tp8",
     context_build: bool = False,
+    expected_flashinfer_direct_output: bool = False,
 ) -> dict:
     row = _read_single_result(result_path)
     server = json.loads(server_info_path.read_text(encoding="utf-8"))
     _validate_server(server, expected_moe_runner)
     runtime = server["glm52_decode_runtime_config"]
+    if bool(runtime.get("flashinfer_moe_direct_output", False)) != (
+        expected_flashinfer_direct_output
+    ):
+        raise ValueError(
+            "FlashInfer MoE direct-output mismatch: expected "
+            f"{expected_flashinfer_direct_output!r}, got {runtime!r}"
+        )
     if runtime.get("shared_expert_parallelism") != expected_shared_expert_parallelism:
         raise ValueError(
             "shared expert parallelism mismatch: expected "
@@ -246,6 +254,7 @@ def main() -> None:
         choices=("auto", "deep_gemm", "flashinfer_trtllm_routed"),
         default="auto",
     )
+    parser.add_argument("--expected-flashinfer-direct-output", action="store_true")
     parser.add_argument("--require-cached-context", action="store_true")
     parser.add_argument(
         "--context-build",
@@ -269,6 +278,9 @@ def main() -> None:
                     args.expected_shared_expert_parallelism
                 ),
                 context_build=args.context_build,
+                expected_flashinfer_direct_output=(
+                    args.expected_flashinfer_direct_output
+                ),
             ),
             sort_keys=True,
         )

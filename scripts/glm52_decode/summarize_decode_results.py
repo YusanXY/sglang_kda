@@ -33,6 +33,7 @@ def main() -> None:
         choices=("auto", "deep_gemm", "flashinfer_trtllm_routed"),
         default="auto",
     )
+    parser.add_argument("--expected-flashinfer-direct-output", action="store_true")
     parser.add_argument(
         "--expected-shared-expert-parallelism", choices=("tp1", "tp8"), default="tp8"
     )
@@ -45,6 +46,9 @@ def main() -> None:
             require_cached_context=True,
             expected_shared_expert_parallelism=(
                 args.expected_shared_expert_parallelism
+            ),
+            expected_flashinfer_direct_output=(
+                args.expected_flashinfer_direct_output
             ),
         )
         for path in args.result

@@ -1037,6 +1037,9 @@ class Envs:
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(False)
+    # Let FlashInfer's routed FP8 MoE write the symmetric all-reduce buffer
+    # directly instead of materializing and copying a private output tensor.
+    SGLANG_FLASHINFER_MOE_DIRECT_OUTPUT = EnvBool(False)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

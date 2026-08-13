@@ -810,6 +810,9 @@ async def server_info():
                 else server_args.moe_runner_backend
             )
         ),
+        "flashinfer_moe_direct_output": (
+            envs.SGLANG_FLASHINFER_MOE_DIRECT_OUTPUT.get()
+        ),
         "shared_expert_parallelism": (
             "tp1"
             if envs.SGLANG_SHARED_EXPERT_TP1.get()

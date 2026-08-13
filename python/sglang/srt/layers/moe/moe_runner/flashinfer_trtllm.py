@@ -26,6 +26,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
     trtllm_fp8_block_scale_moe_wrapper,
+    trtllm_fp8_block_scale_routed_moe_out_wrapper,
     trtllm_fp8_block_scale_routed_moe_wrapper,
     trtllm_fp8_per_tensor_scale_moe_wrapper,
 )
@@ -729,37 +730,44 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 topk_output.topk_ids, topk_output.topk_weights
             )
 
-            output = trtllm_fp8_block_scale_routed_moe_wrapper(
-                topk_ids=packed_topk_ids,
-                routing_bias=None,
-                hidden_states=a_q,
-                hidden_states_scale=a_sf_t,
-                gemm1_weights=quant_info.w13_weight,
-                gemm1_weights_scale=quant_info.w13_weight_scale_inv,
-                gemm2_weights=quant_info.w2_weight,
-                gemm2_weights_scale=quant_info.w2_weight_scale_inv,
-                num_experts=quant_info.global_num_experts,
-                top_k=runner_config.top_k,
-                n_group=None,
-                topk_group=None,
-                intermediate_size=quant_info.intermediate_size,
-                local_expert_offset=quant_info.local_expert_offset,
-                local_num_experts=quant_info.local_num_experts,
-                routed_scaling_factor=(
+            routed_kwargs = {
+                "topk_ids": packed_topk_ids,
+                "routing_bias": None,
+                "hidden_states": a_q,
+                "hidden_states_scale": a_sf_t,
+                "gemm1_weights": quant_info.w13_weight,
+                "gemm1_weights_scale": quant_info.w13_weight_scale_inv,
+                "gemm2_weights": quant_info.w2_weight,
+                "gemm2_weights_scale": quant_info.w2_weight_scale_inv,
+                "num_experts": quant_info.global_num_experts,
+                "top_k": runner_config.top_k,
+                "n_group": None,
+                "topk_group": None,
+                "intermediate_size": quant_info.intermediate_size,
+                "local_expert_offset": quant_info.local_expert_offset,
+                "local_num_experts": quant_info.local_num_experts,
+                "routed_scaling_factor": (
                     runner_config.routed_scaling_factor
                     if runner_config.routed_scaling_factor is not None
                     else 1.0
                 ),
-                routing_method_type=(
+                "routing_method_type": (
                     RoutingMethodType.TopK
                     if routing_method_type == RoutingMethodType.DeepSeekV3
                     else routing_method_type
                 ),
-                use_shuffled_weight=use_shuffled_weight,
-                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
-                fp8_quantization_type=int(fp8_quantization_type),
-                activation_type=quant_info.activation_type,
-            )
+                "use_shuffled_weight": use_shuffled_weight,
+                "tune_max_num_tokens": next_power_of_2(a_q.shape[0]),
+                "fp8_quantization_type": int(fp8_quantization_type),
+                "activation_type": quant_info.activation_type,
+            }
+            if envs.SGLANG_FLASHINFER_MOE_DIRECT_OUTPUT.get():
+                trtllm_fp8_block_scale_routed_moe_out_wrapper(
+                    output=symm_output, **routed_kwargs
+                )
+                output = symm_output
+            else:
+                output = trtllm_fp8_block_scale_routed_moe_wrapper(**routed_kwargs)
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
@@ -790,9 +798,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 fp8_quantization_type=int(fp8_quantization_type),
                 activation_type=quant_info.activation_type,
             )
-        # TODO: Once https://github.com/flashinfer-ai/flashinfer/issues/2703 is fixed, pass output to moe kernel and remove this copy.
-        symm_output.copy_(output)
-        output = symm_output
+        if output.data_ptr() != symm_output.data_ptr():
+            # Compatibility path for FlashInfer releases that cannot write a
+            # caller-provided symmetric buffer.
+            symm_output.copy_(output)
+            output = symm_output
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
         assert quant_info.w13_input_scale is not None

@@ -16,8 +16,9 @@ fail instead of falling back into the performance table.
 then executes the five measured 1K-token samples. The context build is validated
 but excluded from the summary: it covers all 6.4M prompt tokens without wasting
 another 63,936 untimed decode tokens. Measured samples use the identical seed
-and preserve the live prefix cache; every result must report at least 99,999
-cached tokens for every 100K-token request. Thus the timed forward is
+and preserve the live prefix cache; with page size 64 every result must report
+exactly 99,968 cached tokens for every 100K-token request. The final 32-token
+partial page is replayed before first-token timing. Thus the timed forward is
 long-context decode replay rather than another 6.4M-token prefill. Set
 `REUSE_PREFIX_CACHE=1` only when a separately validated warmup populated those
 exact prompts on the same live server.
@@ -57,7 +58,7 @@ AR, not NCCL, and is held identical for baseline and every optimized sample.
 MOE_RUNNER_BACKEND=auto scripts/glm52_decode/launch_server.sh
 ```
 
-Launch the first optimized candidate with:
+Launch the rejected DeepGEMM experiment with:
 
 ```bash
 MOE_RUNNER_BACKEND=deep_gemm scripts/glm52_decode/launch_server.sh
@@ -68,3 +69,32 @@ capacity and CUDA Graph shapes identical. The only intended execution change is
 the FP8 routed-expert runner: stock auto resolves to Triton because the
 checkpoint cannot build FP4 MegaMoE weights; the optimized command uses the
 standard-dispatch masked DeepGEMM runner.
+
+DeepGEMM improves throughput but is not an accepted implementation for this
+checkpoint: it requantizes the non-UE8M0 expert scales and fails the native-noise
+output gate. The accepted routed-MoE implementation preserves the checkpoint's
+FP8 block scales and uses FlashInfer TRT-LLM behind the same standard dispatcher:
+
+```bash
+MOE_RUNNER_BACKEND=flashinfer_trtllm_routed \
+  scripts/glm52_decode/launch_server.sh
+```
+
+The direct-output candidate additionally lets FlashInfer write its finalized
+BF16 result directly into SGLang's caller-owned all-reduce buffer. It removes
+one output-sized D2D copy per sparse layer and rank without changing routing,
+scales, expert weights, collective order, or graph shapes:
+
+```bash
+MOE_RUNNER_BACKEND=flashinfer_trtllm_routed \
+GLM52_FLASHINFER_DIRECT_OUTPUT=1 \
+  scripts/glm52_decode/launch_server.sh
+```
+
+Set the matching strict validator contract while measuring:
+
+```bash
+RUNS=5 MOE_RUNNER_BACKEND=flashinfer_trtllm_routed \
+EXPECTED_FLASHINFER_DIRECT_OUTPUT=1 \
+  scripts/glm52_decode/run_decode_n5.sh
+```
