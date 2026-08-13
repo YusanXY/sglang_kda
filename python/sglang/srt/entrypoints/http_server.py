@@ -735,6 +735,57 @@ async def server_info():
     )
 
     server_args = _global_state.tokenizer_manager.server_args
+    model_config = getattr(_global_state.tokenizer_manager, "model_config", None)
+    hf_config = getattr(model_config, "hf_config", None)
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if hasattr(quantization_config, "to_dict"):
+        quantization_config = quantization_config.to_dict()
+    if not isinstance(quantization_config, dict):
+        quantization_config = {}
+
+    mlp_layer_types = list(getattr(hf_config, "mlp_layer_types", None) or [])
+    indexer_types = list(getattr(hf_config, "indexer_types", None) or [])
+    glm52_model_fingerprint = {
+        "model_type": getattr(hf_config, "model_type", None),
+        "architectures": list(getattr(hf_config, "architectures", None) or []),
+        "hidden_size": getattr(hf_config, "hidden_size", None),
+        "num_hidden_layers": getattr(hf_config, "num_hidden_layers", None),
+        "mlp_layer_type_counts": {
+            layer_type: mlp_layer_types.count(layer_type)
+            for layer_type in sorted(set(mlp_layer_types))
+        },
+        "indexer_type_counts": {
+            indexer_type: indexer_types.count(indexer_type)
+            for indexer_type in sorted(set(indexer_types))
+        },
+        "q_lora_rank": getattr(hf_config, "q_lora_rank", None),
+        "kv_lora_rank": getattr(hf_config, "kv_lora_rank", None),
+        "num_attention_heads": getattr(hf_config, "num_attention_heads", None),
+        "index_topk": getattr(hf_config, "index_topk", None),
+        "index_topk_freq": getattr(hf_config, "index_topk_freq", None),
+        "index_skip_topk_offset": getattr(
+            hf_config, "index_skip_topk_offset", None
+        ),
+        "n_routed_experts": getattr(hf_config, "n_routed_experts", None),
+        "n_shared_experts": getattr(hf_config, "n_shared_experts", None),
+        "num_experts_per_tok": getattr(hf_config, "num_experts_per_tok", None),
+        "moe_intermediate_size": getattr(hf_config, "moe_intermediate_size", None),
+        "weight_quantization": {
+            key: quantization_config.get(key)
+            for key in ("quant_method", "fmt", "scale_fmt", "weight_block_size")
+        },
+    }
+    glm52_decode_runtime_config = {
+        "mega_moe_num_max_tokens_per_rank": (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+        ),
+        "mega_moe_use_fp4_acts": (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
+        ),
+        "mega_moe_use_mxf4_kind": (
+            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get()
+        ),
+    }
 
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
@@ -743,6 +794,8 @@ async def server_info():
             **_global_state.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,
+            "glm52_model_fingerprint": glm52_model_fingerprint,
+            "glm52_decode_runtime_config": glm52_decode_runtime_config,
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `ServerArgs.describe_kv_events_publisher` for the precise contract.

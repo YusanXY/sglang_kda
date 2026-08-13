@@ -36,7 +36,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _call_server_info_with(
-    server_args: ServerArgs, internal_states: list[dict] | None = None
+    server_args: ServerArgs,
+    internal_states: list[dict] | None = None,
+    hf_config=None,
 ) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
@@ -53,6 +55,9 @@ def _call_server_info_with(
     stub_state = SimpleNamespace(
         tokenizer_manager=SimpleNamespace(
             server_args=server_args,
+            model_config=(
+                SimpleNamespace(hf_config=hf_config) if hf_config is not None else None
+            ),
             get_internal_state=_fake_internal_state,
         ),
         scheduler_info={"max_req_input_len": 1024},
@@ -273,6 +278,49 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
 
         self.assertIn("internal_states", info)
         self.assertIn("version", info)
+        self.assertIn("glm52_model_fingerprint", info)
+        self.assertIn("glm52_decode_runtime_config", info)
+
+    def test_glm52_fingerprint_reports_shape_and_layer_counts(self):
+        args = ServerArgs(model_path="dummy")
+        hf_config = SimpleNamespace(
+            model_type="glm_moe_dsa",
+            architectures=["GlmMoeDsaForCausalLM"],
+            hidden_size=6144,
+            num_hidden_layers=78,
+            mlp_layer_types=["dense"] * 3 + ["sparse"] * 75,
+            indexer_types=["full"] * 21 + ["shared"] * 57,
+            q_lora_rank=2048,
+            kv_lora_rank=512,
+            num_attention_heads=64,
+            index_topk=2048,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+            n_routed_experts=256,
+            n_shared_experts=1,
+            num_experts_per_tok=8,
+            moe_intermediate_size=2048,
+            quantization_config={
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+            },
+        )
+
+        info = _call_server_info_with(args, hf_config=hf_config)
+
+        fingerprint = info["glm52_model_fingerprint"]
+        self.assertEqual(fingerprint["architectures"], ["GlmMoeDsaForCausalLM"])
+        self.assertEqual(
+            fingerprint["mlp_layer_type_counts"], {"dense": 3, "sparse": 75}
+        )
+        self.assertEqual(
+            fingerprint["indexer_type_counts"], {"full": 21, "shared": 57}
+        )
+        self.assertEqual(fingerprint["index_topk"], 2048)
+        self.assertEqual(
+            fingerprint["weight_quantization"]["weight_block_size"], [128, 128]
+        )
 
     def test_kv_events_config_raw_field_still_surfaced(self):
         # The new structured `kv_events` block sits alongside the

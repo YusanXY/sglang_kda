@@ -473,6 +473,8 @@ class BenchOneCaseResult(BaseModel):
     input_ids_sha256: str
     output_token_ids_sha256: Optional[List[str]]
     output_token_ids: Optional[List[List[int]]]
+    dp_ranks: Optional[List[int]]
+    dp_rank_counts: Optional[List[int]]
     overall_throughput: float
     last_ttft: float
     last_gen_throughput: float
@@ -523,6 +525,8 @@ class BenchOneCaseResult(BaseModel):
                 "input_ids_sha256": self.input_ids_sha256,
                 "output_token_ids_sha256": self.output_token_ids_sha256,
                 "output_token_ids": self.output_token_ids,
+                "dp_ranks": self.dp_ranks,
+                "dp_rank_counts": self.dp_rank_counts,
                 "overall_throughput": round(self.overall_throughput, 2),
                 "last_ttft": round(self.last_ttft, 4),
                 "last_gen_throughput": round(self.last_gen_throughput, 2),
@@ -1079,6 +1083,8 @@ def run_one_case(
         max_retractions = -1
         output_token_ids_sha256 = None
         persisted_output_token_ids = None
+        persisted_dp_ranks = None
+        dp_rank_counts = None
         if backend == "vllm":
             # Parse OpenAI-compatible streaming format from vLLM
             first_token_indices = set()
@@ -1105,6 +1111,7 @@ def run_one_case(
             server_first_token_timestamps = {}
             server_finished_timestamps = {}
             latest_completion_tokens = {}
+            dp_rank_by_index = {}
             output_token_ids_by_index = [[] for _ in range(batch_size)]
             for chunk in response.iter_lines(decode_unicode=False):
                 chunk = chunk.decode("utf-8")
@@ -1132,6 +1139,23 @@ def run_one_case(
                         raise RuntimeError(
                             f"invalid request index in stream event: {index!r}"
                         )
+                    dp_rank = data["meta_info"].get("dp_rank")
+                    if dp_rank is not None:
+                        if (
+                            isinstance(dp_rank, bool)
+                            or not isinstance(dp_rank, int)
+                            or dp_rank < 0
+                        ):
+                            raise RuntimeError(
+                                f"request {index} returned invalid dp_rank={dp_rank!r}"
+                            )
+                        previous_dp_rank = dp_rank_by_index.get(index)
+                        if previous_dp_rank is not None and previous_dp_rank != dp_rank:
+                            raise RuntimeError(
+                                f"request {index} changed DP rank during streaming: "
+                                f"{previous_dp_rank} -> {dp_rank}"
+                            )
+                        dp_rank_by_index[index] = dp_rank
                     completion_tokens = data["meta_info"]["completion_tokens"]
                     previous_completion_tokens = latest_completion_tokens.get(index, 0)
                     is_finished = data["meta_info"]["finish_reason"] is not None
@@ -1275,6 +1299,17 @@ def run_one_case(
                     f"missing finish events for request indices: {missing}"
                 )
             completed_requests = len(finished_indices)
+            if dp_rank_by_index:
+                if len(dp_rank_by_index) != batch_size:
+                    missing = sorted(set(range(batch_size)) - dp_rank_by_index.keys())
+                    raise RuntimeError(
+                        "DP rank metadata was only returned for part of the batch; "
+                        f"missing request indices: {missing}"
+                    )
+                persisted_dp_ranks = [dp_rank_by_index[i] for i in range(batch_size)]
+                dp_rank_counts = [0] * (max(persisted_dp_ranks) + 1)
+                for dp_rank in persisted_dp_ranks:
+                    dp_rank_counts[dp_rank] += 1
             server_first_token_spread = (
                 max(server_first_token_timestamps.values())
                 - min(server_first_token_timestamps.values())
@@ -1423,6 +1458,8 @@ def run_one_case(
         input_ids_sha256=input_ids_sha256,
         output_token_ids_sha256=output_token_ids_sha256,
         output_token_ids=persisted_output_token_ids,
+        dp_ranks=persisted_dp_ranks,
+        dp_rank_counts=dp_rank_counts,
         overall_throughput=overall_throughput,
         last_ttft=last_ttft,
         last_gen_throughput=last_gen_throughput,
