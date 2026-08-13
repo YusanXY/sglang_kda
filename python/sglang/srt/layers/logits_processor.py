@@ -293,30 +293,36 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-        try:
-            cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
-        except Exception:
-            logger.exception(
-                "DP logits metadata cumsum failed: values_cpu=%s tensor_shape=%s "
-                "tensor_device=%s current_device=%s dp_device=%s dp_rank=%s",
-                self.global_num_tokens_for_logprob_cpu,
-                tuple(self.global_num_tokens_for_logprob_gpu.shape),
-                self.global_num_tokens_for_logprob_gpu.device,
-                torch.cuda.current_device(),
-                get_dp_device(),
-                get_parallel().attn_dp_rank,
-            )
-            raise
         dp_rank = get_parallel().attn_dp_rank
-        if dp_rank == 0:
-            dp_local_start_pos = torch.zeros_like(
-                self.global_num_tokens_for_logprob_gpu[0]
+        if self.global_num_tokens_for_logprob_cpu is not None:
+            # Eager EXTEND/IDLE already carries the authoritative host counts.
+            # Deriving the two local scalars from that list avoids launching a
+            # device-wide cumsum kernel for eight integers.  More importantly,
+            # idle DP ranks can enter this logits tail after participating in
+            # an active peer's long-prefill collectives; launching cumsum here
+            # has produced spurious cudaErrorInvalidDevice on B300 even though
+            # the tensor and current device ordinals are correct.  CUDA-graph
+            # capture has no CPU list and intentionally retains the graphable
+            # tensor path below.
+            counts = self.global_num_tokens_for_logprob_cpu
+            device = self.global_num_tokens_for_logprob_gpu.device
+            self.dp_local_start_pos = torch.tensor(
+                sum(counts[:dp_rank]), dtype=torch.int64, device=device
+            )
+            self.dp_local_num_tokens = torch.tensor(
+                counts[dp_rank], dtype=torch.int64, device=device
             )
         else:
-            dp_local_start_pos = cumtokens[dp_rank - 1]
+            cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+            if dp_rank == 0:
+                dp_local_start_pos = torch.zeros_like(
+                    self.global_num_tokens_for_logprob_gpu[0]
+                )
+            else:
+                dp_local_start_pos = cumtokens[dp_rank - 1]
 
-        self.dp_local_start_pos = dp_local_start_pos
-        self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
+            self.dp_local_start_pos = dp_local_start_pos
+            self.dp_local_num_tokens = self.global_num_tokens_for_logprob_gpu[dp_rank]
 
         hidden_size = get_dp_hidden_size()
         dtype = get_dp_dtype()
