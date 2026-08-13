@@ -776,6 +776,12 @@ async def server_info():
         },
     }
     glm52_decode_runtime_config = {
+        "custom_all_reduce_impl": (
+            "v2"
+            if not server_args.disable_custom_all_reduce
+            and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get()
+            else ("legacy" if not server_args.disable_custom_all_reduce else "disabled")
+        ),
         "mega_moe_num_max_tokens_per_rank": (
             envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
         ),

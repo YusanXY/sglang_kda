@@ -46,6 +46,13 @@ symmetrically on demand, and an exact Req64/100K context build is still run and
 validated before measured samples. This is a common harness fix, not a
 throughput optimization.
 
+The formal launcher resolves `SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0`, and the
+validator requires `/server_info` to report `custom_all_reduce_impl=legacy`.
+On this B300 DP8 topology, V2 intermittently leaves eager-prefill ranks spinning
+inside one-/two-shot GPU kernels: the same 8x2048-token preflight exceeded 90 s,
+whereas legacy custom AR completed in 2.13 s. This remains SGLang's GPU custom
+AR, not NCCL, and is held identical for baseline and every optimized sample.
+
 ```bash
 MOE_RUNNER_BACKEND=auto scripts/glm52_decode/launch_server.sh
 ```

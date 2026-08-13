@@ -10,6 +10,7 @@ MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
 GLM52_TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
 GLM52_DEEP_GEMM_CACHE_DIR=${SGLANG_DG_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
 GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
+GLM52_CUSTOM_ALL_REDUCE_IMPL=${GLM52_CUSTOM_ALL_REDUCE_IMPL:-legacy}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
   echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
@@ -17,6 +18,10 @@ GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
 }
 [[ "$GLM52_SHARED_EXPERT_TP1" == 0 || "$GLM52_SHARED_EXPERT_TP1" == 1 ]] || {
   echo "GLM52_SHARED_EXPERT_TP1 must be 0 or 1" >&2
+  exit 2
+}
+[[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == legacy || "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == v2 ]] || {
+  echo "GLM52_CUSTOM_ALL_REDUCE_IMPL must be legacy or v2" >&2
   exit 2
 }
 [[ -d "$REPO/python/sglang" ]] || { echo "missing repo: $REPO" >&2; exit 2; }
@@ -36,6 +41,14 @@ export SGLANG_DG_CACHE_DIR="$GLM52_DEEP_GEMM_CACHE_DIR"
 # target-shape warmup below the server boundary remains excluded from samples.
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 export SGLANG_SHARED_EXPERT_TP1="$GLM52_SHARED_EXPERT_TP1"
+# Custom AllReduce V2 can leave B300 DP8 eager prefill ranks spinning inside
+# one-/two-shot GPU kernels. Legacy custom AR is still GPU-local (not NCCL),
+# is stable for context construction, and remains common to every formal A/B.
+if [[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == v2 ]]; then
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1
+else
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0
+fi
 mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 

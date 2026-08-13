@@ -322,6 +322,7 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
             fingerprint["weight_quantization"]["weight_block_size"], [128, 128]
         )
         runtime = info["glm52_decode_runtime_config"]
+        self.assertEqual(runtime["custom_all_reduce_impl"], "v2")
         self.assertFalse(runtime["mega_moe_kernel_checkpoint_eligible"])
         self.assertEqual(runtime["effective_fp8_routed_moe_runner"], "triton")
         self.assertEqual(runtime["shared_expert_parallelism"], "tp8")

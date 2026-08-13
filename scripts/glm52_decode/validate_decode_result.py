@@ -128,6 +128,11 @@ def _validate_server(server: dict, expected_moe_runner: str) -> None:
         raise ValueError("missing GLM-5.2 decode runtime config")
     if runtime.get("mega_moe_kernel_checkpoint_eligible") is not False:
         raise ValueError(f"FP8 checkpoint unexpectedly MegaMoE-eligible: {runtime!r}")
+    if runtime.get("custom_all_reduce_impl") != "legacy":
+        raise ValueError(
+            "formal GLM-5.2 decode requires stable legacy custom AR, got "
+            f"{runtime!r}"
+        )
     expected_effective = "triton" if expected_moe_runner == "auto" else "deep_gemm"
     if runtime.get("effective_fp8_routed_moe_runner") != expected_effective:
         raise ValueError(

@@ -52,6 +52,7 @@ def _server_info():
             },
         },
         "glm52_decode_runtime_config": {
+            "custom_all_reduce_impl": "legacy",
             "mega_moe_kernel_checkpoint_eligible": False,
             "effective_fp8_routed_moe_runner": "triton",
             "shared_expert_parallelism": "tp8",
