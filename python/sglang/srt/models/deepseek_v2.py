@@ -3103,6 +3103,23 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if (
+            envs.SGLANG_DEBUG_SYNC_MODEL_LAYERS.get()
+            and forward_batch.forward_mode.is_extend()
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            try:
+                torch.cuda.synchronize(hidden_states.device)
+            except Exception:
+                logger.exception(
+                    "CUDA failure after final model norm; mode=%s hidden_shape=%s "
+                    "device=%s current_device=%s",
+                    forward_batch.forward_mode,
+                    tuple(hidden_states.shape),
+                    hidden_states.device,
+                    torch.cuda.current_device(),
+                )
+                raise
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states

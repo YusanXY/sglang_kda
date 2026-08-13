@@ -293,7 +293,20 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-        cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+        try:
+            cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
+        except Exception:
+            logger.exception(
+                "DP logits metadata cumsum failed: values_cpu=%s tensor_shape=%s "
+                "tensor_device=%s current_device=%s dp_device=%s dp_rank=%s",
+                self.global_num_tokens_for_logprob_cpu,
+                tuple(self.global_num_tokens_for_logprob_gpu.shape),
+                self.global_num_tokens_for_logprob_gpu.device,
+                torch.cuda.current_device(),
+                get_dp_device(),
+                get_parallel().attn_dp_rank,
+            )
+            raise
         dp_rank = get_parallel().attn_dp_rank
         if dp_rank == 0:
             dp_local_start_pos = torch.zeros_like(
