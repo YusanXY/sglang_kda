@@ -86,6 +86,14 @@ class SchedulerRequestReceiver:
 
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
+            # Do not enter the normal work/control broadcasts until the
+            # colocated-batch release barrier has completed on every DP rank.
+            # With a multi-megabyte rank-local prompt, one scheduler can still
+            # be receiving its batch while peers have already observed
+            # UNBLOCK; allowing those peers into a Gloo control broadcast here
+            # interleaves two collectives on the same process group.
+            if self.input_blocker.is_blocking_model_schedule:
+                return []
 
         recv_reqs = self._broadcast_reqs_across_ranks(recv_reqs)
 
