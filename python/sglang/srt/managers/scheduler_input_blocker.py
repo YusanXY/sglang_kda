@@ -33,6 +33,26 @@ class SchedulerInputBlocker:
         assert (recv_reqs is None) == self._noop
 
         if not self._noop:
+            # RequestReceiver groups local work before broadcast control.  If
+            # BLOCK/work/UNBLOCK were drained in one poll, restore the barrier
+            # edge ordering so the work is actually held by the blocker.
+            blocks = [
+                req
+                for req in recv_reqs
+                if isinstance(req, BlockReqInput)
+                and req.req_type == BlockReqType.BLOCK
+            ]
+            unblocks = [
+                req
+                for req in recv_reqs
+                if isinstance(req, BlockReqInput)
+                and req.req_type == BlockReqType.UNBLOCK
+            ]
+            if blocks or unblocks:
+                regular_reqs = [
+                    req for req in recv_reqs if not isinstance(req, BlockReqInput)
+                ]
+                recv_reqs = blocks + regular_reqs + unblocks
             output_reqs = []
             for recv_req in recv_reqs:
                 output_reqs += self._handle_recv_req(recv_req)
