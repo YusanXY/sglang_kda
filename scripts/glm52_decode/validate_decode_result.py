@@ -173,6 +173,7 @@ def validate(
         "completed_requests": EXPECTED_BATCH_SIZE,
         "max_retractions": 0,
         "dp_rank_counts": EXPECTED_DP_RANK_COUNTS,
+        "requested_dp_ranks": [rank for _ in range(8) for rank in range(8)],
     }
     for key, wanted in expected_row.items():
         if row.get(key) != wanted:

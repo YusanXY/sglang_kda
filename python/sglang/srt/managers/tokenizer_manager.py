@@ -622,11 +622,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
+            routed_dp_ranks = (
+                obj.routed_dp_rank
+                if isinstance(obj.routed_dp_rank, list)
+                else [obj.routed_dp_rank]
+            )
+            if dp_size <= 1 and all(rank == 0 for rank in routed_dp_ranks):
                 logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
                 )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+            elif any(rank < 0 or rank >= dp_size for rank in routed_dp_ranks):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )

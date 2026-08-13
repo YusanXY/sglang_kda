@@ -594,6 +594,33 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req[0].return_prompt_token_ids)
         self.assertTrue(req[1].return_prompt_token_ids)
 
+    def test_getitem_selects_per_request_dp_rank(self):
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            sampling_params=[{}, {}],
+            routed_dp_rank=[3, 7],
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(req[0].routed_dp_rank, 3)
+        self.assertEqual(req[1].routed_dp_rank, 7)
+
+    def test_per_request_dp_rank_requires_batch_sized_integer_list(self):
+        with self.assertRaisesRegex(ValueError, "equal to the batch size"):
+            GenerateReqInput(
+                input_ids=[[1], [2]], routed_dp_rank=[0]
+            ).normalize_batch_and_arguments()
+
+        with self.assertRaisesRegex(ValueError, "must be an integer"):
+            GenerateReqInput(
+                input_ids=[[1], [2]], routed_dp_rank=[0, "1"]
+            ).normalize_batch_and_arguments()
+
+        with self.assertRaisesRegex(ValueError, "single request"):
+            GenerateReqInput(
+                input_ids=[1, 2], routed_dp_rank=[0]
+            ).normalize_batch_and_arguments()
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")

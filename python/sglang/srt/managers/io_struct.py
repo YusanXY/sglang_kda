@@ -249,7 +249,7 @@ class GenerateReqInput:
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
     # For DP routing — external router assigns a specific DP worker
-    routed_dp_rank: Optional[int] = None
+    routed_dp_rank: Optional[Union[List[int], int]] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
@@ -426,6 +426,10 @@ class GenerateReqInput:
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
+        if isinstance(self.routed_dp_rank, list):
+            raise ValueError(
+                "routed_dp_rank must be an integer for a single request"
+            )
         if self.sampling_params is None:
             self.sampling_params = {}
         if self.rid is None:
@@ -462,6 +466,26 @@ class GenerateReqInput:
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
+        self._normalize_routed_dp_rank(num)
+
+    def _normalize_routed_dp_rank(self, num):
+        """Normalize optional per-request DP routing for a batched request."""
+        if self.routed_dp_rank is None or isinstance(self.routed_dp_rank, int):
+            return
+        if not isinstance(self.routed_dp_rank, list):
+            raise ValueError(
+                "routed_dp_rank should be an integer or a list of integers"
+            )
+        if len(self.routed_dp_rank) != self.batch_size:
+            raise ValueError(
+                "The length of routed_dp_rank should be equal to the batch size."
+            )
+        if any(
+            not isinstance(rank, int) or isinstance(rank, bool)
+            for rank in self.routed_dp_rank
+        ):
+            raise ValueError("Every routed_dp_rank must be an integer")
+        self.routed_dp_rank = self.routed_dp_rank * self.parallel_sample_num
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -762,7 +786,11 @@ class GenerateReqInput:
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
-            routed_dp_rank=self.routed_dp_rank,
+            routed_dp_rank=(
+                self.routed_dp_rank[i]
+                if isinstance(self.routed_dp_rank, list)
+                else self.routed_dp_rank
+            ),
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,

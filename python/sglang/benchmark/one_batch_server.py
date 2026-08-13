@@ -151,6 +151,7 @@ class BenchArgs:
     enable_multi_batch: bool = False
     request_timeout: float = DEFAULT_TIMEOUT
     preserve_prefix_cache: bool = False
+    explicit_dp_routing: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -204,6 +205,15 @@ class BenchArgs:
                 "Do not flush the server prefix cache before the measured case. "
                 "This is intended for decode-only replay after an identical "
                 "long-context request has populated and validated the KV cache."
+            ),
+        )
+        parser.add_argument(
+            "--explicit-dp-routing",
+            action="store_true",
+            help=(
+                "Route batched SGLang requests round-robin with a per-request "
+                "routed_dp_rank list. This makes DP occupancy part of the "
+                "benchmark input instead of relying on controller timing."
             ),
         )
         parser.add_argument("--show-report", action="store_true")
@@ -485,6 +495,7 @@ class BenchOneCaseResult(BaseModel):
     output_token_ids: Optional[List[List[int]]]
     dp_ranks: Optional[List[int]]
     dp_rank_counts: Optional[List[int]]
+    requested_dp_ranks: Optional[List[int]]
     cached_tokens_per_request: Optional[List[int]]
     overall_throughput: float
     last_ttft: float
@@ -538,6 +549,7 @@ class BenchOneCaseResult(BaseModel):
                 "output_token_ids": self.output_token_ids,
                 "dp_ranks": self.dp_ranks,
                 "dp_rank_counts": self.dp_rank_counts,
+                "requested_dp_ranks": self.requested_dp_ranks,
                 "cached_tokens_per_request": self.cached_tokens_per_request,
                 "overall_throughput": round(self.overall_throughput, 2),
                 "last_ttft": round(self.last_ttft, 4),
@@ -847,6 +859,8 @@ def run_one_case(
     save_output_token_ids: bool = False,
     seed: int = BenchArgs.seed,
     preserve_prefix_cache: bool = False,
+    explicit_dp_routing: bool = False,
+    dp_size: int = 1,
 ):
     if profile_decode_after_first_token:
         if not profile:
@@ -946,6 +960,7 @@ def run_one_case(
         input_ids = [shared_prefix + list(ids[cached_token_len:]) for ids in input_ids]
 
     # Build payload based on backend
+    requested_dp_ranks = None
     if backend == "vllm":
         payload = {
             "model": model_name,
@@ -986,6 +1001,19 @@ def run_one_case(
             **({"parallel_batch": parallel_batch} if parallel_batch else {}),
         }
         payload["input_ids"] = input_ids
+        if explicit_dp_routing:
+            if dp_size <= 1:
+                raise ValueError("--explicit-dp-routing requires server dp_size > 1")
+            if batch_size % dp_size != 0:
+                raise ValueError(
+                    "--explicit-dp-routing requires batch size divisible by dp_size"
+                )
+            requested_dp_ranks = [index % dp_size for index in range(batch_size)]
+            payload["routed_dp_rank"] = requested_dp_ranks
+            print(
+                "Explicit DP routing counts: "
+                f"{[requested_dp_ranks.count(rank) for rank in range(dp_size)]}"
+            )
         if image_data is not None:
             payload["image_data"] = image_data
         if fake_prefill:
@@ -1510,6 +1538,7 @@ def run_one_case(
         output_token_ids=persisted_output_token_ids,
         dp_ranks=persisted_dp_ranks,
         dp_rank_counts=dp_rank_counts,
+        requested_dp_ranks=requested_dp_ranks,
         cached_tokens_per_request=persisted_cached_tokens,
         overall_throughput=overall_throughput,
         last_ttft=last_ttft,
@@ -1647,6 +1676,7 @@ def run_benchmark_internal(
     base_url = endpoint.base_url
 
     # Get tokenizer and server info
+    dp_size = 1
     if bench_args.backend == "vllm":
         # For vLLM, get model name from /v1/models endpoint
         print(f"Connecting to vLLM server at {base_url}...")
@@ -1797,6 +1827,8 @@ def run_benchmark_internal(
                 fixed_prompt_file=bench_args.fixed_prompt_file,
                 apply_chat_template=bench_args.apply_chat_template,
                 seed=bench_args.seed,
+                explicit_dp_routing=bench_args.explicit_dp_routing,
+                dp_size=dp_size,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1859,6 +1891,8 @@ def run_benchmark_internal(
                         save_output_token_ids=bench_args.save_output_token_ids,
                         seed=bench_args.seed,
                         preserve_prefix_cache=bench_args.preserve_prefix_cache,
+                        explicit_dp_routing=bench_args.explicit_dp_routing,
+                        dp_size=dp_size,
                         **gsp_kwargs,
                     )
                 )
@@ -1928,6 +1962,8 @@ def run_benchmark_internal(
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
                             seed=bench_args.seed,
                             preserve_prefix_cache=bench_args.preserve_prefix_cache,
+                            explicit_dp_routing=bench_args.explicit_dp_routing,
+                            dp_size=dp_size,
                             **gsp_kwargs,
                         )
                     )

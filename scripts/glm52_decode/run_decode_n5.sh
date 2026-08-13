@@ -66,6 +66,7 @@ if [[ "$REUSE_PREFIX_CACHE" == 0 ]]; then
     --local-tokenizer-path "$MODEL" \
     --batch-size 64 --input-len 100000 --output-len 1 \
     --temperature 0 --dataset-name random-ids --seed 4199 \
+    --explicit-dp-routing \
     --save-output-token-ids --client-stream-interval 64 --skip-warmup \
     --request-timeout 14400 --no-append-to-github-summary \
     --run-name "glm52_decode_req64_100k_context_build" \
@@ -94,6 +95,7 @@ for run in $(seq 1 "$RUNS"); do
     --local-tokenizer-path "$MODEL" \
     --batch-size 64 --input-len 100000 --output-len 1000 \
     --temperature 0 --dataset-name random-ids --seed 4199 \
+    --explicit-dp-routing \
     --preserve-prefix-cache \
     --save-output-token-ids --client-stream-interval 64 --skip-warmup \
     --request-timeout 14400 --no-append-to-github-summary \
