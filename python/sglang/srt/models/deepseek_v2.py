@@ -2829,7 +2829,10 @@ class DeepseekV2Model(nn.Module):
                 )
                 if (
                     envs.SGLANG_DEBUG_SYNC_MODEL_LAYERS.get()
-                    and forward_batch.forward_mode.is_extend()
+                    and (
+                        forward_batch.forward_mode.is_extend()
+                        or forward_batch.forward_mode.is_idle()
+                    )
                     and not torch.cuda.is_current_stream_capturing()
                 ):
                     try:
@@ -3105,7 +3108,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             )
         if (
             envs.SGLANG_DEBUG_SYNC_MODEL_LAYERS.get()
-            and forward_batch.forward_mode.is_extend()
+            and (
+                forward_batch.forward_mode.is_extend()
+                or forward_batch.forward_mode.is_idle()
+            )
             and not torch.cuda.is_current_stream_capturing()
         ):
             try:
