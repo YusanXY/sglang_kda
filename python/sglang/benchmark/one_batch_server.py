@@ -14,8 +14,10 @@ python3 -m sglang.benchmark.one_batch_server --model None --base-url http://loca
 
 import argparse
 import dataclasses
+import hashlib
 import itertools
 import json
+import math
 import random
 import re
 import time
@@ -114,10 +116,13 @@ class BenchArgs:
     skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
+    profile_only: bool = False
     profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_start_step: Optional[int] = None
     profile_steps: int = 5
     profile_stop_after_request: bool = False
+    profile_decode_after_first_token: bool = False
+    save_output_token_ids: bool = False
     profile_by_stage: bool = False
     profile_prefix: Optional[str] = None
     profile_output_dir: Optional[str] = None
@@ -194,6 +199,15 @@ class BenchArgs:
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
         parser.add_argument(
+            "--profile-only",
+            action="store_true",
+            help=(
+                "Run only the profiled case instead of first executing an "
+                "ordinary benchmark copy. Requires --profile. This is useful "
+                "for very large prompts and external Nsys capture."
+            ),
+        )
+        parser.add_argument(
             "--profile-activities",
             type=str,
             nargs="+",
@@ -221,6 +235,26 @@ class BenchArgs:
                 "Explicitly stop and flush the profiler after the measured request. "
                 "This is required for prefill-only runs that have no later forward "
                 "step to trigger the automatic num_steps stop condition."
+            ),
+        )
+        parser.add_argument(
+            "--profile-decode-after-first-token",
+            action="store_true",
+            help=(
+                "Arm the profiler only after every request in the batch has "
+                "emitted its first token. This excludes prefill from external "
+                "CUDA_PROFILER/Nsys captures and is intended for decode-only "
+                "analysis. Requires --profile, the sglang backend, and cannot "
+                "be combined with --profile-by-stage or --profile-start-step."
+            ),
+        )
+        parser.add_argument(
+            "--save-output-token-ids",
+            action="store_true",
+            help=(
+                "Persist the complete per-request output token vectors in the "
+                "JSONL result. SHA256 digests are always saved; use this only "
+                "when exact cross-version correctness comparison is required."
             ),
         )
         parser.add_argument("--profile-by-stage", action="store_true")
@@ -412,10 +446,33 @@ class BenchOneCaseResult(BaseModel):
     run_name: str
     batch_size: int
     input_len: int
+    input_len_min: int
+    input_len_max: int
+    input_tokens_total: int
     output_len: int
+    stream_interval: int
     latency: float
     input_throughput: float
     output_throughput: float
+    first_ttft: float
+    first_token_spread: float
+    server_first_token_spread: float
+    server_first_token_ts_min: float
+    server_finished_ts_max: float
+    decode_duration: float
+    decode_tokens: int
+    decode_tokens_before_last_ttft: int
+    decode_throughput: float
+    client_decode_duration: float
+    client_decode_throughput: float
+    steady_decode_duration: float
+    steady_decode_tokens: int
+    steady_decode_throughput: float
+    completed_requests: int
+    max_retractions: int
+    input_ids_sha256: str
+    output_token_ids_sha256: Optional[List[str]]
+    output_token_ids: Optional[List[List[int]]]
     overall_throughput: float
     last_ttft: float
     last_gen_throughput: float
@@ -429,10 +486,43 @@ class BenchOneCaseResult(BaseModel):
                 "run_name": self.run_name,
                 "batch_size": self.batch_size,
                 "input_len": self.input_len,
+                "input_len_min": self.input_len_min,
+                "input_len_max": self.input_len_max,
+                "input_tokens_total": self.input_tokens_total,
                 "output_len": self.output_len,
+                "stream_interval": self.stream_interval,
                 "latency": round(self.latency, 4),
                 "input_throughput": round(self.input_throughput, 2),
                 "output_throughput": round(self.output_throughput, 2),
+                "first_ttft": round(self.first_ttft, 4),
+                "first_token_spread": round(self.first_token_spread, 4),
+                "server_first_token_spread": round(
+                    self.server_first_token_spread, 4
+                ),
+                "server_first_token_ts_min": round(
+                    self.server_first_token_ts_min, 6
+                ),
+                "server_finished_ts_max": round(self.server_finished_ts_max, 6),
+                "decode_duration": round(self.decode_duration, 4),
+                "decode_tokens": self.decode_tokens,
+                "decode_tokens_before_last_ttft": (
+                    self.decode_tokens_before_last_ttft
+                ),
+                "decode_throughput": round(self.decode_throughput, 2),
+                "client_decode_duration": round(self.client_decode_duration, 4),
+                "client_decode_throughput": round(
+                    self.client_decode_throughput, 2
+                ),
+                "steady_decode_duration": round(self.steady_decode_duration, 4),
+                "steady_decode_tokens": self.steady_decode_tokens,
+                "steady_decode_throughput": round(
+                    self.steady_decode_throughput, 2
+                ),
+                "completed_requests": self.completed_requests,
+                "max_retractions": self.max_retractions,
+                "input_ids_sha256": self.input_ids_sha256,
+                "output_token_ids_sha256": self.output_token_ids_sha256,
+                "output_token_ids": self.output_token_ids,
                 "overall_throughput": round(self.overall_throughput, 2),
                 "last_ttft": round(self.last_ttft, 4),
                 "last_gen_throughput": round(self.last_gen_throughput, 2),
@@ -444,6 +534,77 @@ class BenchOneCaseResult(BaseModel):
                 ),
             }
             fout.write(json.dumps(res) + "\n")
+
+
+def calculate_decode_only_metrics(
+    *,
+    batch_size: int,
+    output_len: int,
+    latency: float,
+    first_ttft: float,
+    last_ttft: float,
+    decode_tokens_before_last_ttft: int = 0,
+) -> Tuple[float, int, float, float, int, float]:
+    """Return strict full-decode and post-last-first-token metrics.
+
+    The existing ``output_throughput`` metric intentionally keeps its legacy
+    definition for compatibility.  It divides ``batch_size * output_len`` by
+    the time after the last request receives its first token, even though the
+    first token was produced before that boundary.  A decode-only workload
+    must instead count exactly ``output_len - 1`` tokens per request.  The
+    full-decode rate brackets every decode token from the earliest first-token
+    event.  The steady rate starts at the last first-token event and removes
+    any decode tokens that earlier requests produced before that boundary.
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if output_len <= 0:
+        raise ValueError(f"output_len must be positive, got {output_len}")
+    if first_ttft <= 0 or last_ttft <= 0:
+        raise ValueError(
+            "first_ttft/last_ttft was not recorded; every request must emit a first-token "
+            "stream event before decode-only metrics can be computed"
+        )
+    if first_ttft > last_ttft:
+        raise ValueError(
+            f"first_ttft ({first_ttft}) must not exceed last_ttft ({last_ttft})"
+        )
+    decode_duration = latency - first_ttft
+    steady_decode_duration = latency - last_ttft
+    if steady_decode_duration < 0:
+        raise ValueError(
+            f"latency ({latency}) must not be smaller than last_ttft ({last_ttft})"
+        )
+    decode_tokens = batch_size * (output_len - 1)
+    if not 0 <= decode_tokens_before_last_ttft <= decode_tokens:
+        raise ValueError(
+            "decode_tokens_before_last_ttft must be in [0, "
+            f"{decode_tokens}], got {decode_tokens_before_last_ttft}"
+        )
+    # DP schedulers may stream an early rank's second token before the final
+    # rank's first token reaches the client.  Those early tokens are outside
+    # the post-last-first-token timing window and must not remain in its
+    # numerator.
+    steady_decode_tokens = decode_tokens - decode_tokens_before_last_ttft
+    if decode_tokens == 0:
+        return decode_duration, 0, 0.0, steady_decode_duration, 0, 0.0
+    if decode_duration == 0:
+        raise ValueError("non-empty decode span has zero duration")
+    if steady_decode_tokens and steady_decode_duration == 0:
+        raise ValueError("non-empty steady decode span has zero duration")
+    steady_decode_throughput = (
+        steady_decode_tokens / steady_decode_duration
+        if steady_decode_tokens
+        else 0.0
+    )
+    return (
+        decode_duration,
+        decode_tokens,
+        decode_tokens / decode_duration,
+        steady_decode_duration,
+        steady_decode_tokens,
+        steady_decode_throughput,
+    )
 
 
 def _warmup_cache(
@@ -645,6 +806,7 @@ def run_one_case(
     profile_start_step: Optional[int] = None,
     profile_steps: int = BenchArgs.profile_steps,
     profile_stop_after_request: bool = False,
+    profile_decode_after_first_token: bool = False,
     profile_by_stage: bool = False,
     profile_prefix: Optional[str] = BenchArgs.profile_prefix,
     profile_output_dir: Optional[str] = BenchArgs.profile_output_dir,
@@ -666,7 +828,27 @@ def run_one_case(
     lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
     fixed_prompt_file: str = "",
     apply_chat_template: bool = False,
+    save_output_token_ids: bool = False,
 ):
+    if profile_decode_after_first_token:
+        if not profile:
+            raise ValueError(
+                "--profile-decode-after-first-token requires --profile"
+            )
+        if backend != "sglang":
+            raise ValueError(
+                "--profile-decode-after-first-token only supports the sglang backend"
+            )
+        if profile_by_stage:
+            raise ValueError(
+                "--profile-decode-after-first-token cannot be combined with "
+                "--profile-by-stage"
+            )
+        if profile_start_step is not None:
+            raise ValueError(
+                "--profile-decode-after-first-token cannot be combined with "
+                "--profile-start-step"
+            )
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
         _flush_cache_with_retry(url, "/reset_prefix_cache")
@@ -817,6 +999,22 @@ def run_one_case(
                 )
         gen_url = url + "/generate"
 
+    input_hasher = hashlib.sha256()
+    input_hasher.update(len(input_ids).to_bytes(8, "little"))
+    input_token_lengths = [len(ids) for ids in input_ids]
+    if len(input_token_lengths) != batch_size:
+        raise RuntimeError(
+            f"dataset returned {len(input_token_lengths)} prompts, expected {batch_size}"
+        )
+    input_len_min = min(input_token_lengths)
+    input_len_max = max(input_token_lengths)
+    input_tokens_total = sum(input_token_lengths)
+    for ids in input_ids:
+        input_hasher.update(len(ids).to_bytes(8, "little"))
+        input_hasher.update(np.asarray(ids, dtype="<i4").tobytes())
+    input_ids_sha256 = input_hasher.hexdigest()
+    print(f"SGLANG_BENCH_INPUT_IDS_SHA256 {input_ids_sha256}", flush=True)
+
     # Warm up cache if cache_hit_rate > 0.0
     if cache_hit_rate > 0.0:
         _warmup_cache(
@@ -834,7 +1032,7 @@ def run_one_case(
 
     # Turn on profiler
     profile_link = None
-    if profile:
+    if profile and not profile_decode_after_first_token:
         profile_link: str = run_profile(
             url=url,
             num_steps=profile_steps,
@@ -872,7 +1070,14 @@ def run_one_case(
         response.raise_for_status()
 
         # Get the TTFT of the last request in the batch
+        first_ttft = 0.0
         last_ttft = 0.0
+        decode_tokens_before_last_ttft = 0
+        decode_profile_started = False
+        completed_requests = 0
+        max_retractions = -1
+        output_token_ids_sha256 = None
+        persisted_output_token_ids = None
         if backend == "vllm":
             # Parse OpenAI-compatible streaming format from vLLM
             first_token_indices = set()
@@ -889,9 +1094,17 @@ def run_one_case(
                         idx = choice["index"]
                         if idx not in first_token_indices:
                             first_token_indices.add(idx)
+                            if first_ttft == 0.0:
+                                first_ttft = time.perf_counter() - tic
                             if len(first_token_indices) == batch_size:
                                 last_ttft = time.perf_counter() - tic
         else:
+            first_token_indices = set()
+            finished_indices = set()
+            server_first_token_timestamps = {}
+            server_finished_timestamps = {}
+            latest_completion_tokens = {}
+            output_token_ids_by_index = [[] for _ in range(batch_size)]
             for chunk in response.iter_lines(decode_unicode=False):
                 chunk = chunk.decode("utf-8")
                 if chunk and chunk.startswith("data:"):
@@ -905,9 +1118,100 @@ def run_one_case(
                         data["meta_info"]["finish_reason"] is None
                         or data["meta_info"]["finish_reason"]["type"] == "length"
                     )
-                    if data["meta_info"]["completion_tokens"] == 1:
-                        last_ttft = time.perf_counter() - tic
-                        if return_logprob:
+                    index = data.get("index")
+                    if index is None:
+                        if batch_size != 1:
+                            raise RuntimeError(
+                                "batched SGLang stream event is missing its "
+                                "request index; cannot establish the strict "
+                                "decode-only boundary"
+                            )
+                        index = 0
+                    if not isinstance(index, int) or not 0 <= index < batch_size:
+                        raise RuntimeError(
+                            f"invalid request index in stream event: {index!r}"
+                        )
+                    completion_tokens = data["meta_info"]["completion_tokens"]
+                    previous_completion_tokens = latest_completion_tokens.get(index, 0)
+                    is_finished = data["meta_info"]["finish_reason"] is not None
+                    if completion_tokens < previous_completion_tokens or (
+                        completion_tokens == previous_completion_tokens
+                        and not is_finished
+                    ):
+                        raise RuntimeError(
+                            "completion token count did not advance for request "
+                            f"{index}: {previous_completion_tokens} -> {completion_tokens}"
+                        )
+                    latest_completion_tokens[index] = completion_tokens
+                    output_ids = data.get("output_ids")
+                    if not isinstance(output_ids, list) or not all(
+                        isinstance(token_id, int) for token_id in output_ids
+                    ):
+                        raise RuntimeError(
+                            f"request {index} returned invalid output_ids"
+                        )
+                    if len(output_ids) == completion_tokens:
+                        output_token_ids_by_index[index] = list(output_ids)
+                    elif (
+                        len(output_token_ids_by_index[index]) + len(output_ids)
+                        == completion_tokens
+                    ):
+                        output_token_ids_by_index[index].extend(output_ids)
+                    else:
+                        raise RuntimeError(
+                            f"request {index} output_ids length does not match "
+                            f"completion_tokens={completion_tokens}"
+                        )
+                    num_retractions = int(
+                        data["meta_info"].get("num_retractions", 0)
+                    )
+                    max_retractions = max(max_retractions, num_retractions)
+                    server_first_token_ts = data["meta_info"].get("first_token_ts")
+                    if server_first_token_ts is None:
+                        raise RuntimeError(
+                            f"request {index} stream event is missing server "
+                            "first_token_ts"
+                        )
+                    server_first_token_ts = float(server_first_token_ts)
+                    previous_first_token_ts = server_first_token_timestamps.get(index)
+                    if previous_first_token_ts is not None and not math.isclose(
+                        server_first_token_ts,
+                        previous_first_token_ts,
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    ):
+                        raise RuntimeError(
+                            f"request {index} server first-token timestamp changed: "
+                            f"{previous_first_token_ts} -> {server_first_token_ts}"
+                        )
+                    if index not in first_token_indices:
+                        if completion_tokens < 1:
+                            raise RuntimeError(
+                                f"request {index} first observed stream event has "
+                                f"no generated token: {completion_tokens=}"
+                            )
+                        first_token_indices.add(index)
+                        server_first_token_timestamps[index] = server_first_token_ts
+                        if first_ttft == 0.0:
+                            first_ttft = time.perf_counter() - tic
+                        if len(first_token_indices) == batch_size:
+                            last_ttft = time.perf_counter() - tic
+                            decode_tokens_before_last_ttft = sum(
+                                max(0, count - 1)
+                                for count in latest_completion_tokens.values()
+                            )
+                            if profile_decode_after_first_token:
+                                profile_link = run_profile(
+                                    url=url,
+                                    num_steps=profile_steps,
+                                    activities=profile_activities,
+                                    output_dir=profile_output_dir,
+                                    profile_by_stage=False,
+                                    profile_prefix=profile_prefix,
+                                    start_step=None,
+                                )
+                                decode_profile_started = True
+                        if return_logprob and completion_tokens == 1:
                             first_token_logprobs = data["meta_info"].get(
                                 "output_token_logprobs"
                             )
@@ -929,6 +1233,62 @@ def run_one_case(
                                 flush=True,
                             )
 
+                    if is_finished:
+                        if index in finished_indices:
+                            raise RuntimeError(
+                                f"duplicate finish event for request {index}"
+                            )
+                        if completion_tokens != output_len:
+                            raise RuntimeError(
+                                f"request {index} completed with {completion_tokens} "
+                                f"tokens, expected {output_len}"
+                            )
+                        if len(output_token_ids_by_index[index]) != output_len:
+                            raise RuntimeError(
+                                f"request {index} retained "
+                                f"{len(output_token_ids_by_index[index])} token ids, "
+                                f"expected {output_len}"
+                            )
+                        request_finished_ts = data["meta_info"].get(
+                            "request_finished_ts"
+                        )
+                        if request_finished_ts is None:
+                            raise RuntimeError(
+                                f"request {index} finish event is missing server "
+                                "request_finished_ts"
+                            )
+                        server_finished_timestamps[index] = float(request_finished_ts)
+                        finished_indices.add(index)
+
+            if len(first_token_indices) != batch_size:
+                missing = sorted(set(range(batch_size)) - first_token_indices)
+                raise RuntimeError(
+                    "request completed before every first-token boundary was "
+                    f"observed; missing request indices: {missing}"
+                )
+            if profile_decode_after_first_token and not decode_profile_started:
+                raise RuntimeError("decode-only profiler was never started")
+            if len(finished_indices) != batch_size:
+                missing = sorted(set(range(batch_size)) - finished_indices)
+                raise RuntimeError(
+                    f"missing finish events for request indices: {missing}"
+                )
+            completed_requests = len(finished_indices)
+            server_first_token_spread = (
+                max(server_first_token_timestamps.values())
+                - min(server_first_token_timestamps.values())
+            )
+            server_first_token_ts_min = min(server_first_token_timestamps.values())
+            server_finished_ts_max = max(server_finished_timestamps.values())
+            output_token_ids_sha256 = [
+                hashlib.sha256(
+                    json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                for token_ids in output_token_ids_by_index
+            ]
+            if save_output_token_ids:
+                persisted_output_token_ids = output_token_ids_by_index
+
     print("SGLANG_BENCH_MEASURED_REQUEST_END", flush=True)
 
     if profile and profile_stop_after_request:
@@ -939,6 +1299,36 @@ def run_one_case(
     latency = time.perf_counter() - tic
     input_throughput = batch_size * input_len / last_ttft
     output_throughput = batch_size * output_len / (latency - last_ttft)
+    (
+        client_decode_duration,
+        decode_tokens,
+        client_decode_throughput,
+        steady_decode_duration,
+        steady_decode_tokens,
+        steady_decode_throughput,
+    ) = calculate_decode_only_metrics(
+        batch_size=batch_size,
+        output_len=output_len,
+        latency=latency,
+        first_ttft=first_ttft,
+        last_ttft=last_ttft,
+        decode_tokens_before_last_ttft=decode_tokens_before_last_ttft,
+    )
+    if backend == "vllm":
+        server_first_token_ts_min = -1.0
+        server_finished_ts_max = -1.0
+        decode_duration = client_decode_duration
+        decode_throughput = client_decode_throughput
+    else:
+        decode_duration = server_finished_ts_max - server_first_token_ts_min
+        if decode_tokens and decode_duration <= 0:
+            raise RuntimeError(
+                "non-empty server decode span must be positive, got "
+                f"{decode_duration}"
+            )
+        decode_throughput = (
+            decode_tokens / decode_duration if decode_duration else 0.0
+        )
     overall_throughput = batch_size * (input_len + output_len) / latency
 
     if backend == "vllm":
@@ -972,7 +1362,26 @@ def run_one_case(
     print(f"input throughput: {input_throughput:.2f} tok/s")
     if output_len != 1:
         print(f"output throughput: {output_throughput:.2f} tok/s")
+        print(
+            "decode-only throughput: "
+            f"{decode_throughput:.2f} tok/s "
+            f"({decode_tokens} tokens in {decode_duration:.4f} s, "
+            "server timestamp window)"
+        )
+        print(
+            "client-observed decode-only throughput: "
+            f"{client_decode_throughput:.2f} tok/s "
+            f"({decode_tokens} tokens in {client_decode_duration:.4f} s)"
+        )
+        print(
+            "steady decode-only throughput: "
+            f"{steady_decode_throughput:.2f} tok/s "
+            f"({steady_decode_tokens} tokens in "
+            f"{steady_decode_duration:.4f} s; "
+            f"excluded {decode_tokens_before_last_ttft} early decode tokens)"
+        )
     print(f"last_ttft: {last_ttft:.2f} s")
+    print(f"first-token spread: {last_ttft - first_ttft:.4f} s")
     print(f"last generation throughput: {last_gen_throughput:.2f} tok/s")
     if acc_length > 0:
         print(f"acc_length: {acc_length:.2f} ")
@@ -984,10 +1393,35 @@ def run_one_case(
         run_name=run_name,
         batch_size=batch_size,
         input_len=input_len,
+        input_len_min=input_len_min,
+        input_len_max=input_len_max,
+        input_tokens_total=input_tokens_total,
         output_len=output_len,
+        stream_interval=stream_interval,
         latency=latency,
         input_throughput=input_throughput,
         output_throughput=output_throughput,
+        first_ttft=first_ttft,
+        first_token_spread=last_ttft - first_ttft,
+        server_first_token_spread=(
+            -1.0 if backend == "vllm" else server_first_token_spread
+        ),
+        server_first_token_ts_min=server_first_token_ts_min,
+        server_finished_ts_max=server_finished_ts_max,
+        decode_duration=decode_duration,
+        decode_tokens=decode_tokens,
+        decode_tokens_before_last_ttft=decode_tokens_before_last_ttft,
+        decode_throughput=decode_throughput,
+        client_decode_duration=client_decode_duration,
+        client_decode_throughput=client_decode_throughput,
+        steady_decode_duration=steady_decode_duration,
+        steady_decode_tokens=steady_decode_tokens,
+        steady_decode_throughput=steady_decode_throughput,
+        completed_requests=(batch_size if backend == "vllm" else completed_requests),
+        max_retractions=max_retractions,
+        input_ids_sha256=input_ids_sha256,
+        output_token_ids_sha256=output_token_ids_sha256,
+        output_token_ids=persisted_output_token_ids,
         overall_throughput=overall_throughput,
         last_ttft=last_ttft,
         last_gen_throughput=last_gen_throughput,
@@ -1054,6 +1488,8 @@ def get_report_summary(
         "latency (s)",
         "input throughput (tok/s)",
         "output throughput (tok/s)",
+        "decode-only throughput (tok/s)",
+        "steady decode-only throughput (tok/s)",
         "acc length",
         "ITL (ms)",
         "input cost ($/1M)",
@@ -1079,6 +1515,8 @@ def get_report_summary(
             f"{res.latency:.2f}",
             f"{res.input_throughput:.2f}",
             f"{res.output_throughput:.2f}",
+            f"{res.decode_throughput:.2f}",
+            f"{res.steady_decode_throughput:.2f}",
             accept_length,
             f"{itl_ms:.2f}",
             f"{input_cost:.2f}",
@@ -1104,6 +1542,7 @@ def run_benchmark_internal(
     launch_server_func: Callable = launch_server,
 ):
     global DEFAULT_TIMEOUT
+    validate_profile_cli_contract(bench_args)
     if bench_args.request_timeout <= 0:
         raise ValueError(
             f"--request-timeout must be positive, got {bench_args.request_timeout}"
@@ -1275,53 +1714,62 @@ def run_benchmark_internal(
     results = []
     profile_results = []
     try:
-        # Benchmark all cases
-        for bs, il, ol in itertools.product(
-            bench_args.batch_size, bench_args.input_len, bench_args.output_len
-        ):
-            kv_footprint_bs = (
-                bs if effective_running_cap is None else min(bs, effective_running_cap)
-            )
-            if should_skip_due_to_max_running_requests(
-                bs, skip_max_running_requests_threshold
-            ) or should_skip_due_to_token_capacity(
-                kv_footprint_bs, il, ol, skip_token_capacity_threshold
+        # Benchmark all cases. A profile-only run skips this duplicate pass;
+        # the profiled rows below become the returned benchmark results.
+        if not bench_args.profile_only:
+            for bs, il, ol in itertools.product(
+                bench_args.batch_size, bench_args.input_len, bench_args.output_len
             ):
-                continue
-            results.append(
-                run_one_case(
-                    base_url,
-                    bs,
-                    il,
-                    ol,
-                    temperature=bench_args.temperature,
-                    return_logprob=bench_args.return_logprob,
-                    stream_interval=bench_args.client_stream_interval,
-                    input_len_step_percentage=bench_args.input_len_step_percentage,
-                    run_name=bench_args.run_name,
-                    result_filename=bench_args.result_filename,
-                    tokenizer=tokenizer,
-                    dataset_name=bench_args.dataset_name,
-                    dataset_path=bench_args.dataset_path,
-                    parallel_batch=bench_args.parallel_batch,
-                    cache_hit_rate=bench_args.cache_hit_rate,
-                    share_cached_prefix_across_batch=(
-                        bench_args.share_cached_prefix_across_batch
-                    ),
-                    warmup_cached_prefill_shape=(
-                        bench_args.warmup_cached_prefill_shape
-                    ),
-                    backend=bench_args.backend,
-                    model_name=model_name,
-                    fake_prefill=bench_args.fake_prefill,
-                    lora_name=bench_args.lora_name,
-                    lora_request_distribution=bench_args.lora_request_distribution,
-                    lora_zipf_alpha=bench_args.lora_zipf_alpha,
-                    fixed_prompt_file=bench_args.fixed_prompt_file,
-                    apply_chat_template=bench_args.apply_chat_template,
-                    **gsp_kwargs,
+                kv_footprint_bs = (
+                    bs
+                    if effective_running_cap is None
+                    else min(bs, effective_running_cap)
                 )
-            )
+                if should_skip_due_to_max_running_requests(
+                    bs, skip_max_running_requests_threshold
+                ) or should_skip_due_to_token_capacity(
+                    kv_footprint_bs, il, ol, skip_token_capacity_threshold
+                ):
+                    continue
+                results.append(
+                    run_one_case(
+                        base_url,
+                        bs,
+                        il,
+                        ol,
+                        temperature=bench_args.temperature,
+                        return_logprob=bench_args.return_logprob,
+                        stream_interval=bench_args.client_stream_interval,
+                        input_len_step_percentage=(
+                            bench_args.input_len_step_percentage
+                        ),
+                        run_name=bench_args.run_name,
+                        result_filename=bench_args.result_filename,
+                        tokenizer=tokenizer,
+                        dataset_name=bench_args.dataset_name,
+                        dataset_path=bench_args.dataset_path,
+                        parallel_batch=bench_args.parallel_batch,
+                        cache_hit_rate=bench_args.cache_hit_rate,
+                        share_cached_prefix_across_batch=(
+                            bench_args.share_cached_prefix_across_batch
+                        ),
+                        warmup_cached_prefill_shape=(
+                            bench_args.warmup_cached_prefill_shape
+                        ),
+                        backend=bench_args.backend,
+                        model_name=model_name,
+                        fake_prefill=bench_args.fake_prefill,
+                        lora_name=bench_args.lora_name,
+                        lora_request_distribution=(
+                            bench_args.lora_request_distribution
+                        ),
+                        lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                        fixed_prompt_file=bench_args.fixed_prompt_file,
+                        apply_chat_template=bench_args.apply_chat_template,
+                        save_output_token_ids=bench_args.save_output_token_ids,
+                        **gsp_kwargs,
+                    )
+                )
 
         # Profile all cases
         if bench_args.profile:
@@ -1373,6 +1821,10 @@ def run_benchmark_internal(
                             profile_stop_after_request=(
                                 bench_args.profile_stop_after_request
                             ),
+                            profile_decode_after_first_token=(
+                                bench_args.profile_decode_after_first_token
+                            ),
+                            save_output_token_ids=bench_args.save_output_token_ids,
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,
                             profile_output_dir=bench_args.profile_output_dir,
@@ -1386,11 +1838,16 @@ def run_benchmark_internal(
                         )
                     )
             except Exception as e:
+                if bench_args.profile_only:
+                    raise
                 print(f"Error profiling, some profile traces may not be dumped: {e}")
 
-            # Replace the profile link for any successful profile results
-            for res, profile_res in zip(results, profile_results, strict=False):
-                res.profile_link = profile_res.profile_link
+            if bench_args.profile_only:
+                results = profile_results
+            else:
+                # Replace the profile link for any successful profile results
+                for res, profile_res in zip(results, profile_results, strict=False):
+                    res.profile_link = profile_res.profile_link
     finally:
         endpoint.close()
 
@@ -1422,6 +1879,38 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         )
 
     return results, server_info
+
+
+def validate_profile_cli_contract(bench_args: BenchArgs) -> None:
+    if bench_args.profile_only and not bench_args.profile:
+        raise ValueError("--profile-only requires --profile")
+    if not bench_args.profile_decode_after_first_token:
+        return
+    if not bench_args.profile:
+        raise ValueError("--profile-decode-after-first-token requires --profile")
+    if bench_args.backend != "sglang":
+        raise ValueError(
+            "--profile-decode-after-first-token only supports the sglang backend"
+        )
+    if bench_args.profile_by_stage:
+        raise ValueError(
+            "--profile-decode-after-first-token cannot be combined with "
+            "--profile-by-stage"
+        )
+    if bench_args.profile_start_step is not None:
+        raise ValueError(
+            "--profile-decode-after-first-token cannot be combined with "
+            "--profile-start-step"
+        )
+    if "CUDA_PROFILER" not in bench_args.profile_activities:
+        raise ValueError(
+            "--profile-decode-after-first-token requires "
+            "--profile-activities CUDA_PROFILER"
+        )
+    if bench_args.profile_steps <= 0:
+        raise ValueError(
+            "--profile-decode-after-first-token requires --profile-steps > 0"
+        )
 
 
 def cli_main():

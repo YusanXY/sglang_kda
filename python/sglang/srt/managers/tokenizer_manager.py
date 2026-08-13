@@ -2116,10 +2116,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if pooled_hidden_states[i] is not None:
                         out_dict["pooled_hidden_state"] = pooled_hidden_states[i]
 
-            # Set first_token_time on the first output batch.
-            # This is the single write point for first_token_time.
+            # Set first_token_time on the first output batch. Keep exposing the
+            # value on every later streaming chunk: under high concurrency the
+            # tokenizer event loop can coalesce/drop an earlier cumulative
+            # chunk before the HTTP client observes it. The timestamp remains
+            # the original first-output boundary, not the later chunk time.
             if state.time_stats.first_token_time == 0.0:
                 state.time_stats.set_first_token_time()
+            meta_info["first_token_ts"] = convert_time_to_realtime(
+                state.time_stats.first_token_time
+            )
 
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:
@@ -2127,6 +2133,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         self.convert_to_span_attrs(state, recv_obj, i)
                     )
                 state.time_stats.set_finished_time()
+                meta_info["request_finished_ts"] = convert_time_to_realtime(
+                    state.time_stats.finished_time
+                )
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
 
                 if self.server_args.speculative_algorithm:
