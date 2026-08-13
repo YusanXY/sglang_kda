@@ -37,14 +37,13 @@ class SchedulerInputBlocker:
             for recv_req in recv_reqs:
                 output_reqs += self._handle_recv_req(recv_req)
 
-        global_arrived_unblock_barrier = (
-            self._global_unblock_barrier.poll_global_arrived()
-        )
-        if (
-            self._state == _State.GLOBAL_UNBLOCK_BARRIER
-            and global_arrived_unblock_barrier
-        ):
-            output_reqs += self._handle_arrive_unblock_barrier()
+        # PollBasedBarrier performs a CPU process-group all-reduce.  Only call
+        # it while an UNBLOCK rendezvous is active; polling it unconditionally
+        # puts a host collective in every scheduler iteration, including the
+        # steady-state decode hot path.
+        if self._state == _State.GLOBAL_UNBLOCK_BARRIER:
+            if self._global_unblock_barrier.poll_global_arrived():
+                output_reqs += self._handle_arrive_unblock_barrier()
 
         if not self._noop:
             return output_reqs

@@ -14,6 +14,7 @@ GLM52_CUSTOM_ALL_REDUCE_IMPL=${GLM52_CUSTOM_ALL_REDUCE_IMPL:-legacy}
 GLM52_DISABLE_CUSTOM_ALL_REDUCE=${GLM52_DISABLE_CUSTOM_ALL_REDUCE:-0}
 GLM52_DISABLE_OVERLAP=${GLM52_DISABLE_OVERLAP:-0}
 GLM52_ENABLE_DP_LM_HEAD=${GLM52_ENABLE_DP_LM_HEAD:-0}
+GLM52_COLOCATE_DP_BATCH=${GLM52_COLOCATE_DP_BATCH:-0}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
   echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
@@ -39,6 +40,10 @@ GLM52_ENABLE_DP_LM_HEAD=${GLM52_ENABLE_DP_LM_HEAD:-0}
   echo "GLM52_ENABLE_DP_LM_HEAD must be 0 or 1" >&2
   exit 2
 }
+[[ "$GLM52_COLOCATE_DP_BATCH" == 0 || "$GLM52_COLOCATE_DP_BATCH" == 1 ]] || {
+  echo "GLM52_COLOCATE_DP_BATCH must be 0 or 1" >&2
+  exit 2
+}
 [[ -d "$REPO/python/sglang" ]] || { echo "missing repo: $REPO" >&2; exit 2; }
 [[ -f "$MODEL/config.json" ]] || { echo "missing model: $MODEL" >&2; exit 2; }
 
@@ -56,6 +61,11 @@ export SGLANG_DG_CACHE_DIR="$GLM52_DEEP_GEMM_CACHE_DIR"
 # target-shape warmup below the server boundary remains excluded from samples.
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 export SGLANG_SHARED_EXPERT_TP1="$GLM52_SHARED_EXPERT_TP1"
+# Explicitly-routed long-context batches must be visible to all DP schedulers
+# before any rank starts the first model forward.  SchedulerInputBlocker is
+# dormant after the one-shot release, so this does not add a decode-step host
+# collective.
+export SGLANG_ENABLE_COLOCATED_BATCH_GEN="$GLM52_COLOCATE_DP_BATCH"
 # Custom AllReduce V2 can leave B300 DP8 eager prefill ranks spinning inside
 # one-/two-shot GPU kernels. Legacy custom AR is still GPU-local (not NCCL),
 # is stable for context construction, and remains common to every formal A/B.

@@ -1604,7 +1604,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 batch_size, obj
             ) or group_explicit_dp_batch:
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
-                self._send_batch_request(tokenized_objs)
+                # The DP controller splits an explicitly-routed batch into one
+                # rank-local message per scheduler.  Hold those messages until
+                # every scheduler has received its local batch, otherwise the
+                # first rank can enter a world/EP collective while its peers
+                # are still polling ZMQ.  The blocker uses a one-shot CPU
+                # barrier when UNBLOCK is received; it is dormant during the
+                # subsequent prefill/decode loop.
+                with (
+                    input_blocker_guard_region(
+                        dispatch_to_scheduler=self._dispatch_to_scheduler,
+                    )
+                    if group_explicit_dp_batch
+                    and get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+                    else nullcontext()
+                ):
+                    self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
