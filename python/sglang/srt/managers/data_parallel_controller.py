@@ -211,6 +211,15 @@ class DataParallelController:
             if self.status[i]:
                 sock_send(worker, obj)
 
+    def send_barrier_control_to_all_workers(self, obj: BlockReqInput):
+        # BLOCK/UNBLOCK delimit a global scheduler rendezvous.  Unlike an
+        # inference request, they must reach every rank even when a scheduler
+        # has temporarily published itself inactive.  Filtering either edge
+        # through self.status can strand one rank in BLOCKED while its peers
+        # wait forever in the global UNBLOCK barrier.
+        for worker in self.workers:
+            sock_send(worker, obj)
+
     def send_control_message(self, obj):
         # Send control messages to first worker of tp group
         for worker in self.workers[:: self.control_message_step]:
@@ -302,7 +311,7 @@ class DataParallelController:
                 (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
-                (BlockReqInput, self.send_to_all_workers),
+                (BlockReqInput, self.send_barrier_control_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
