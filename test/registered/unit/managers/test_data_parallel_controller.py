@@ -13,7 +13,7 @@ is exercised as the real method, no mock.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec.structs
 
@@ -27,6 +27,8 @@ from sglang.srt.managers.data_parallel_controller import (
     DPBudget,
     LoadBalanceMethod,
 )
+from sglang.srt.managers.io_struct import BatchTokenizedGenerateReqInput
+from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -50,6 +52,7 @@ def _make_controller(dp_size: int) -> DataParallelController:
     ctl.status = [True] * dp_size
     ctl.round_robin_counter = 0
     ctl.dp_budget = DPBudget(dp_size=dp_size)
+    ctl.refresh_load_budget_on_dispatch = False
     return ctl
 
 
@@ -206,6 +209,30 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+
+class TestBatchGenerateDispatch(CustomTestCase):
+    @patch("sglang.srt.managers.data_parallel_controller.sock_send")
+    def test_explicit_routes_are_grouped_and_rank_zero_is_sent_last(self, send):
+        ctl = _make_controller(dp_size=3)
+        requests = [
+            _req(routed_dp_rank=rank, input_ids=[rank] * 4)
+            for rank in (0, 1, 2, 0, 1, 2)
+        ]
+        for req in requests:
+            req.time_stats = DPControllerReqTimeStats()
+
+        ctl.dispatch_batch_generate(BatchTokenizedGenerateReqInput(batch=requests))
+
+        sent_workers = [call.args[0] for call in send.call_args_list]
+        self.assertEqual(sent_workers, [ctl.workers[1], ctl.workers[2], ctl.workers[0]])
+        self.assertEqual(
+            [[req.routed_dp_rank for req in call.args[1]] for call in send.call_args_list],
+            [[1, 1], [2, 2], [0, 0]],
+        )
+        self.assertTrue(
+            all(req.time_stats.dpc_dispatch_finish_time > 0 for req in requests)
+        )
 
 
 class TestFollowBootstrapRoomScheduler(CustomTestCase):

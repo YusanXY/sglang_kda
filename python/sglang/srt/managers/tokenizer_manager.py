@@ -1590,7 +1590,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if self._should_use_batch_tokenization(batch_size, obj):
+            # A pre-tokenized batch with explicit per-request DP routes should
+            # stay batched until the DP controller.  The controller can then
+            # coalesce it into one IPC message per destination rank.  Sending
+            # long prompts one by one lets an early rank enter the DP MLP
+            # collective while peer ranks are still deserializing requests.
+            group_explicit_dp_batch = (
+                isinstance(obj, GenerateReqInput)
+                and isinstance(obj.routed_dp_rank, list)
+                and not self._batch_has_text(batch_size, obj)
+            )
+            if self._should_use_batch_tokenization(
+                batch_size, obj
+            ) or group_explicit_dp_batch:
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
                 self._send_batch_request(tokenized_objs)
 

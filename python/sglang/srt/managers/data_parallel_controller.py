@@ -253,6 +253,39 @@ class DataParallelController:
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
         if self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
+
+        # Preserve an explicitly-routed batch as eight rank-local batches
+        # instead of serializing every long prompt through ZMQ independently.
+        # Rank 0 is sent last because it is the source of several DP-attention
+        # control/collective paths; peer work is therefore already queued when
+        # the source rank starts the first forward.
+        if len(batch_req) > 1 and all(
+            req.routed_dp_rank is not None for req in batch_req
+        ):
+            grouped_reqs = {}
+            time_stats_by_id = {}
+            for req in batch_req:
+                time_stats = DPControllerReqTimeStats.new_from_obj(
+                    unwrap_from_pickle(req.time_stats)
+                )
+                time_stats.set_dp_dispatch_time()
+                time_stats_by_id[id(req)] = time_stats
+                req.time_stats = wrap_as_pickle(time_stats)
+                grouped_reqs.setdefault(req.routed_dp_rank, []).append(req)
+
+            rank_order = sorted(grouped_reqs, key=lambda rank: (rank == 0, rank))
+            for rank in rank_order:
+                sock_send(
+                    self.workers[rank],
+                    BatchTokenizedGenerateReqInput(batch=grouped_reqs[rank]),
+                )
+
+            for req in batch_req:
+                time_stats = time_stats_by_id[id(req)]
+                req.time_stats = time_stats
+                time_stats.set_dp_dispatch_finish_time()
+            return
+
         for req in batch_req:
             self.dispatching_with_trace(req, refresh_load_budget=False)
 
