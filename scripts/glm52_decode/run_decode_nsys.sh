@@ -10,15 +10,21 @@ RUN_DIR=${RUN_DIR:-$ROOT/.runtime/glm52_decode_nsys}
 PYTHON=${PYTHON:-$RUNTIME/venv/bin/python}
 PROFILE_STEPS=${PROFILE_STEPS:-200}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
+GLM52_FP8_GEMM_BACKEND=${GLM52_FP8_GEMM_BACKEND:-deep_gemm}
 GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
 GLM52_FLASHINFER_DIRECT_OUTPUT=${GLM52_FLASHINFER_DIRECT_OUTPUT:-0}
 GLM52_FLASHINFER_FUSED_ROUTING_PACK=${GLM52_FLASHINFER_FUSED_ROUTING_PACK:-0}
+GLM52_CUSTOM_ALL_REDUCE_IMPL=${GLM52_CUSTOM_ALL_REDUCE_IMPL:-legacy}
 GLM52_TRITON_CACHE_DIR=${GLM52_TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
 GLM52_DEEP_GEMM_CACHE_DIR=${GLM52_DEEP_GEMM_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
 PREFIX=$RUN_DIR/req64_100k_1k_${TAG}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm || "$MOE_RUNNER_BACKEND" == flashinfer_trtllm_routed ]] || {
   echo "MOE_RUNNER_BACKEND must be auto, deep_gemm, or flashinfer_trtllm_routed" >&2
+  exit 2
+}
+[[ "$GLM52_FP8_GEMM_BACKEND" == deep_gemm || "$GLM52_FP8_GEMM_BACKEND" == flashinfer_trtllm ]] || {
+  echo "GLM52_FP8_GEMM_BACKEND must be deep_gemm or flashinfer_trtllm" >&2
   exit 2
 }
 [[ "$GLM52_SHARED_EXPERT_TP1" == 0 || "$GLM52_SHARED_EXPERT_TP1" == 1 ]] || {
@@ -33,6 +39,10 @@ PREFIX=$RUN_DIR/req64_100k_1k_${TAG}
   echo "GLM52_FLASHINFER_FUSED_ROUTING_PACK must be 0 or 1" >&2
   exit 2
 }
+[[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == legacy || "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == v2 || "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == hybrid_graph_v2 ]] || {
+  echo "GLM52_CUSTOM_ALL_REDUCE_IMPL must be legacy, v2, or hybrid_graph_v2" >&2
+  exit 2
+}
 source "$RUNTIME/env.sh"
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -43,10 +53,18 @@ export SGLANG_ENABLE_COLOCATED_BATCH_GEN=1
 export SGLANG_SHARED_EXPERT_TP1="$GLM52_SHARED_EXPERT_TP1"
 export SGLANG_FLASHINFER_MOE_DIRECT_OUTPUT="$GLM52_FLASHINFER_DIRECT_OUTPUT"
 export SGLANG_FLASHINFER_MOE_FUSED_ROUTING_PACK="$GLM52_FLASHINFER_FUSED_ROUTING_PACK"
-# Match launch_server.sh's formal default.  runtime/env.sh may enable V2 for
-# unrelated experiments, but the validated GLM-5.2 baseline uses legacy custom
-# AR because V2 can strand DP8 prefill ranks in long-running GPU kernels.
-export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0
+# Keep the eager implementation explicit.  hybrid_graph_v2 uses legacy AR for
+# long-context construction and captures V2 nodes only in decode CUDA Graphs.
+if [[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == v2 ]]; then
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_GRAPH_ONLY=0
+elif [[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == hybrid_graph_v2 ]]; then
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_GRAPH_ONLY=1
+else
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_GRAPH_ONLY=0
+fi
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR" "$RUN_DIR"
 
@@ -58,6 +76,8 @@ fused_routing_pack_args=()
 if [[ "$GLM52_FLASHINFER_FUSED_ROUTING_PACK" == 1 ]]; then
   fused_routing_pack_args+=(--expected-flashinfer-fused-routing-pack)
 fi
+custom_all_reduce_args=(--expected-custom-all-reduce "$GLM52_CUSTOM_ALL_REDUCE_IMPL")
+fp8_gemm_args=(--expected-fp8-gemm-backend "$GLM52_FP8_GEMM_BACKEND")
 
 for path in \
   "$REPO/python/sglang/benchmark/one_batch_server.py" \
@@ -78,8 +98,9 @@ done
   echo "commit=$(git -C "$REPO" rev-parse HEAD)"
   echo "model=$MODEL"
   echo "moe_runner_backend=$MOE_RUNNER_BACKEND"
+  echo "fp8_gemm_backend=$GLM52_FP8_GEMM_BACKEND"
   echo "shared_expert_parallelism=$([[ "$GLM52_SHARED_EXPERT_TP1" == 1 ]] && echo tp1 || echo tp8)"
-  echo "custom_all_reduce_impl=legacy"
+  echo "custom_all_reduce_impl=$GLM52_CUSTOM_ALL_REDUCE_IMPL"
   echo "semantics=req64,input_per_request=100000,output_per_request=1000,decode_tokens=63936"
   echo "dp_batch_entry=colocated,explicit_dp_routing=1"
   echo "dp_scheduler_control=global"
@@ -100,7 +121,7 @@ done
     --tp 8 --dp 8 --ep 8 --enable-dp-attention \
     --attention-backend dsa --moe-a2a-backend megamoe \
     --moe-runner-backend "$MOE_RUNNER_BACKEND" \
-    --fp8-gemm-backend deep_gemm --kv-cache-dtype fp8_e4m3 \
+    --fp8-gemm-backend "$GLM52_FP8_GEMM_BACKEND" --kv-cache-dtype fp8_e4m3 \
     --mem-fraction-static 0.835 --swa-full-tokens-ratio 0.075 \
     --page-size 64 --chunked-prefill-size 16384 \
     --cuda-graph-max-bs-decode 544 --dist-timeout 3600 --watchdog-timeout 1800 \
@@ -124,6 +145,8 @@ cp "${server_info_files[0]}" "$PREFIX.server_info.json"
 "$PYTHON" "$REPO/scripts/glm52_decode/validate_decode_result.py" \
   --result "$PREFIX.jsonl" --server-info "$PREFIX.server_info.json" \
   --expected-moe-runner "$MOE_RUNNER_BACKEND" \
+  "${custom_all_reduce_args[@]}" \
+  "${fp8_gemm_args[@]}" \
   "${direct_output_args[@]}" \
   "${fused_routing_pack_args[@]}" >"$PREFIX.validated.json"
 [[ -s "$PREFIX.nsys-rep" ]] || { echo "missing Nsys report" >&2; exit 1; }

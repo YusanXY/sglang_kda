@@ -14,6 +14,8 @@ REUSE_PREFIX_CACHE=${REUSE_PREFIX_CACHE:-0}
 EXPECTED_SHARED_EXPERT_PARALLELISM=${EXPECTED_SHARED_EXPERT_PARALLELISM:-tp8}
 EXPECTED_FLASHINFER_DIRECT_OUTPUT=${EXPECTED_FLASHINFER_DIRECT_OUTPUT:-0}
 EXPECTED_FLASHINFER_FUSED_ROUTING_PACK=${EXPECTED_FLASHINFER_FUSED_ROUTING_PACK:-0}
+EXPECTED_CUSTOM_ALL_REDUCE=${EXPECTED_CUSTOM_ALL_REDUCE:-legacy}
+EXPECTED_FP8_GEMM_BACKEND=${EXPECTED_FP8_GEMM_BACKEND:-deep_gemm}
 
 source "$RUNTIME/env.sh"
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
@@ -38,6 +40,14 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 [[ "$EXPECTED_FLASHINFER_FUSED_ROUTING_PACK" == 0 || "$EXPECTED_FLASHINFER_FUSED_ROUTING_PACK" == 1 ]] || {
   echo "EXPECTED_FLASHINFER_FUSED_ROUTING_PACK must be 0 or 1" >&2
+  exit 2
+}
+[[ "$EXPECTED_CUSTOM_ALL_REDUCE" == legacy || "$EXPECTED_CUSTOM_ALL_REDUCE" == v2 || "$EXPECTED_CUSTOM_ALL_REDUCE" == hybrid_graph_v2 ]] || {
+  echo "EXPECTED_CUSTOM_ALL_REDUCE must be legacy, v2, or hybrid_graph_v2" >&2
+  exit 2
+}
+[[ "$EXPECTED_FP8_GEMM_BACKEND" == deep_gemm || "$EXPECTED_FP8_GEMM_BACKEND" == flashinfer_trtllm ]] || {
+  echo "EXPECTED_FP8_GEMM_BACKEND must be deep_gemm or flashinfer_trtllm" >&2
   exit 2
 }
 direct_output_args=()
@@ -93,6 +103,8 @@ if [[ "$REUSE_PREFIX_CACHE" == 0 ]]; then
     --result "$WARMUP_RESULT" --server-info "$SERVER_INFO" \
     --context-build \
     --expected-moe-runner "$MOE_RUNNER_BACKEND" \
+    --expected-custom-all-reduce "$EXPECTED_CUSTOM_ALL_REDUCE" \
+    --expected-fp8-gemm-backend "$EXPECTED_FP8_GEMM_BACKEND" \
     --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
     "${direct_output_args[@]}" \
     "${fused_routing_pack_args[@]}" \
@@ -124,6 +136,8 @@ for run in $(seq 1 "$RUNS"); do
   "$PYTHON" "$REPO/scripts/glm52_decode/validate_decode_result.py" \
     --result "$result" --server-info "$SERVER_INFO" \
     --expected-moe-runner "$MOE_RUNNER_BACKEND" \
+    --expected-custom-all-reduce "$EXPECTED_CUSTOM_ALL_REDUCE" \
+    --expected-fp8-gemm-backend "$EXPECTED_FP8_GEMM_BACKEND" \
     --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
     "${direct_output_args[@]}" \
     "${fused_routing_pack_args[@]}" \
@@ -134,6 +148,8 @@ done
 "$PYTHON" "$REPO/scripts/glm52_decode/summarize_decode_results.py" \
   "${result_args[@]}" --server-info "$SERVER_INFO" --output-dir "$RUN_DIR" \
   --expected-moe-runner "$MOE_RUNNER_BACKEND" \
+  --expected-custom-all-reduce "$EXPECTED_CUSTOM_ALL_REDUCE" \
+  --expected-fp8-gemm-backend "$EXPECTED_FP8_GEMM_BACKEND" \
   --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
   "${direct_output_args[@]}" \
   "${fused_routing_pack_args[@]}"

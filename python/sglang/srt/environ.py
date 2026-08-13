@@ -726,6 +726,10 @@ class Envs:
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # Keep the stable legacy custom AR for eager/prefill, but capture decode
+    # CUDA Graphs with V2. Graph replay contains the selected V2 kernels, so
+    # this adds no Python dispatch to the steady decode loop.
+    SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_GRAPH_ONLY = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)

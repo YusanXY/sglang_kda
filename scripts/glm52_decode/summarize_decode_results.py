@@ -38,6 +38,16 @@ def main() -> None:
         "--expected-flashinfer-fused-routing-pack", action="store_true"
     )
     parser.add_argument(
+        "--expected-custom-all-reduce",
+        choices=("legacy", "v2", "hybrid_graph_v2"),
+        default="legacy",
+    )
+    parser.add_argument(
+        "--expected-fp8-gemm-backend",
+        choices=("deep_gemm", "flashinfer_trtllm"),
+        default="deep_gemm",
+    )
+    parser.add_argument(
         "--expected-shared-expert-parallelism",
         choices=("tp1", "tp8"),
         default="tp8",
@@ -58,6 +68,8 @@ def main() -> None:
             expected_flashinfer_fused_routing_pack=(
                 args.expected_flashinfer_fused_routing_pack
             ),
+            expected_custom_all_reduce=args.expected_custom_all_reduce,
+            expected_fp8_gemm_backend=args.expected_fp8_gemm_backend,
         )
         for path in args.result
     ]

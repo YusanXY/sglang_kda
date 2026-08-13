@@ -341,6 +341,62 @@ class CustomAllreduce:
         self.close()
 
 
+class GraphV2EagerLegacyCustomAllReduce:
+    """Use legacy AR eagerly and V2 only while capturing CUDA Graphs.
+
+    GLM-5.2 long-context prefill can strand ranks in V2's push/pull kernels,
+    while its steady decode is entirely CUDA-Graph replay. Selecting V2 at
+    capture time gives decode the faster graph nodes without exposing eager
+    prefill to V2. The replay path contains no Python-side mode check.
+    """
+
+    def __init__(self, group: ProcessGroup, device: torch.device) -> None:
+        from .custom_all_reduce_v2 import CustomAllReduceV2
+
+        self.legacy = CustomAllreduce(group=group, device=device)
+        self.v2 = CustomAllReduceV2(group=group, device=device)
+        self.disabled = self.legacy.disabled or self.v2.disabled
+        self.original_disabled = self.disabled
+        self._capture_v2 = False
+        if self.disabled:
+            self.close()
+
+    @property
+    def _IS_CAPTURING(self) -> bool:
+        return self._capture_v2
+
+    @contextmanager
+    def capture(self):
+        if self.disabled:
+            yield
+            return
+        self._capture_v2 = True
+        try:
+            with self.v2.capture():
+                yield
+        finally:
+            self._capture_v2 = False
+
+    def should_custom_ar(self, inp: torch.Tensor) -> bool:
+        comm = self.v2 if self._capture_v2 else self.legacy
+        return not self.disabled and comm.should_custom_ar(inp)
+
+    def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
+        comm = self.v2 if self._capture_v2 else self.legacy
+        return comm.custom_all_reduce(input)
+
+    def close(self):
+        for name in ("v2", "legacy"):
+            comm = getattr(self, name, None)
+            if comm is not None:
+                comm.close()
+                setattr(self, name, None)
+        self.disabled = True
+
+    def __del__(self):
+        self.close()
+
+
 def dispatch_custom_allreduce(
     group: ProcessGroup,
     device: torch.device,
@@ -355,6 +411,13 @@ def dispatch_custom_allreduce(
     Note: ServerArgs._handle_environment_variables forces this env to "0" when
     nnodes > 1 since custom AR is intra-node only.
     """
+    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_GRAPH_ONLY.get():
+        from .custom_all_reduce_v2 import can_use_custom_all_reduce_v2
+
+        if can_use_custom_all_reduce_v2(group=group, device=device):
+            logger.debug("[AR] Using V2 for CUDA Graphs and legacy for eager")
+            return GraphV2EagerLegacyCustomAllReduce
+
     if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
         from .custom_all_reduce_v2 import (
             CustomAllReduceV2,

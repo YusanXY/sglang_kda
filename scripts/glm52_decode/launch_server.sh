@@ -7,6 +7,7 @@ RUNTIME=${RUNTIME:-/mnt/b300-shared/home/gjy/data/agent4kernel/.runtime/b300}
 MODEL=${MODEL:-/var/b300-shared/models/GLM-5.2-FP8}
 PORT=${PORT:-30000}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
+GLM52_FP8_GEMM_BACKEND=${GLM52_FP8_GEMM_BACKEND:-deep_gemm}
 GLM52_TRITON_CACHE_DIR=${GLM52_TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
 GLM52_DEEP_GEMM_CACHE_DIR=${GLM52_DEEP_GEMM_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
 GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
@@ -23,12 +24,16 @@ GLM52_FLASHINFER_FUSED_ROUTING_PACK=${GLM52_FLASHINFER_FUSED_ROUTING_PACK:-0}
   echo "MOE_RUNNER_BACKEND must be auto, deep_gemm, or flashinfer_trtllm_routed" >&2
   exit 2
 }
+[[ "$GLM52_FP8_GEMM_BACKEND" == deep_gemm || "$GLM52_FP8_GEMM_BACKEND" == flashinfer_trtllm ]] || {
+  echo "GLM52_FP8_GEMM_BACKEND must be deep_gemm or flashinfer_trtllm" >&2
+  exit 2
+}
 [[ "$GLM52_SHARED_EXPERT_TP1" == 0 || "$GLM52_SHARED_EXPERT_TP1" == 1 ]] || {
   echo "GLM52_SHARED_EXPERT_TP1 must be 0 or 1" >&2
   exit 2
 }
-[[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == legacy || "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == v2 ]] || {
-  echo "GLM52_CUSTOM_ALL_REDUCE_IMPL must be legacy or v2" >&2
+[[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == legacy || "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == v2 || "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == hybrid_graph_v2 ]] || {
+  echo "GLM52_CUSTOM_ALL_REDUCE_IMPL must be legacy, v2, or hybrid_graph_v2" >&2
   exit 2
 }
 [[ "$GLM52_DISABLE_CUSTOM_ALL_REDUCE" == 0 || "$GLM52_DISABLE_CUSTOM_ALL_REDUCE" == 1 ]] || {
@@ -88,8 +93,13 @@ export SGLANG_FLASHINFER_MOE_FUSED_ROUTING_PACK="$GLM52_FLASHINFER_FUSED_ROUTING
 # is stable for context construction, and remains common to every formal A/B.
 if [[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == v2 ]]; then
   export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_GRAPH_ONLY=0
+elif [[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == hybrid_graph_v2 ]]; then
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_GRAPH_ONLY=1
 else
   export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0
+  export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_GRAPH_ONLY=0
 fi
 mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
@@ -114,7 +124,7 @@ exec "$RUNTIME/venv/bin/python" -m sglang.launch_server \
   --tp-size 8 --ep-size 8 --dp-size 8 --enable-dp-attention \
   --attention-backend dsa --moe-a2a-backend megamoe \
   --moe-runner-backend "$MOE_RUNNER_BACKEND" \
-  --fp8-gemm-backend deep_gemm --kv-cache-dtype fp8_e4m3 \
+  --fp8-gemm-backend "$GLM52_FP8_GEMM_BACKEND" --kv-cache-dtype fp8_e4m3 \
   --mem-fraction-static 0.835 --swa-full-tokens-ratio 0.075 \
   --page-size 64 --chunked-prefill-size 16384 \
   --cuda-graph-max-bs-decode 544 --dist-timeout 3600 --watchdog-timeout 1800 \

@@ -61,7 +61,12 @@ def _validate_output_vectors(
     return input_hash, hashes
 
 
-def _validate_server(server: dict, expected_moe_runner: str) -> None:
+def _validate_server(
+    server: dict,
+    expected_moe_runner: str,
+    expected_custom_all_reduce: str,
+    expected_fp8_gemm_backend: str,
+) -> None:
     expected = {
         "tp_size": 8,
         "dp_size": 8,
@@ -76,6 +81,7 @@ def _validate_server(server: dict, expected_moe_runner: str) -> None:
         "kv_cache_dtype": "fp8_e4m3",
         "chunked_prefill_size": 2048,
         "moe_runner_backend": expected_moe_runner,
+        "fp8_gemm_runner_backend": expected_fp8_gemm_backend,
     }
     for key, wanted in expected.items():
         actual = server.get(key)
@@ -128,9 +134,9 @@ def _validate_server(server: dict, expected_moe_runner: str) -> None:
         raise ValueError("missing GLM-5.2 decode runtime config")
     if runtime.get("mega_moe_kernel_checkpoint_eligible") is not False:
         raise ValueError(f"FP8 checkpoint unexpectedly MegaMoE-eligible: {runtime!r}")
-    if runtime.get("custom_all_reduce_impl") != "legacy":
+    if runtime.get("custom_all_reduce_impl") != expected_custom_all_reduce:
         raise ValueError(
-            "formal GLM-5.2 decode requires stable legacy custom AR, got "
+            f"expected custom all-reduce {expected_custom_all_reduce!r}, got "
             f"{runtime!r}"
         )
     expected_effective = (
@@ -152,10 +158,17 @@ def validate(
     context_build: bool = False,
     expected_flashinfer_direct_output: bool = False,
     expected_flashinfer_fused_routing_pack: bool = False,
+    expected_custom_all_reduce: str = "legacy",
+    expected_fp8_gemm_backend: str = "deep_gemm",
 ) -> dict:
     row = _read_single_result(result_path)
     server = json.loads(server_info_path.read_text(encoding="utf-8"))
-    _validate_server(server, expected_moe_runner)
+    _validate_server(
+        server,
+        expected_moe_runner,
+        expected_custom_all_reduce,
+        expected_fp8_gemm_backend,
+    )
     runtime = server["glm52_decode_runtime_config"]
     if bool(runtime.get("flashinfer_moe_direct_output", False)) != (
         expected_flashinfer_direct_output
@@ -266,6 +279,16 @@ def main() -> None:
     parser.add_argument(
         "--expected-flashinfer-fused-routing-pack", action="store_true"
     )
+    parser.add_argument(
+        "--expected-custom-all-reduce",
+        choices=("legacy", "v2", "hybrid_graph_v2"),
+        default="legacy",
+    )
+    parser.add_argument(
+        "--expected-fp8-gemm-backend",
+        choices=("deep_gemm", "flashinfer_trtllm"),
+        default="deep_gemm",
+    )
     parser.add_argument("--require-cached-context", action="store_true")
     parser.add_argument(
         "--context-build",
@@ -295,6 +318,8 @@ def main() -> None:
                 expected_flashinfer_fused_routing_pack=(
                     args.expected_flashinfer_fused_routing_pack
                 ),
+                expected_custom_all_reduce=args.expected_custom_all_reduce,
+                expected_fp8_gemm_backend=args.expected_fp8_gemm_backend,
             ),
             sort_keys=True,
         )
