@@ -8,6 +8,7 @@ MODEL=${MODEL:-/var/b300-shared/models/GLM-5.2-FP8}
 PORT=${PORT:-30000}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
 GLM52_TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
+GLM52_DEEP_GEMM_CACHE_DIR=${SGLANG_DG_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
   echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
@@ -22,11 +23,17 @@ export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
 # Re-apply the per-experiment directory after sourcing it so all ranks have a
 # writable cache and baseline/candidates reuse the same compiled kernels.
 export TRITON_CACHE_DIR="$GLM52_TRITON_CACHE_DIR"
-mkdir -p "$TRITON_CACHE_DIR"
+export SGLANG_DG_CACHE_DIR="$GLM52_DEEP_GEMM_CACHE_DIR"
+# Decode only needs the complete 1..1024 M range. Fast warmup covers that
+# range exactly and samples larger prefill Ms instead of replaying all 16K
+# shapes on every server restart.
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 
 exec "$RUNTIME/venv/bin/python" -m sglang.launch_server \
   --model-path "$MODEL" --host 127.0.0.1 --port "$PORT" --trust-remote-code \
+  --skip-server-warmup \
   --tp-size 8 --ep-size 8 --dp-size 8 --enable-dp-attention \
   --attention-backend dsa --moe-a2a-backend megamoe \
   --moe-runner-backend "$MOE_RUNNER_BACKEND" \

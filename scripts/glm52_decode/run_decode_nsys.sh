@@ -11,6 +11,7 @@ PYTHON=${PYTHON:-$RUNTIME/venv/bin/python}
 PROFILE_STEPS=${PROFILE_STEPS:-200}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
 GLM52_TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
+GLM52_DEEP_GEMM_CACHE_DIR=${SGLANG_DG_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
 PREFIX=$RUN_DIR/req64_100k_1k_${TAG}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
@@ -21,8 +22,10 @@ source "$RUNTIME/env.sh"
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export TRITON_CACHE_DIR="$GLM52_TRITON_CACHE_DIR"
+export SGLANG_DG_CACHE_DIR="$GLM52_DEEP_GEMM_CACHE_DIR"
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
-mkdir -p "$TRITON_CACHE_DIR" "$RUN_DIR"
+mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR" "$RUN_DIR"
 
 for path in \
   "$REPO/python/sglang/benchmark/one_batch_server.py" \
@@ -55,6 +58,7 @@ done
   --cuda-graph-trace=node:host-only --force-overwrite=true -o "$PREFIX" \
   "$PYTHON" -m sglang.benchmark.one_batch_server \
     --model-path "$MODEL" --trust-remote-code \
+    --skip-server-warmup \
     --tp 8 --dp 8 --ep 8 --enable-dp-attention \
     --attention-backend dsa --moe-a2a-backend megamoe \
     --moe-runner-backend "$MOE_RUNNER_BACKEND" \

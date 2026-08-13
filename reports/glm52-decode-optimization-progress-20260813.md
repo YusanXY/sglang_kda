@@ -71,6 +71,13 @@ Two cold-start failures were diagnosed before collecting performance data:
    account's read-only directory. Commit `b0e280ddf` reapplies an explicit
    experiment-owned cache after sourcing the environment. This changes no
    inference kernels and makes warm-cache A/B runs reproducible.
+3. SGLang's internal warmup request has a fixed 600-second HTTP timeout, while
+   the first all-M DeepGEMM pass took about 11 minutes. Experiments skip that
+   internal request and use the strict external workload warmup with a
+   14,400-second timeout. DeepGEMM fast warmup still compiles every decode M
+   from 1 through 1,024, and only samples larger prefill Ms; this avoids
+   replaying all 16K prefill shapes at every restart without reducing decode
+   kernel coverage.
 
 Neither startup fix is counted as a decode throughput optimization.
 
