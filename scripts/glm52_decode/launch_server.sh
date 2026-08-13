@@ -11,6 +11,7 @@ GLM52_TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
 GLM52_DEEP_GEMM_CACHE_DIR=${SGLANG_DG_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
 GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
 GLM52_CUSTOM_ALL_REDUCE_IMPL=${GLM52_CUSTOM_ALL_REDUCE_IMPL:-legacy}
+GLM52_DISABLE_CUSTOM_ALL_REDUCE=${GLM52_DISABLE_CUSTOM_ALL_REDUCE:-0}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
   echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
@@ -22,6 +23,10 @@ GLM52_CUSTOM_ALL_REDUCE_IMPL=${GLM52_CUSTOM_ALL_REDUCE_IMPL:-legacy}
 }
 [[ "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == legacy || "$GLM52_CUSTOM_ALL_REDUCE_IMPL" == v2 ]] || {
   echo "GLM52_CUSTOM_ALL_REDUCE_IMPL must be legacy or v2" >&2
+  exit 2
+}
+[[ "$GLM52_DISABLE_CUSTOM_ALL_REDUCE" == 0 || "$GLM52_DISABLE_CUSTOM_ALL_REDUCE" == 1 ]] || {
+  echo "GLM52_DISABLE_CUSTOM_ALL_REDUCE must be 0 or 1" >&2
   exit 2
 }
 [[ -d "$REPO/python/sglang" ]] || { echo "missing repo: $REPO" >&2; exit 2; }
@@ -52,6 +57,11 @@ fi
 mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 
+extra_args=()
+if [[ "$GLM52_DISABLE_CUSTOM_ALL_REDUCE" == 1 ]]; then
+  extra_args+=(--disable-custom-all-reduce)
+fi
+
 exec "$RUNTIME/venv/bin/python" -m sglang.launch_server \
   --model-path "$MODEL" --host 127.0.0.1 --port "$PORT" --trust-remote-code \
   --skip-server-warmup \
@@ -61,4 +71,5 @@ exec "$RUNTIME/venv/bin/python" -m sglang.launch_server \
   --fp8-gemm-backend deep_gemm --kv-cache-dtype fp8_e4m3 \
   --mem-fraction-static 0.835 --swa-full-tokens-ratio 0.075 \
   --page-size 64 --chunked-prefill-size 16384 \
-  --cuda-graph-max-bs-decode 544 --dist-timeout 3600 --watchdog-timeout 1800
+  --cuda-graph-max-bs-decode 544 --dist-timeout 3600 --watchdog-timeout 1800 \
+  "${extra_args[@]}"
