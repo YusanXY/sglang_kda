@@ -181,16 +181,22 @@ def validate(
 
     cached_tokens = row.get("cached_tokens_per_request")
     if require_cached_context:
+        page_size = server.get("page_size")
+        if not isinstance(page_size, int) or page_size <= 0:
+            raise ValueError(f"invalid server page_size={page_size!r}")
+        # Radix cache reuses complete KV pages.  For the fixed 100K prompt and
+        # page_size=64 this is exactly 99,968 cached tokens; the final 32-token
+        # tail is replayed before first-token timing and is not part of the
+        # 63,936-token decode window.
+        expected_cached_tokens = (EXPECTED_INPUT_LEN // page_size) * page_size
         if (
             not isinstance(cached_tokens, list)
             or len(cached_tokens) != EXPECTED_BATCH_SIZE
-            or any(
-                not isinstance(value, int) or value < EXPECTED_INPUT_LEN - 1
-                for value in cached_tokens
-            )
+            or any(value != expected_cached_tokens for value in cached_tokens)
         ):
             raise ValueError(
-                "decode replay requires at least 99,999 cached prompt tokens "
+                "decode replay requires the exact full-page cached prefix "
+                f"({expected_cached_tokens} tokens with page_size={page_size}) "
                 f"for every request, got {cached_tokens!r}"
             )
 
