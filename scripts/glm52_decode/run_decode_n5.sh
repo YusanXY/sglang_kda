@@ -30,7 +30,12 @@ done
 
 mkdir -p "$RUN_DIR"
 SERVER_INFO=$RUN_DIR/server_info.json
-curl -fsS "$BASE_URL/server_info" -o "$SERVER_INFO"
+# This endpoint only queries scheduler metadata.  Bound the probe so a prior
+# failed generation/collective cannot leave an unattended benchmark blocked
+# forever.  Do not use /health here: with generation-backed health checks that
+# endpoint launches a real request and can trigger cold JIT work.
+curl --connect-timeout 5 --max-time 60 -fsS \
+  "$BASE_URL/server_info" -o "$SERVER_INFO"
 
 # A full target-shape warmup is mandatory.  GLM-5.2 may lazily compile
 # DeepGEMM shapes when the first real batch arrives; counting that one-time
