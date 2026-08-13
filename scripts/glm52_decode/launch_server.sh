@@ -12,6 +12,7 @@ GLM52_DEEP_GEMM_CACHE_DIR=${SGLANG_DG_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_
 GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
 GLM52_CUSTOM_ALL_REDUCE_IMPL=${GLM52_CUSTOM_ALL_REDUCE_IMPL:-legacy}
 GLM52_DISABLE_CUSTOM_ALL_REDUCE=${GLM52_DISABLE_CUSTOM_ALL_REDUCE:-0}
+GLM52_DISABLE_OVERLAP=${GLM52_DISABLE_OVERLAP:-0}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
   echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
@@ -27,6 +28,10 @@ GLM52_DISABLE_CUSTOM_ALL_REDUCE=${GLM52_DISABLE_CUSTOM_ALL_REDUCE:-0}
 }
 [[ "$GLM52_DISABLE_CUSTOM_ALL_REDUCE" == 0 || "$GLM52_DISABLE_CUSTOM_ALL_REDUCE" == 1 ]] || {
   echo "GLM52_DISABLE_CUSTOM_ALL_REDUCE must be 0 or 1" >&2
+  exit 2
+}
+[[ "$GLM52_DISABLE_OVERLAP" == 0 || "$GLM52_DISABLE_OVERLAP" == 1 ]] || {
+  echo "GLM52_DISABLE_OVERLAP must be 0 or 1" >&2
   exit 2
 }
 [[ -d "$REPO/python/sglang" ]] || { echo "missing repo: $REPO" >&2; exit 2; }
@@ -60,6 +65,9 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 extra_args=()
 if [[ "$GLM52_DISABLE_CUSTOM_ALL_REDUCE" == 1 ]]; then
   extra_args+=(--disable-custom-all-reduce)
+fi
+if [[ "$GLM52_DISABLE_OVERLAP" == 1 ]]; then
+  extra_args+=(--disable-overlap-schedule)
 fi
 
 exec "$RUNTIME/venv/bin/python" -m sglang.launch_server \
