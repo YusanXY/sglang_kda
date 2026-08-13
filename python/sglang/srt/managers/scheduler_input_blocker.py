@@ -48,6 +48,11 @@ class SchedulerInputBlocker:
         if not self._noop:
             return output_reqs
 
+    @property
+    def is_blocking_model_schedule(self) -> bool:
+        """Whether this scheduler must stay out of DP/EP model collectives."""
+        return not self._noop and self._state != _State.UNBLOCKED
+
     def _handle_recv_req(self, recv_req):
         if isinstance(recv_req, BlockReqInput):
             if recv_req.req_type == BlockReqType.BLOCK:

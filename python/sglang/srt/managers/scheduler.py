@@ -1513,6 +1513,15 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+            # A colocated batch is released only after every DP scheduler has
+            # received its rank-local requests.  While BLOCKED (or waiting in
+            # the UNBLOCK CPU barrier), do not run an idle model batch: that
+            # would enter DP/EP GPU collectives out of order with peers that
+            # have already reached the release barrier.
+            if self.input_blocker is not None and (
+                self.input_blocker.is_blocking_model_schedule
+            ) and self.is_fully_idle():
+                continue
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -1555,6 +1564,10 @@ class Scheduler(
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                continue
+            if self.input_blocker is not None and (
+                self.input_blocker.is_blocking_model_schedule
+            ) and self.is_fully_idle():
                 continue
 
             self._apply_war_barrier()
