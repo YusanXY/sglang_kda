@@ -15,6 +15,7 @@ GLM52_DISABLE_CUSTOM_ALL_REDUCE=${GLM52_DISABLE_CUSTOM_ALL_REDUCE:-0}
 GLM52_DISABLE_OVERLAP=${GLM52_DISABLE_OVERLAP:-0}
 GLM52_ENABLE_DP_LM_HEAD=${GLM52_ENABLE_DP_LM_HEAD:-0}
 GLM52_COLOCATE_DP_BATCH=${GLM52_COLOCATE_DP_BATCH:-0}
+GLM52_LOCAL_DP_CONTROL=${GLM52_LOCAL_DP_CONTROL:-0}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
   echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
@@ -42,6 +43,10 @@ GLM52_COLOCATE_DP_BATCH=${GLM52_COLOCATE_DP_BATCH:-0}
 }
 [[ "$GLM52_COLOCATE_DP_BATCH" == 0 || "$GLM52_COLOCATE_DP_BATCH" == 1 ]] || {
   echo "GLM52_COLOCATE_DP_BATCH must be 0 or 1" >&2
+  exit 2
+}
+[[ "$GLM52_LOCAL_DP_CONTROL" == 0 || "$GLM52_LOCAL_DP_CONTROL" == 1 ]] || {
+  echo "GLM52_LOCAL_DP_CONTROL must be 0 or 1" >&2
   exit 2
 }
 [[ -d "$REPO/python/sglang" ]] || { echo "missing repo: $REPO" >&2; exit 2; }
@@ -86,6 +91,9 @@ if [[ "$GLM52_DISABLE_OVERLAP" == 1 ]]; then
 fi
 if [[ "$GLM52_ENABLE_DP_LM_HEAD" == 1 ]]; then
   extra_args+=(--enable-dp-lm-head)
+fi
+if [[ "$GLM52_LOCAL_DP_CONTROL" == 1 ]]; then
+  extra_args+=(--enable-dp-attention-local-control-broadcast)
 fi
 
 exec "$RUNTIME/venv/bin/python" -m sglang.launch_server \
