@@ -35,7 +35,12 @@ def main() -> None:
     )
     parser.add_argument("--expected-flashinfer-direct-output", action="store_true")
     parser.add_argument(
-        "--expected-shared-expert-parallelism", choices=("tp1", "tp8"), default="tp8"
+        "--expected-flashinfer-fused-routing-pack", action="store_true"
+    )
+    parser.add_argument(
+        "--expected-shared-expert-parallelism",
+        choices=("tp1", "tp8"),
+        default="tp8",
     )
     args = parser.parse_args()
     samples = [
@@ -49,6 +54,9 @@ def main() -> None:
             ),
             expected_flashinfer_direct_output=(
                 args.expected_flashinfer_direct_output
+            ),
+            expected_flashinfer_fused_routing_pack=(
+                args.expected_flashinfer_fused_routing_pack
             ),
         )
         for path in args.result

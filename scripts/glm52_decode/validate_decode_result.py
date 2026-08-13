@@ -151,6 +151,7 @@ def validate(
     expected_shared_expert_parallelism: str = "tp8",
     context_build: bool = False,
     expected_flashinfer_direct_output: bool = False,
+    expected_flashinfer_fused_routing_pack: bool = False,
 ) -> dict:
     row = _read_single_result(result_path)
     server = json.loads(server_info_path.read_text(encoding="utf-8"))
@@ -162,6 +163,13 @@ def validate(
         raise ValueError(
             "FlashInfer MoE direct-output mismatch: expected "
             f"{expected_flashinfer_direct_output!r}, got {runtime!r}"
+        )
+    if bool(runtime.get("flashinfer_moe_fused_routing_pack", False)) != (
+        expected_flashinfer_fused_routing_pack
+    ):
+        raise ValueError(
+            "FlashInfer fused routing-pack mismatch: expected "
+            f"{expected_flashinfer_fused_routing_pack!r}, got {runtime!r}"
         )
     if runtime.get("shared_expert_parallelism") != expected_shared_expert_parallelism:
         raise ValueError(
@@ -255,6 +263,9 @@ def main() -> None:
         default="auto",
     )
     parser.add_argument("--expected-flashinfer-direct-output", action="store_true")
+    parser.add_argument(
+        "--expected-flashinfer-fused-routing-pack", action="store_true"
+    )
     parser.add_argument("--require-cached-context", action="store_true")
     parser.add_argument(
         "--context-build",
@@ -280,6 +291,9 @@ def main() -> None:
                 context_build=args.context_build,
                 expected_flashinfer_direct_output=(
                     args.expected_flashinfer_direct_output
+                ),
+                expected_flashinfer_fused_routing_pack=(
+                    args.expected_flashinfer_fused_routing_pack
                 ),
             ),
             sort_keys=True,

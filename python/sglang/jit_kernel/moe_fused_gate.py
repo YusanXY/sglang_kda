@@ -354,7 +354,12 @@ def moe_fused_gate(
     BLOCK_M = max(1, min(4, 256 // BLOCK_N))
     num_warps = 1
     grid = (triton.cdiv(M, BLOCK_M),)
-    use_pdl = is_arch_support_pdl()
+    # The next consumer of packed_out is FlashInfer's routed-MoE kernel, which
+    # does not issue cudaGridDependencySynchronize before reading the carrier.
+    # Advertising programmatic launch completion before the packed stores can
+    # therefore expose partially-written routing data under CUDA Graph replay.
+    # Keep the ordinary same-stream completion dependency for this fused ABI.
+    use_pdl = is_arch_support_pdl() and packed_out is None
     extra = {"launch_pdl": True} if use_pdl else {}
     _router_triton_kernel[grid](
         scores,

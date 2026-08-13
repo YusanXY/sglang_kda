@@ -813,6 +813,9 @@ async def server_info():
         "flashinfer_moe_direct_output": (
             envs.SGLANG_FLASHINFER_MOE_DIRECT_OUTPUT.get()
         ),
+        "flashinfer_moe_fused_routing_pack": (
+            envs.SGLANG_FLASHINFER_MOE_FUSED_ROUTING_PACK.get()
+        ),
         "shared_expert_parallelism": (
             "tp1"
             if envs.SGLANG_SHARED_EXPERT_TP1.get()

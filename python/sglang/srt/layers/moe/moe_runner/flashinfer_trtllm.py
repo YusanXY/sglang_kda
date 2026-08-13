@@ -726,9 +726,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 runner_config.top_k is not None
             ), "runner_config.top_k is required for flashinfer_trtllm_routed."
             assert TopKOutputChecker.format_is_standard(topk_output)
-            packed_topk_ids = PackTopkIds.execute(
-                topk_output.topk_ids, topk_output.topk_weights
-            )
+            packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
+            if packed_topk_ids is None:
+                packed_topk_ids = PackTopkIds.execute(
+                    topk_output.topk_ids, topk_output.topk_weights
+                )
 
             routed_kwargs = {
                 "topk_ids": packed_topk_ids,

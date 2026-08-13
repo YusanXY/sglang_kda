@@ -13,6 +13,7 @@ MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
 REUSE_PREFIX_CACHE=${REUSE_PREFIX_CACHE:-0}
 EXPECTED_SHARED_EXPERT_PARALLELISM=${EXPECTED_SHARED_EXPERT_PARALLELISM:-tp8}
 EXPECTED_FLASHINFER_DIRECT_OUTPUT=${EXPECTED_FLASHINFER_DIRECT_OUTPUT:-0}
+EXPECTED_FLASHINFER_FUSED_ROUTING_PACK=${EXPECTED_FLASHINFER_FUSED_ROUTING_PACK:-0}
 
 source "$RUNTIME/env.sh"
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
@@ -35,9 +36,17 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
   echo "EXPECTED_FLASHINFER_DIRECT_OUTPUT must be 0 or 1" >&2
   exit 2
 }
+[[ "$EXPECTED_FLASHINFER_FUSED_ROUTING_PACK" == 0 || "$EXPECTED_FLASHINFER_FUSED_ROUTING_PACK" == 1 ]] || {
+  echo "EXPECTED_FLASHINFER_FUSED_ROUTING_PACK must be 0 or 1" >&2
+  exit 2
+}
 direct_output_args=()
 if [[ "$EXPECTED_FLASHINFER_DIRECT_OUTPUT" == 1 ]]; then
   direct_output_args+=(--expected-flashinfer-direct-output)
+fi
+fused_routing_pack_args=()
+if [[ "$EXPECTED_FLASHINFER_FUSED_ROUTING_PACK" == 1 ]]; then
+  fused_routing_pack_args+=(--expected-flashinfer-fused-routing-pack)
 fi
 for path in \
   "$REPO/python/sglang/benchmark/one_batch_server.py" \
@@ -86,6 +95,7 @@ if [[ "$REUSE_PREFIX_CACHE" == 0 ]]; then
     --expected-moe-runner "$MOE_RUNNER_BACKEND" \
     --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
     "${direct_output_args[@]}" \
+    "${fused_routing_pack_args[@]}" \
     >"$WARMUP_CHECKED"
 else
   echo "Reusing live, externally validated Req64 100K prefix cache" >"$WARMUP_LOG"
@@ -116,6 +126,7 @@ for run in $(seq 1 "$RUNS"); do
     --expected-moe-runner "$MOE_RUNNER_BACKEND" \
     --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
     "${direct_output_args[@]}" \
+    "${fused_routing_pack_args[@]}" \
     --require-cached-context >"$checked"
   result_args+=(--result "$result")
 done
@@ -124,7 +135,8 @@ done
   "${result_args[@]}" --server-info "$SERVER_INFO" --output-dir "$RUN_DIR" \
   --expected-moe-runner "$MOE_RUNNER_BACKEND" \
   --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
-  "${direct_output_args[@]}"
+  "${direct_output_args[@]}" \
+  "${fused_routing_pack_args[@]}"
 warmup_artifacts=("$WARMUP_LOG")
 if [[ "$REUSE_PREFIX_CACHE" == 0 ]]; then
   warmup_artifacts+=("$WARMUP_RESULT" "$WARMUP_CHECKED")

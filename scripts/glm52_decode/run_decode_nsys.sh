@@ -12,6 +12,7 @@ PROFILE_STEPS=${PROFILE_STEPS:-200}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
 GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
 GLM52_FLASHINFER_DIRECT_OUTPUT=${GLM52_FLASHINFER_DIRECT_OUTPUT:-0}
+GLM52_FLASHINFER_FUSED_ROUTING_PACK=${GLM52_FLASHINFER_FUSED_ROUTING_PACK:-0}
 GLM52_TRITON_CACHE_DIR=${GLM52_TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
 GLM52_DEEP_GEMM_CACHE_DIR=${GLM52_DEEP_GEMM_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
 PREFIX=$RUN_DIR/req64_100k_1k_${TAG}
@@ -28,6 +29,10 @@ PREFIX=$RUN_DIR/req64_100k_1k_${TAG}
   echo "GLM52_FLASHINFER_DIRECT_OUTPUT must be 0 or 1" >&2
   exit 2
 }
+[[ "$GLM52_FLASHINFER_FUSED_ROUTING_PACK" == 0 || "$GLM52_FLASHINFER_FUSED_ROUTING_PACK" == 1 ]] || {
+  echo "GLM52_FLASHINFER_FUSED_ROUTING_PACK must be 0 or 1" >&2
+  exit 2
+}
 source "$RUNTIME/env.sh"
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
@@ -37,6 +42,7 @@ export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 export SGLANG_ENABLE_COLOCATED_BATCH_GEN=1
 export SGLANG_SHARED_EXPERT_TP1="$GLM52_SHARED_EXPERT_TP1"
 export SGLANG_FLASHINFER_MOE_DIRECT_OUTPUT="$GLM52_FLASHINFER_DIRECT_OUTPUT"
+export SGLANG_FLASHINFER_MOE_FUSED_ROUTING_PACK="$GLM52_FLASHINFER_FUSED_ROUTING_PACK"
 # Match launch_server.sh's formal default.  runtime/env.sh may enable V2 for
 # unrelated experiments, but the validated GLM-5.2 baseline uses legacy custom
 # AR because V2 can strand DP8 prefill ranks in long-running GPU kernels.
@@ -47,6 +53,10 @@ mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR" "$RUN_DIR"
 direct_output_args=()
 if [[ "$GLM52_FLASHINFER_DIRECT_OUTPUT" == 1 ]]; then
   direct_output_args+=(--expected-flashinfer-direct-output)
+fi
+fused_routing_pack_args=()
+if [[ "$GLM52_FLASHINFER_FUSED_ROUTING_PACK" == 1 ]]; then
+  fused_routing_pack_args+=(--expected-flashinfer-fused-routing-pack)
 fi
 
 for path in \
@@ -74,6 +84,7 @@ done
   echo "dp_batch_entry=colocated,explicit_dp_routing=1"
   echo "dp_scheduler_control=global"
   echo "flashinfer_moe_direct_output=$GLM52_FLASHINFER_DIRECT_OUTPUT"
+  echo "flashinfer_moe_fused_routing_pack=$GLM52_FLASHINFER_FUSED_ROUTING_PACK"
   echo "profile_scope=post_last_first_token,steps=$PROFILE_STEPS,cuda_graph_nodes=host_only"
   nvidia-smi -L
   nvidia-smi topo -m
@@ -113,7 +124,8 @@ cp "${server_info_files[0]}" "$PREFIX.server_info.json"
 "$PYTHON" "$REPO/scripts/glm52_decode/validate_decode_result.py" \
   --result "$PREFIX.jsonl" --server-info "$PREFIX.server_info.json" \
   --expected-moe-runner "$MOE_RUNNER_BACKEND" \
-  "${direct_output_args[@]}" >"$PREFIX.validated.json"
+  "${direct_output_args[@]}" \
+  "${fused_routing_pack_args[@]}" >"$PREFIX.validated.json"
 [[ -s "$PREFIX.nsys-rep" ]] || { echo "missing Nsys report" >&2; exit 1; }
 /usr/local/cuda/bin/nsys export --type sqlite --force-overwrite=true \
   --output "$PREFIX.sqlite" "$PREFIX.nsys-rep"

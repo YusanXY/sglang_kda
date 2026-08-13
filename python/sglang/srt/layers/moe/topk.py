@@ -424,6 +424,10 @@ class TopK(MultiPlatformOp):
             scoring_func=scoring_func,
             fuse_packed_routing=(
                 get_server_args().dsv4_worker_backend == "huge_kernel"
+                or (
+                    envs.SGLANG_FLASHINFER_MOE_FUSED_ROUTING_PACK.get()
+                    and get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                )
             ),
             allow_routed_experts_capture=allow_routed_experts_capture,
         )
@@ -1331,6 +1335,8 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    packed_out: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
@@ -1343,14 +1349,30 @@ def biased_grouped_topk_gpu(
     if (
         _is_cuda
         and num_expert_group
-        and num_expert_group > 1
-        and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
+        and num_expert_group >= 1
+        and (
+            envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
+            or packed_out is not None
+        )
     ):
         # Opt-in: unified Triton router for DeepSeek-V3 grouped routing. Bit-exact
         # with the flashinfer/AOT paths on DeepSeek-V3.2 e2e (validated); handles any
         # experts-per-group (no <=32 cap). Off by default — see the env-var comment.
         from sglang.jit_kernel.moe_fused_gate import moe_fused_gate as jit_grouped_gate
 
+        fused_static_map = None
+        if packed_out is not None and expert_location_dispatch_info is not None:
+            if expert_location_dispatch_info.ep_dispatch_algorithm != "static":
+                raise RuntimeError(
+                    "fused grouped routing-pack only supports static expert dispatch"
+                )
+            fused_static_map = (
+                expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
+            )
+            if fused_static_map is None:
+                raise RuntimeError(
+                    "fused grouped routing-pack requires a rank dispatch map"
+                )
         return jit_grouped_gate(
             gating_output.to(dtype=torch.float32),
             correction_bias.to(dtype=torch.float32),
@@ -1366,6 +1388,8 @@ def biased_grouped_topk_gpu(
             ),
             num_expert_group=num_expert_group,
             topk_group=topk_group,
+            packed_out=packed_out,
+            logical_to_physical_map=fused_static_map,
         )
     if (
         _is_cuda
@@ -1924,8 +1948,8 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
-    use_dsv4_huge_packed = topk_config.fuse_packed_routing
-    if use_dsv4_huge_packed:
+    use_fused_packed_routing = topk_config.fuse_packed_routing
+    if use_fused_packed_routing:
         unsupported_dispatch = expert_location_dispatch_info is not None and (
             expert_location_dispatch_info.ep_dispatch_algorithm != "static"
             or expert_location_dispatch_info.partial_logical_to_rank_dispatch_physical_map
@@ -1940,7 +1964,7 @@ def select_experts(
             or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
         ):
             raise RuntimeError(
-                "DSV4 Huge fused packed routing received an unsupported TopK path"
+                "fused FlashInfer packed routing received an unsupported TopK path"
             )
         packed_topk = torch.empty(
             (hidden_states.shape[0], top_k),
@@ -1979,6 +2003,14 @@ def select_experts(
                 num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                **(
+                    {
+                        "packed_out": packed_topk,
+                        "expert_location_dispatch_info": expert_location_dispatch_info,
+                    }
+                    if packed_topk is not None
+                    else {}
+                ),
             )
     elif torch_native and custom_routing_function is None:
         assert (
@@ -2003,10 +2035,10 @@ def select_experts(
         if scoring_func == "sqrtsoftplus" or (
             scoring_func == "sigmoid" and use_jit_fused_gate
         ):
-            if use_dsv4_huge_packed:
+            if use_fused_packed_routing:
                 if not use_jit_fused_gate:
                     raise RuntimeError(
-                        "DSV4 Huge requires the fused Triton router for packed routing"
+                        "fused FlashInfer packed routing requires the Triton router"
                     )
             _biased_topk = (
                 biased_topk_jit_kernel_impl if use_jit_fused_gate else biased_topk_impl
@@ -2158,6 +2190,10 @@ def select_experts(
 
     # ===== TO BE REFACTORED ====
     if packed_topk is not None:
+        if use_grouped_topk and not envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+            raise RuntimeError(
+                "fused grouped routing-pack requires the unified Triton router"
+            )
         return StandardTopKOutputPacked(
             topk_weights, topk_ids, router_logits, packed_topk
         )

@@ -1040,6 +1040,10 @@ class Envs:
     # Let FlashInfer's routed FP8 MoE write the symmetric all-reduce buffer
     # directly instead of materializing and copying a private output tensor.
     SGLANG_FLASHINFER_MOE_DIRECT_OUTPUT = EnvBool(False)
+    # Fuse the standard sigmoid/softmax router's final physical expert IDs and
+    # BF16 routing weights into FlashInfer's int32 carrier.  This removes the
+    # standalone PackTopkIds launch from every routed MoE layer.
+    SGLANG_FLASHINFER_MOE_FUSED_ROUTING_PACK = EnvBool(False)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

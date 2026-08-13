@@ -17,6 +17,7 @@ GLM52_ENABLE_DP_LM_HEAD=${GLM52_ENABLE_DP_LM_HEAD:-0}
 GLM52_COLOCATE_DP_BATCH=${GLM52_COLOCATE_DP_BATCH:-0}
 GLM52_LOCAL_DP_CONTROL=${GLM52_LOCAL_DP_CONTROL:-0}
 GLM52_FLASHINFER_DIRECT_OUTPUT=${GLM52_FLASHINFER_DIRECT_OUTPUT:-0}
+GLM52_FLASHINFER_FUSED_ROUTING_PACK=${GLM52_FLASHINFER_FUSED_ROUTING_PACK:-0}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm || "$MOE_RUNNER_BACKEND" == flashinfer_trtllm_routed ]] || {
   echo "MOE_RUNNER_BACKEND must be auto, deep_gemm, or flashinfer_trtllm_routed" >&2
@@ -54,6 +55,10 @@ GLM52_FLASHINFER_DIRECT_OUTPUT=${GLM52_FLASHINFER_DIRECT_OUTPUT:-0}
   echo "GLM52_FLASHINFER_DIRECT_OUTPUT must be 0 or 1" >&2
   exit 2
 }
+[[ "$GLM52_FLASHINFER_FUSED_ROUTING_PACK" == 0 || "$GLM52_FLASHINFER_FUSED_ROUTING_PACK" == 1 ]] || {
+  echo "GLM52_FLASHINFER_FUSED_ROUTING_PACK must be 0 or 1" >&2
+  exit 2
+}
 [[ -d "$REPO/python/sglang" ]] || { echo "missing repo: $REPO" >&2; exit 2; }
 [[ -f "$MODEL/config.json" ]] || { echo "missing model: $MODEL" >&2; exit 2; }
 
@@ -77,6 +82,7 @@ export SGLANG_SHARED_EXPERT_TP1="$GLM52_SHARED_EXPERT_TP1"
 # collective.
 export SGLANG_ENABLE_COLOCATED_BATCH_GEN="$GLM52_COLOCATE_DP_BATCH"
 export SGLANG_FLASHINFER_MOE_DIRECT_OUTPUT="$GLM52_FLASHINFER_DIRECT_OUTPUT"
+export SGLANG_FLASHINFER_MOE_FUSED_ROUTING_PACK="$GLM52_FLASHINFER_FUSED_ROUTING_PACK"
 # Custom AllReduce V2 can leave B300 DP8 eager prefill ranks spinning inside
 # one-/two-shot GPU kernels. Legacy custom AR is still GPU-local (not NCCL),
 # is stable for context construction, and remains common to every formal A/B.
