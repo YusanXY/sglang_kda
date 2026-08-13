@@ -12,13 +12,13 @@ Graph with max batch 544, eight requests on each DP rank, no retractions, and
 complete output-token vectors. Unsupported or silently changed configurations
 fail instead of falling back into the performance table.
 
-`run_decode_n5.sh` always executes one additional full target-shape batch before
-the five measured samples. This warmup is validated but excluded from the
-summary so lazy DeepGEMM compilation and first-use allocator work cannot pollute
-the throughput distribution. Measured samples use the identical seed and
-preserve the live prefix cache; every result must report at least 99,999 cached
-tokens for every 100K-token request. Thus the timed forward is long-context
-decode replay rather than another 6.4M-token prefill. Set
+`run_decode_n5.sh` first builds the exact target prefixes with one output token,
+then executes the five measured 1K-token samples. The context build is validated
+but excluded from the summary: it covers all 6.4M prompt tokens without wasting
+another 63,936 untimed decode tokens. Measured samples use the identical seed
+and preserve the live prefix cache; every result must report at least 99,999
+cached tokens for every 100K-token request. Thus the timed forward is
+long-context decode replay rather than another 6.4M-token prefill. Set
 `REUSE_PREFIX_CACHE=1` only when a separately validated warmup populated those
 exact prompts on the same live server.
 
@@ -42,7 +42,7 @@ The launcher also sets `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`. The upstream all-M
 precompile hook runs only on rank 0 from inside a model forward; under DP
 attention, peer ranks can enter the next collective while rank 0 synchronizes
 that sweep and deadlock the first request. Actual shapes are compiled
-symmetrically on demand, and a complete Req64/100K/1K request is still run and
+symmetrically on demand, and an exact Req64/100K context build is still run and
 validated before measured samples. This is a common harness fix, not a
 throughput optimization.
 

@@ -47,10 +47,10 @@ SERVER_INFO=$RUN_DIR/server_info.json
 curl --connect-timeout 5 --max-time 60 -fsS \
   "$BASE_URL/server_info" -o "$SERVER_INFO"
 
-# A full target-shape warmup is mandatory unless a preceding, separately
-# validated run populated the exact same 64 long-context prefixes and the
-# caller explicitly preserves that live server cache. Counting that one-time
-# 6.4M-token work as a throughput sample makes A/B ordering meaningless.
+# Build the exact 64 long-context prefixes unless a preceding, separately
+# validated run populated them on this live server. Only one token is emitted:
+# the measured request below supplies the workload's complete 1K-token decode,
+# while another 63,936 untimed decode tokens would add no cache coverage.
 WARMUP_RESULT=$RUN_DIR/warmup.jsonl
 WARMUP_LOG=$RUN_DIR/warmup.log
 WARMUP_CHECKED=$RUN_DIR/warmup.validated.json
@@ -64,14 +64,15 @@ if [[ "$REUSE_PREFIX_CACHE" == 0 ]]; then
   "$PYTHON" -m sglang.benchmark.one_batch_server \
     --model-path None --base-url "$BASE_URL" \
     --local-tokenizer-path "$MODEL" \
-    --batch-size 64 --input-len 100000 --output-len 1000 \
+    --batch-size 64 --input-len 100000 --output-len 1 \
     --temperature 0 --dataset-name random-ids --seed 4199 \
     --save-output-token-ids --client-stream-interval 64 --skip-warmup \
     --request-timeout 14400 --no-append-to-github-summary \
-    --run-name "glm52_decode_req64_100k_1k_warmup" \
+    --run-name "glm52_decode_req64_100k_context_build" \
     --result-filename "$WARMUP_RESULT" >"$WARMUP_LOG" 2>&1
   "$PYTHON" "$REPO/scripts/glm52_decode/validate_decode_result.py" \
     --result "$WARMUP_RESULT" --server-info "$SERVER_INFO" \
+    --context-build \
     --expected-moe-runner "$MOE_RUNNER_BACKEND" \
     --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
     >"$WARMUP_CHECKED"

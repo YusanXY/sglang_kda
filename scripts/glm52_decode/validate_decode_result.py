@@ -34,7 +34,9 @@ def _finite(row: dict, key: str, *, positive: bool = True) -> float:
     return value
 
 
-def _validate_output_vectors(row: dict) -> tuple[str, list[str]]:
+def _validate_output_vectors(
+    row: dict, expected_output_len: int = EXPECTED_OUTPUT_LEN
+) -> tuple[str, list[str]]:
     input_hash = row.get("input_ids_sha256")
     if not isinstance(input_hash, str) or len(input_hash) != 64:
         raise ValueError("missing input token SHA256")
@@ -47,7 +49,7 @@ def _validate_output_vectors(row: dict) -> tuple[str, list[str]]:
     for index, (token_ids, digest) in enumerate(zip(vectors, hashes)):
         if (
             not isinstance(token_ids, list)
-            or len(token_ids) != EXPECTED_OUTPUT_LEN
+            or len(token_ids) != expected_output_len
             or any(not isinstance(token_id, int) for token_id in token_ids)
         ):
             raise ValueError(f"invalid output token vector for request {index}")
@@ -140,6 +142,7 @@ def validate(
     expected_moe_runner: str = "auto",
     require_cached_context: bool = False,
     expected_shared_expert_parallelism: str = "tp8",
+    context_build: bool = False,
 ) -> dict:
     row = _read_single_result(result_path)
     server = json.loads(server_info_path.read_text(encoding="utf-8"))
@@ -151,15 +154,17 @@ def validate(
             f"{expected_shared_expert_parallelism!r}, got {runtime!r}"
         )
 
+    expected_output_len = 1 if context_build else EXPECTED_OUTPUT_LEN
+    expected_decode_tokens = 0 if context_build else EXPECTED_DECODE_TOKENS
     expected_row = {
         "batch_size": EXPECTED_BATCH_SIZE,
         "input_len": EXPECTED_INPUT_LEN,
         "input_len_min": EXPECTED_INPUT_LEN,
         "input_len_max": EXPECTED_INPUT_LEN,
         "input_tokens_total": EXPECTED_BATCH_SIZE * EXPECTED_INPUT_LEN,
-        "output_len": EXPECTED_OUTPUT_LEN,
+        "output_len": expected_output_len,
         "stream_interval": EXPECTED_STREAM_INTERVAL,
-        "decode_tokens": EXPECTED_DECODE_TOKENS,
+        "decode_tokens": expected_decode_tokens,
         "completed_requests": EXPECTED_BATCH_SIZE,
         "max_retractions": 0,
         "dp_rank_counts": EXPECTED_DP_RANK_COUNTS,
@@ -186,24 +191,31 @@ def validate(
     first_ttft = _finite(row, "first_ttft")
     last_ttft = _finite(row, "last_ttft")
     latency = _finite(row, "latency")
-    decode_duration = _finite(row, "decode_duration")
-    decode_throughput = _finite(row, "decode_throughput")
     if not first_ttft <= last_ttft <= latency:
         raise ValueError("invalid first-token/finish timing order")
     server_start = _finite(row, "server_first_token_ts_min")
     server_end = _finite(row, "server_finished_ts_max")
+    decode_duration = _finite(row, "decode_duration", positive=not context_build)
+    decode_throughput = _finite(row, "decode_throughput", positive=not context_build)
     if not math.isclose(decode_duration, server_end - server_start, abs_tol=2e-4):
         raise ValueError("decode duration does not match server timestamps")
-    if not math.isclose(
+    if context_build:
+        if decode_throughput != 0:
+            raise ValueError(
+                f"context-build decode throughput must be zero, got {decode_throughput}"
+            )
+    elif not math.isclose(
         decode_throughput, EXPECTED_DECODE_TOKENS / decode_duration, abs_tol=0.02
     ):
         raise ValueError("decode throughput numerator or duration is inconsistent")
-    input_hash, hashes = _validate_output_vectors(row)
+    input_hash, hashes = _validate_output_vectors(row, expected_output_len)
     return {
         "status": "PASS",
         "result": str(result_path),
         "decode_throughput": decode_throughput,
-        "steady_decode_throughput": _finite(row, "steady_decode_throughput"),
+        "steady_decode_throughput": _finite(
+            row, "steady_decode_throughput", positive=not context_build
+        ),
         "decode_duration": decode_duration,
         "input_ids_sha256": input_hash,
         "output_token_ids_sha256": hashes,
@@ -220,6 +232,11 @@ def main() -> None:
     )
     parser.add_argument("--require-cached-context", action="store_true")
     parser.add_argument(
+        "--context-build",
+        action="store_true",
+        help="Validate the untimed Req64/100K prefix build with output_len=1.",
+    )
+    parser.add_argument(
         "--expected-shared-expert-parallelism",
         choices=("tp1", "tp8"),
         default="tp8",
@@ -235,6 +252,7 @@ def main() -> None:
                 expected_shared_expert_parallelism=(
                     args.expected_shared_expert_parallelism
                 ),
+                context_build=args.context_build,
             ),
             sort_keys=True,
         )

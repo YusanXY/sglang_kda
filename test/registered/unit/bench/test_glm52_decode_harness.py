@@ -59,8 +59,8 @@ def _server_info():
     }
 
 
-def _result(cached_tokens=99_999):
-    vectors = [[index] * 1000 for index in range(64)]
+def _result(cached_tokens=99_999, output_len=1_000):
+    vectors = [[index] * output_len for index in range(64)]
     hashes = [
         hashlib.sha256(
             json.dumps(ids, separators=(",", ":")).encode("utf-8")
@@ -73,17 +73,17 @@ def _result(cached_tokens=99_999):
         "input_len_min": 100_000,
         "input_len_max": 100_000,
         "input_tokens_total": 6_400_000,
-        "output_len": 1_000,
+        "output_len": output_len,
         "stream_interval": 64,
         "latency": 110.0,
         "first_ttft": 10.0,
         "last_ttft": 10.5,
         "server_first_token_ts_min": 1000.0,
-        "server_finished_ts_max": 1100.0,
-        "decode_duration": 100.0,
-        "decode_tokens": 63_936,
-        "decode_throughput": 639.36,
-        "steady_decode_throughput": 640.0,
+        "server_finished_ts_max": 1000.5 if output_len == 1 else 1100.0,
+        "decode_duration": 0.5 if output_len == 1 else 100.0,
+        "decode_tokens": 0 if output_len == 1 else 63_936,
+        "decode_throughput": 0.0 if output_len == 1 else 639.36,
+        "steady_decode_throughput": 0.0 if output_len == 1 else 640.0,
         "completed_requests": 64,
         "max_retractions": 0,
         "dp_rank_counts": [8] * 8,
@@ -108,3 +108,19 @@ def test_decode_replay_requires_full_cached_context(tmp_path):
     result_path.write_text(json.dumps(_result(99_998)) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="99,999 cached prompt tokens"):
         validate(result_path, info_path, require_cached_context=True)
+
+
+def test_context_build_requires_one_output_token(tmp_path):
+    result_path = tmp_path / "context.jsonl"
+    info_path = tmp_path / "server_info.json"
+    info_path.write_text(json.dumps(_server_info()), encoding="utf-8")
+    result_path.write_text(
+        json.dumps(_result(cached_tokens=0, output_len=1)) + "\n",
+        encoding="utf-8",
+    )
+
+    checked = validate(result_path, info_path, context_build=True)
+    assert checked["decode_throughput"] == 0.0
+
+    with pytest.raises(ValueError, match="output_len"):
+        validate(result_path, info_path)
