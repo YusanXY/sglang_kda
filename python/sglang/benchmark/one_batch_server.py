@@ -829,6 +829,7 @@ def run_one_case(
     fixed_prompt_file: str = "",
     apply_chat_template: bool = False,
     save_output_token_ids: bool = False,
+    seed: int = BenchArgs.seed,
 ):
     if profile_decode_after_first_token:
         if not profile:
@@ -881,7 +882,7 @@ def run_one_case(
             dataset_path=dataset_path,
             tokenize_prompt=dataset_name not in ("mmmu", "generated-shared-prefix"),
             backend=backend,
-            seed=BenchArgs.seed,
+            seed=seed,
             gsp_num_groups=actual_gsp_groups,
             gsp_prompts_per_group=(batch_size + actual_gsp_groups - 1)
             // actual_gsp_groups,
@@ -1707,6 +1708,7 @@ def run_benchmark_internal(
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
                 fixed_prompt_file=bench_args.fixed_prompt_file,
                 apply_chat_template=bench_args.apply_chat_template,
+                seed=bench_args.seed,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1767,6 +1769,7 @@ def run_benchmark_internal(
                         fixed_prompt_file=bench_args.fixed_prompt_file,
                         apply_chat_template=bench_args.apply_chat_template,
                         save_output_token_ids=bench_args.save_output_token_ids,
+                        seed=bench_args.seed,
                         **gsp_kwargs,
                     )
                 )
@@ -1834,6 +1837,7 @@ def run_benchmark_internal(
                             lora_name=bench_args.lora_name,
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                            seed=bench_args.seed,
                             **gsp_kwargs,
                         )
                     )
