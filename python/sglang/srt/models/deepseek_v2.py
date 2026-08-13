@@ -2827,6 +2827,24 @@ class DeepseekV2Model(nn.Module):
                         i
                     ),
                 )
+                if (
+                    envs.SGLANG_DEBUG_SYNC_MODEL_LAYERS.get()
+                    and forward_batch.forward_mode.is_extend()
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    try:
+                        torch.cuda.synchronize(hidden_states.device)
+                    except Exception:
+                        logger.exception(
+                            "CUDA failure after decoder layer %s; mode=%s "
+                            "hidden_shape=%s device=%s current_device=%s",
+                            i,
+                            forward_batch.forward_mode,
+                            tuple(hidden_states.shape),
+                            hidden_states.device,
+                            torch.cuda.current_device(),
+                        )
+                        raise
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(
