@@ -158,6 +158,32 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> DeepGemmRunnerOutput:
+        # Under DP attention, ranks without local requests still execute an idle
+        # model forward to stay collective-safe.  Standard dispatch represents
+        # that semantic empty batch with a padded masked-GEMM buffer, so checking
+        # hidden_states.numel() is insufficient: expected_m is the authoritative
+        # number of rows.  DeepGEMM rejects expected_m == 0, while the combine
+        # path only needs a correctly shaped empty output for this case.
+        is_empty = (
+            runner_input.expected_m == 0
+            if runner_input.use_masked_gemm
+            else runner_input.hidden_states.shape[0] == 0
+        )
+        if is_empty:
+            output_width = quant_info.w2_weight.shape[1]
+            if runner_input.use_masked_gemm:
+                output_shape = (
+                    *runner_input.hidden_states.shape[:-1],
+                    output_width,
+                )
+            else:
+                output_shape = (0, output_width)
+            return DeepGemmRunnerOutput(
+                hidden_states=runner_input.hidden_states.new_empty(
+                    output_shape, dtype=torch.bfloat16
+                )
+            )
+
         weight_dtype = quant_info.w13_weight.dtype
         if not runner_input.use_masked_gemm:
             if weight_dtype == torch.bfloat16:
