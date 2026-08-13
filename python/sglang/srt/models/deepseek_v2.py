@@ -842,7 +842,16 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_mori()
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
-                or get_moe_a2a_backend().is_megamoe()
+                # Requesting MegaMoE is not sufficient: the installed SM100
+                # fused kernel only binds after FP4 expert weights are built.
+                # FP8 GLM-5.2 falls through to StandardDispatcher, where a
+                # TP1 shared expert would redundantly run the global DP-gathered
+                # tokens on every rank. Keep that fallback TP-sharded and fold
+                # it into the existing post-expert all-reduce.
+                or (
+                    get_moe_a2a_backend().is_megamoe()
+                    and getattr(quant_config, "is_fp4_experts", False)
+                )
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
                 or (

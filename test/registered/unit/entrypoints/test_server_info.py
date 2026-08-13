@@ -324,6 +324,7 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         runtime = info["glm52_decode_runtime_config"]
         self.assertFalse(runtime["mega_moe_kernel_checkpoint_eligible"])
         self.assertEqual(runtime["effective_fp8_routed_moe_runner"], "triton")
+        self.assertEqual(runtime["shared_expert_parallelism"], "tp8")
 
     def test_glm52_explicit_deep_gemm_runner_is_reported(self):
         args = ServerArgs(

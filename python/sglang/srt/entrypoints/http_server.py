@@ -805,6 +805,20 @@ async def server_info():
                 else server_args.moe_runner_backend
             )
         ),
+        "shared_expert_parallelism": (
+            "tp1"
+            if envs.SGLANG_SHARED_EXPERT_TP1.get()
+            or (
+                server_args.moe_a2a_backend == "megamoe"
+                and quantization_config.get("is_fp4_experts", False)
+            )
+            else (
+                f"tp{server_args.tp_size}"
+                if server_args.moe_a2a_backend == "megamoe"
+                and quantization_config.get("quant_method") == "fp8"
+                else "backend_default"
+            )
+        ),
     }
 
     # server_args.model_config is not serializable but should be excluded by asdict.

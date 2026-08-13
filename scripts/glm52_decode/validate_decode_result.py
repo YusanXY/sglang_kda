@@ -139,10 +139,17 @@ def validate(
     server_info_path: Path,
     expected_moe_runner: str = "auto",
     require_cached_context: bool = False,
+    expected_shared_expert_parallelism: str = "tp8",
 ) -> dict:
     row = _read_single_result(result_path)
     server = json.loads(server_info_path.read_text(encoding="utf-8"))
     _validate_server(server, expected_moe_runner)
+    runtime = server["glm52_decode_runtime_config"]
+    if runtime.get("shared_expert_parallelism") != expected_shared_expert_parallelism:
+        raise ValueError(
+            "shared expert parallelism mismatch: expected "
+            f"{expected_shared_expert_parallelism!r}, got {runtime!r}"
+        )
 
     expected_row = {
         "batch_size": EXPECTED_BATCH_SIZE,
@@ -212,6 +219,11 @@ def main() -> None:
         "--expected-moe-runner", choices=("auto", "deep_gemm"), default="auto"
     )
     parser.add_argument("--require-cached-context", action="store_true")
+    parser.add_argument(
+        "--expected-shared-expert-parallelism",
+        choices=("tp1", "tp8"),
+        default="tp8",
+    )
     args = parser.parse_args()
     print(
         json.dumps(
@@ -220,6 +232,9 @@ def main() -> None:
                 args.server_info,
                 args.expected_moe_runner,
                 require_cached_context=args.require_cached_context,
+                expected_shared_expert_parallelism=(
+                    args.expected_shared_expert_parallelism
+                ),
             ),
             sort_keys=True,
         )

@@ -11,6 +11,7 @@ PYTHON=${PYTHON:-$RUNTIME/venv/bin/python}
 RUNS=${RUNS:-5}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
 REUSE_PREFIX_CACHE=${REUSE_PREFIX_CACHE:-0}
+EXPECTED_SHARED_EXPERT_PARALLELISM=${EXPECTED_SHARED_EXPERT_PARALLELISM:-tp8}
 
 source "$RUNTIME/env.sh"
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
@@ -23,6 +24,10 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 [[ "$REUSE_PREFIX_CACHE" == 0 || "$REUSE_PREFIX_CACHE" == 1 ]] || {
   echo "REUSE_PREFIX_CACHE must be 0 or 1" >&2
+  exit 2
+}
+[[ "$EXPECTED_SHARED_EXPERT_PARALLELISM" == tp1 || "$EXPECTED_SHARED_EXPERT_PARALLELISM" == tp8 ]] || {
+  echo "EXPECTED_SHARED_EXPERT_PARALLELISM must be tp1 or tp8" >&2
   exit 2
 }
 for path in \
@@ -67,7 +72,9 @@ if [[ "$REUSE_PREFIX_CACHE" == 0 ]]; then
     --result-filename "$WARMUP_RESULT" >"$WARMUP_LOG" 2>&1
   "$PYTHON" "$REPO/scripts/glm52_decode/validate_decode_result.py" \
     --result "$WARMUP_RESULT" --server-info "$SERVER_INFO" \
-    --expected-moe-runner "$MOE_RUNNER_BACKEND" >"$WARMUP_CHECKED"
+    --expected-moe-runner "$MOE_RUNNER_BACKEND" \
+    --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
+    >"$WARMUP_CHECKED"
 else
   echo "Reusing live, externally validated Req64 100K prefix cache" >"$WARMUP_LOG"
 fi
@@ -94,13 +101,15 @@ for run in $(seq 1 "$RUNS"); do
   "$PYTHON" "$REPO/scripts/glm52_decode/validate_decode_result.py" \
     --result "$result" --server-info "$SERVER_INFO" \
     --expected-moe-runner "$MOE_RUNNER_BACKEND" \
+    --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
     --require-cached-context >"$checked"
   result_args+=(--result "$result")
 done
 
 "$PYTHON" "$REPO/scripts/glm52_decode/summarize_decode_results.py" \
   "${result_args[@]}" --server-info "$SERVER_INFO" --output-dir "$RUN_DIR" \
-  --expected-moe-runner "$MOE_RUNNER_BACKEND"
+  --expected-moe-runner "$MOE_RUNNER_BACKEND" \
+  --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM"
 warmup_artifacts=("$WARMUP_LOG")
 if [[ "$REUSE_PREFIX_CACHE" == 0 ]]; then
   warmup_artifacts+=("$WARMUP_RESULT" "$WARMUP_CHECKED")

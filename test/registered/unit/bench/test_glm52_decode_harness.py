@@ -54,6 +54,7 @@ def _server_info():
         "glm52_decode_runtime_config": {
             "mega_moe_kernel_checkpoint_eligible": False,
             "effective_fp8_routed_moe_runner": "triton",
+            "shared_expert_parallelism": "tp8",
         },
     }
 
@@ -107,4 +108,3 @@ def test_decode_replay_requires_full_cached_context(tmp_path):
     result_path.write_text(json.dumps(_result(99_998)) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="99,999 cached prompt tokens"):
         validate(result_path, info_path, require_cached_context=True)
-

@@ -31,6 +31,9 @@ def main() -> None:
     parser.add_argument(
         "--expected-moe-runner", choices=("auto", "deep_gemm"), default="auto"
     )
+    parser.add_argument(
+        "--expected-shared-expert-parallelism", choices=("tp1", "tp8"), default="tp8"
+    )
     args = parser.parse_args()
     samples = [
         validate(
@@ -38,6 +41,9 @@ def main() -> None:
             args.server_info,
             args.expected_moe_runner,
             require_cached_context=True,
+            expected_shared_expert_parallelism=(
+                args.expected_shared_expert_parallelism
+            ),
         )
         for path in args.result
     ]

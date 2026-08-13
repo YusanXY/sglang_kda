@@ -9,9 +9,14 @@ PORT=${PORT:-30000}
 MOE_RUNNER_BACKEND=${MOE_RUNNER_BACKEND:-auto}
 GLM52_TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$ROOT/.runtime/glm52_decode_cache}
 GLM52_DEEP_GEMM_CACHE_DIR=${SGLANG_DG_CACHE_DIR:-$ROOT/.runtime/glm52_deep_gemm_cache}
+GLM52_SHARED_EXPERT_TP1=${GLM52_SHARED_EXPERT_TP1:-0}
 
 [[ "$MOE_RUNNER_BACKEND" == auto || "$MOE_RUNNER_BACKEND" == deep_gemm ]] || {
   echo "MOE_RUNNER_BACKEND must be auto or deep_gemm" >&2
+  exit 2
+}
+[[ "$GLM52_SHARED_EXPERT_TP1" == 0 || "$GLM52_SHARED_EXPERT_TP1" == 1 ]] || {
+  echo "GLM52_SHARED_EXPERT_TP1 must be 0 or 1" >&2
   exit 2
 }
 [[ -d "$REPO/python/sglang" ]] || { echo "missing repo: $REPO" >&2; exit 2; }
@@ -30,6 +35,7 @@ export SGLANG_DG_CACHE_DIR="$GLM52_DEEP_GEMM_CACHE_DIR"
 # first real request. On-demand JIT is symmetric across ranks and the full
 # target-shape warmup below the server boundary remains excluded from samples.
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
+export SGLANG_SHARED_EXPERT_TP1="$GLM52_SHARED_EXPERT_TP1"
 mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 
