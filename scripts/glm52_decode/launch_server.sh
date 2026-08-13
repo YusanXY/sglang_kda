@@ -24,10 +24,12 @@ export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
 # writable cache and baseline/candidates reuse the same compiled kernels.
 export TRITON_CACHE_DIR="$GLM52_TRITON_CACHE_DIR"
 export SGLANG_DG_CACHE_DIR="$GLM52_DEEP_GEMM_CACHE_DIR"
-# Decode only needs the complete 1..1024 M range. Fast warmup covers that
-# range exactly and samples larger prefill Ms instead of replaying all 16K
-# shapes on every server restart.
-export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+# Never run the rank-0-only all-M DeepGEMM sweep from inside a distributed
+# model forward. With DP attention, peer ranks can already be waiting in the
+# next collective while rank 0 synchronizes the sweep, which deadlocks the
+# first real request. On-demand JIT is symmetric across ranks and the full
+# target-shape warmup below the server boundary remains excluded from samples.
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 mkdir -p "$TRITON_CACHE_DIR" "$SGLANG_DG_CACHE_DIR"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 

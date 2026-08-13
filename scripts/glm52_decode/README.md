@@ -33,6 +33,14 @@ after rank 0 has entered a model-parallel collective; PyTorch's 600-second
 default can therefore abort a healthy cold start. This setting is identical
 for baseline and optimized runs and does not change measured steady decode.
 
+The launcher also sets `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`. The upstream all-M
+precompile hook runs only on rank 0 from inside a model forward; under DP
+attention, peer ranks can enter the next collective while rank 0 synchronizes
+that sweep and deadlock the first request. Actual shapes are compiled
+symmetrically on demand, and a complete Req64/100K/1K request is still run and
+validated before measured samples. This is a common harness fix, not a
+throughput optimization.
+
 ```bash
 MOE_RUNNER_BACKEND=auto scripts/glm52_decode/launch_server.sh
 ```
