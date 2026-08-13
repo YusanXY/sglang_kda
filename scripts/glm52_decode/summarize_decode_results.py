@@ -33,7 +33,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     samples = [
-        validate(path, args.server_info, args.expected_moe_runner)
+        validate(
+            path,
+            args.server_info,
+            args.expected_moe_runner,
+            require_cached_context=True,
+        )
         for path in args.result
     ]
     summary = {
@@ -44,6 +49,7 @@ def main() -> None:
             "output_tokens_per_request": 1_000,
             "decode_tokens": 63_936,
             "decode_boundary": "earliest server first token to latest server finish",
+            "context_residency": "at least 99,999 cached prompt tokens per request",
         },
         "decode_throughput": _stats([x["decode_throughput"] for x in samples]),
         "steady_decode_throughput": _stats(

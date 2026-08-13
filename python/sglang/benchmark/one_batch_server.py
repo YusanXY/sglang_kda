@@ -150,6 +150,7 @@ class BenchArgs:
     lora_zipf_alpha: float = 1.1
     enable_multi_batch: bool = False
     request_timeout: float = DEFAULT_TIMEOUT
+    preserve_prefix_cache: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -194,6 +195,15 @@ class BenchArgs:
             help=(
                 "HTTP request timeout in seconds. Increase this for the first "
                 "cold-compilation request of very large models."
+            ),
+        )
+        parser.add_argument(
+            "--preserve-prefix-cache",
+            action="store_true",
+            help=(
+                "Do not flush the server prefix cache before the measured case. "
+                "This is intended for decode-only replay after an identical "
+                "long-context request has populated and validated the KV cache."
             ),
         )
         parser.add_argument("--show-report", action="store_true")
@@ -475,6 +485,7 @@ class BenchOneCaseResult(BaseModel):
     output_token_ids: Optional[List[List[int]]]
     dp_ranks: Optional[List[int]]
     dp_rank_counts: Optional[List[int]]
+    cached_tokens_per_request: Optional[List[int]]
     overall_throughput: float
     last_ttft: float
     last_gen_throughput: float
@@ -527,6 +538,7 @@ class BenchOneCaseResult(BaseModel):
                 "output_token_ids": self.output_token_ids,
                 "dp_ranks": self.dp_ranks,
                 "dp_rank_counts": self.dp_rank_counts,
+                "cached_tokens_per_request": self.cached_tokens_per_request,
                 "overall_throughput": round(self.overall_throughput, 2),
                 "last_ttft": round(self.last_ttft, 4),
                 "last_gen_throughput": round(self.last_gen_throughput, 2),
@@ -834,6 +846,7 @@ def run_one_case(
     apply_chat_template: bool = False,
     save_output_token_ids: bool = False,
     seed: int = BenchArgs.seed,
+    preserve_prefix_cache: bool = False,
 ):
     if profile_decode_after_first_token:
         if not profile:
@@ -854,11 +867,12 @@ def run_one_case(
                 "--profile-decode-after-first-token cannot be combined with "
                 "--profile-start-step"
             )
-    if backend == "vllm":
-        # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
-        _flush_cache_with_retry(url, "/reset_prefix_cache")
-    else:
-        _flush_cache_with_retry(url, "/flush_cache")
+    if not preserve_prefix_cache:
+        if backend == "vllm":
+            # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
+            _flush_cache_with_retry(url, "/reset_prefix_cache")
+        else:
+            _flush_cache_with_retry(url, "/flush_cache")
 
     if fixed_prompt_file:
         tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
@@ -1085,6 +1099,7 @@ def run_one_case(
         persisted_output_token_ids = None
         persisted_dp_ranks = None
         dp_rank_counts = None
+        persisted_cached_tokens = None
         if backend == "vllm":
             # Parse OpenAI-compatible streaming format from vLLM
             first_token_indices = set()
@@ -1112,6 +1127,7 @@ def run_one_case(
             server_finished_timestamps = {}
             latest_completion_tokens = {}
             dp_rank_by_index = {}
+            cached_tokens_by_index = {}
             output_token_ids_by_index = [[] for _ in range(batch_size)]
             for chunk in response.iter_lines(decode_unicode=False):
                 chunk = chunk.decode("utf-8")
@@ -1156,6 +1172,28 @@ def run_one_case(
                                 f"{previous_dp_rank} -> {dp_rank}"
                             )
                         dp_rank_by_index[index] = dp_rank
+                    cached_tokens = data["meta_info"].get("cached_tokens")
+                    if cached_tokens is not None:
+                        if (
+                            isinstance(cached_tokens, bool)
+                            or not isinstance(cached_tokens, int)
+                            or cached_tokens < 0
+                        ):
+                            raise RuntimeError(
+                                f"request {index} returned invalid "
+                                f"cached_tokens={cached_tokens!r}"
+                            )
+                        previous_cached_tokens = cached_tokens_by_index.get(index)
+                        if (
+                            previous_cached_tokens is not None
+                            and previous_cached_tokens != cached_tokens
+                        ):
+                            raise RuntimeError(
+                                f"request {index} changed cached_tokens during "
+                                f"streaming: {previous_cached_tokens} -> "
+                                f"{cached_tokens}"
+                            )
+                        cached_tokens_by_index[index] = cached_tokens
                     completion_tokens = data["meta_info"]["completion_tokens"]
                     previous_completion_tokens = latest_completion_tokens.get(index, 0)
                     is_finished = data["meta_info"]["finish_reason"] is not None
@@ -1310,6 +1348,18 @@ def run_one_case(
                 dp_rank_counts = [0] * (max(persisted_dp_ranks) + 1)
                 for dp_rank in persisted_dp_ranks:
                     dp_rank_counts[dp_rank] += 1
+            if cached_tokens_by_index:
+                if len(cached_tokens_by_index) != batch_size:
+                    missing = sorted(
+                        set(range(batch_size)) - cached_tokens_by_index.keys()
+                    )
+                    raise RuntimeError(
+                        "cached-token metadata was only returned for part of "
+                        f"the batch; missing request indices: {missing}"
+                    )
+                persisted_cached_tokens = [
+                    cached_tokens_by_index[i] for i in range(batch_size)
+                ]
             server_first_token_spread = (
                 max(server_first_token_timestamps.values())
                 - min(server_first_token_timestamps.values())
@@ -1460,6 +1510,7 @@ def run_one_case(
         output_token_ids=persisted_output_token_ids,
         dp_ranks=persisted_dp_ranks,
         dp_rank_counts=dp_rank_counts,
+        cached_tokens_per_request=persisted_cached_tokens,
         overall_throughput=overall_throughput,
         last_ttft=last_ttft,
         last_gen_throughput=last_gen_throughput,
@@ -1807,6 +1858,7 @@ def run_benchmark_internal(
                         apply_chat_template=bench_args.apply_chat_template,
                         save_output_token_ids=bench_args.save_output_token_ids,
                         seed=bench_args.seed,
+                        preserve_prefix_cache=bench_args.preserve_prefix_cache,
                         **gsp_kwargs,
                     )
                 )
@@ -1875,6 +1927,7 @@ def run_benchmark_internal(
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
                             seed=bench_args.seed,
+                            preserve_prefix_cache=bench_args.preserve_prefix_cache,
                             **gsp_kwargs,
                         )
                     )

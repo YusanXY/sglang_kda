@@ -135,7 +135,10 @@ def _validate_server(server: dict, expected_moe_runner: str) -> None:
 
 
 def validate(
-    result_path: Path, server_info_path: Path, expected_moe_runner: str = "auto"
+    result_path: Path,
+    server_info_path: Path,
+    expected_moe_runner: str = "auto",
+    require_cached_context: bool = False,
 ) -> dict:
     row = _read_single_result(result_path)
     server = json.loads(server_info_path.read_text(encoding="utf-8"))
@@ -157,6 +160,21 @@ def validate(
     for key, wanted in expected_row.items():
         if row.get(key) != wanted:
             raise ValueError(f"{key}: expected {wanted!r}, got {row.get(key)!r}")
+
+    cached_tokens = row.get("cached_tokens_per_request")
+    if require_cached_context:
+        if (
+            not isinstance(cached_tokens, list)
+            or len(cached_tokens) != EXPECTED_BATCH_SIZE
+            or any(
+                not isinstance(value, int) or value < EXPECTED_INPUT_LEN - 1
+                for value in cached_tokens
+            )
+        ):
+            raise ValueError(
+                "decode replay requires at least 99,999 cached prompt tokens "
+                f"for every request, got {cached_tokens!r}"
+            )
 
     first_ttft = _finite(row, "first_ttft")
     last_ttft = _finite(row, "last_ttft")
@@ -182,6 +200,7 @@ def validate(
         "decode_duration": decode_duration,
         "input_ids_sha256": input_hash,
         "output_token_ids_sha256": hashes,
+        "cached_tokens_per_request": cached_tokens,
     }
 
 
@@ -192,10 +211,16 @@ def main() -> None:
     parser.add_argument(
         "--expected-moe-runner", choices=("auto", "deep_gemm"), default="auto"
     )
+    parser.add_argument("--require-cached-context", action="store_true")
     args = parser.parse_args()
     print(
         json.dumps(
-            validate(args.result, args.server_info, args.expected_moe_runner),
+            validate(
+                args.result,
+                args.server_info,
+                args.expected_moe_runner,
+                require_cached_context=args.require_cached_context,
+            ),
             sort_keys=True,
         )
     )

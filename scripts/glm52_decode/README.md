@@ -15,7 +15,12 @@ fail instead of falling back into the performance table.
 `run_decode_n5.sh` always executes one additional full target-shape batch before
 the five measured samples. This warmup is validated but excluded from the
 summary so lazy DeepGEMM compilation and first-use allocator work cannot pollute
-the throughput distribution.
+the throughput distribution. Measured samples use the identical seed and
+preserve the live prefix cache; every result must report at least 99,999 cached
+tokens for every 100K-token request. Thus the timed forward is long-context
+decode replay rather than another 6.4M-token prefill. Set
+`REUSE_PREFIX_CACHE=1` only when a separately validated warmup populated those
+exact prompts on the same live server.
 
 On the current B300 runtime, `--moe-a2a-backend megamoe` is a requested server
 configuration rather than proof that routed experts execute the MegaMoE kernel.
