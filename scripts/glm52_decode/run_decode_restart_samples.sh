@@ -7,10 +7,16 @@ SAMPLE_ROOT=${SAMPLE_ROOT:-$ROOT/.runtime/glm52_decode_restart_samples}
 SAMPLES=${SAMPLES:-5}
 GLM52_CUSTOM_ALL_REDUCE_IMPL=${GLM52_CUSTOM_ALL_REDUCE_IMPL:-legacy}
 GLM52_FP8_GEMM_BACKEND=${GLM52_FP8_GEMM_BACKEND:-deep_gemm}
+GLM52_GRAPH_V2_MAX_PUSH_BLOCKS=${GLM52_GRAPH_V2_MAX_PUSH_BLOCKS:-auto}
 PORT=${PORT:-30000}
+NCCL_PORT_BASE=${NCCL_PORT_BASE:-45100}
 SERVER_WAIT_SECONDS=${SERVER_WAIT_SECONDS:-420}
 
 [[ "$SAMPLES" =~ ^[1-9][0-9]*$ ]] || { echo "SAMPLES must be positive" >&2; exit 2; }
+[[ "$NCCL_PORT_BASE" =~ ^[1-9][0-9]*$ && "$NCCL_PORT_BASE" -le 65000 ]] || {
+  echo "NCCL_PORT_BASE must be an integer in [1,65000]" >&2
+  exit 2
+}
 mkdir -p "$SAMPLE_ROOT"
 
 server_pid=""
@@ -46,9 +52,11 @@ for sample in $(seq 1 "$SAMPLES"); do
     GLM52_LOCAL_DP_CONTROL=0 \
     GLM52_CUSTOM_ALL_REDUCE_IMPL="$GLM52_CUSTOM_ALL_REDUCE_IMPL" \
     GLM52_FP8_GEMM_BACKEND="$GLM52_FP8_GEMM_BACKEND" \
+    GLM52_GRAPH_V2_MAX_PUSH_BLOCKS="$GLM52_GRAPH_V2_MAX_PUSH_BLOCKS" \
     GLM52_FLASHINFER_DIRECT_OUTPUT=1 \
     GLM52_FLASHINFER_FUSED_ROUTING_PACK=1 \
     PORT="$PORT" \
+    NCCL_PORT="$((NCCL_PORT_BASE + sample - 1))" \
     bash "$REPO/scripts/glm52_decode/launch_server.sh" \
     >"$server_log" 2>&1 < /dev/null &
   server_pid=$!
@@ -75,6 +83,7 @@ for sample in $(seq 1 "$SAMPLES"); do
     EXPECTED_FLASHINFER_FUSED_ROUTING_PACK=1 \
     EXPECTED_CUSTOM_ALL_REDUCE="$GLM52_CUSTOM_ALL_REDUCE_IMPL" \
     EXPECTED_FP8_GEMM_BACKEND="$GLM52_FP8_GEMM_BACKEND" \
+    EXPECTED_GRAPH_V2_MAX_PUSH_BLOCKS="$GLM52_GRAPH_V2_MAX_PUSH_BLOCKS" \
     bash "$REPO/scripts/glm52_decode/run_decode_n5.sh"
   cleanup_server
 done

@@ -730,6 +730,10 @@ class Envs:
     # CUDA Graphs with V2. Graph replay contains the selected V2 kernels, so
     # this adds no Python dispatch to the steady decode loop.
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2_GRAPH_ONLY = EnvBool(False)
+    # Optional CTA cap for V2 push kernels captured by the graph-only hybrid.
+    # Keep unset for the generic device-wide default; GLM-5.2 Req64/DP8 uses
+    # 96 after an eight-GPU sweep at the exact 8x6144 BF16 decode shape.
+    SGLANG_OPT_CUSTOM_ALL_REDUCE_V2_GRAPH_MAX_PUSH_BLOCKS = EnvInt(None)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)

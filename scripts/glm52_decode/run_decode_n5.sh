@@ -16,6 +16,7 @@ EXPECTED_FLASHINFER_DIRECT_OUTPUT=${EXPECTED_FLASHINFER_DIRECT_OUTPUT:-0}
 EXPECTED_FLASHINFER_FUSED_ROUTING_PACK=${EXPECTED_FLASHINFER_FUSED_ROUTING_PACK:-0}
 EXPECTED_CUSTOM_ALL_REDUCE=${EXPECTED_CUSTOM_ALL_REDUCE:-legacy}
 EXPECTED_FP8_GEMM_BACKEND=${EXPECTED_FP8_GEMM_BACKEND:-deep_gemm}
+EXPECTED_GRAPH_V2_MAX_PUSH_BLOCKS=${EXPECTED_GRAPH_V2_MAX_PUSH_BLOCKS:-auto}
 
 source "$RUNTIME/env.sh"
 export PYTHONPATH="$REPO/python${PYTHONPATH:+:$PYTHONPATH}"
@@ -48,6 +49,10 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 }
 [[ "$EXPECTED_FP8_GEMM_BACKEND" == deep_gemm || "$EXPECTED_FP8_GEMM_BACKEND" == flashinfer_trtllm ]] || {
   echo "EXPECTED_FP8_GEMM_BACKEND must be deep_gemm or flashinfer_trtllm" >&2
+  exit 2
+}
+[[ "$EXPECTED_GRAPH_V2_MAX_PUSH_BLOCKS" == auto || "$EXPECTED_GRAPH_V2_MAX_PUSH_BLOCKS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "EXPECTED_GRAPH_V2_MAX_PUSH_BLOCKS must be auto or a positive integer" >&2
   exit 2
 }
 direct_output_args=()
@@ -105,6 +110,7 @@ if [[ "$REUSE_PREFIX_CACHE" == 0 ]]; then
     --expected-moe-runner "$MOE_RUNNER_BACKEND" \
     --expected-custom-all-reduce "$EXPECTED_CUSTOM_ALL_REDUCE" \
     --expected-fp8-gemm-backend "$EXPECTED_FP8_GEMM_BACKEND" \
+    --expected-graph-v2-max-push-blocks "$EXPECTED_GRAPH_V2_MAX_PUSH_BLOCKS" \
     --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
     "${direct_output_args[@]}" \
     "${fused_routing_pack_args[@]}" \
@@ -138,6 +144,7 @@ for run in $(seq 1 "$RUNS"); do
     --expected-moe-runner "$MOE_RUNNER_BACKEND" \
     --expected-custom-all-reduce "$EXPECTED_CUSTOM_ALL_REDUCE" \
     --expected-fp8-gemm-backend "$EXPECTED_FP8_GEMM_BACKEND" \
+    --expected-graph-v2-max-push-blocks "$EXPECTED_GRAPH_V2_MAX_PUSH_BLOCKS" \
     --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
     "${direct_output_args[@]}" \
     "${fused_routing_pack_args[@]}" \
@@ -150,6 +157,7 @@ done
   --expected-moe-runner "$MOE_RUNNER_BACKEND" \
   --expected-custom-all-reduce "$EXPECTED_CUSTOM_ALL_REDUCE" \
   --expected-fp8-gemm-backend "$EXPECTED_FP8_GEMM_BACKEND" \
+  --expected-graph-v2-max-push-blocks "$EXPECTED_GRAPH_V2_MAX_PUSH_BLOCKS" \
   --expected-shared-expert-parallelism "$EXPECTED_SHARED_EXPERT_PARALLELISM" \
   "${direct_output_args[@]}" \
   "${fused_routing_pack_args[@]}"

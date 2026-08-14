@@ -791,6 +791,9 @@ async def server_info():
                 )
             )
         ),
+        "custom_all_reduce_v2_graph_max_push_blocks": (
+            envs.SGLANG_OPT_CUSTOM_ALL_REDUCE_V2_GRAPH_MAX_PUSH_BLOCKS.get()
+        ),
         "mega_moe_num_max_tokens_per_rank": (
             envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
         ),

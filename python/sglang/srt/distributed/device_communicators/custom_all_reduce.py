@@ -354,7 +354,19 @@ class GraphV2EagerLegacyCustomAllReduce:
         from .custom_all_reduce_v2 import CustomAllReduceV2
 
         self.legacy = CustomAllreduce(group=group, device=device)
-        self.v2 = CustomAllReduceV2(group=group, device=device)
+        max_push_blocks = (
+            envs.SGLANG_OPT_CUSTOM_ALL_REDUCE_V2_GRAPH_MAX_PUSH_BLOCKS.get()
+        )
+        if max_push_blocks is not None and max_push_blocks <= 0:
+            raise ValueError(
+                "SGLANG_OPT_CUSTOM_ALL_REDUCE_V2_GRAPH_MAX_PUSH_BLOCKS must "
+                f"be positive when set, got {max_push_blocks}"
+            )
+        self.v2 = CustomAllReduceV2(
+            group=group,
+            device=device,
+            max_push_blocks=max_push_blocks,
+        )
         self.disabled = self.legacy.disabled or self.v2.disabled
         self.original_disabled = self.disabled
         self._capture_v2 = False

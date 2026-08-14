@@ -47,6 +47,7 @@ def main() -> None:
         choices=("deep_gemm", "flashinfer_trtllm"),
         default="deep_gemm",
     )
+    parser.add_argument("--expected-graph-v2-max-push-blocks", default="auto")
     parser.add_argument(
         "--expected-shared-expert-parallelism",
         choices=("tp1", "tp8"),
@@ -70,6 +71,9 @@ def main() -> None:
             ),
             expected_custom_all_reduce=args.expected_custom_all_reduce,
             expected_fp8_gemm_backend=args.expected_fp8_gemm_backend,
+            expected_graph_v2_max_push_blocks=(
+                args.expected_graph_v2_max_push_blocks
+            ),
         )
         for path in args.result
     ]

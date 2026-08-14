@@ -160,6 +160,7 @@ def validate(
     expected_flashinfer_fused_routing_pack: bool = False,
     expected_custom_all_reduce: str = "legacy",
     expected_fp8_gemm_backend: str = "deep_gemm",
+    expected_graph_v2_max_push_blocks: str = "auto",
 ) -> dict:
     row = _read_single_result(result_path)
     server = json.loads(server_info_path.read_text(encoding="utf-8"))
@@ -170,6 +171,19 @@ def validate(
         expected_fp8_gemm_backend,
     )
     runtime = server["glm52_decode_runtime_config"]
+    expected_push_blocks = (
+        None
+        if expected_graph_v2_max_push_blocks == "auto"
+        else int(expected_graph_v2_max_push_blocks)
+    )
+    if (
+        runtime.get("custom_all_reduce_v2_graph_max_push_blocks")
+        != expected_push_blocks
+    ):
+        raise ValueError(
+            "V2 graph push-CTA cap mismatch: expected "
+            f"{expected_push_blocks!r}, got {runtime!r}"
+        )
     if bool(runtime.get("flashinfer_moe_direct_output", False)) != (
         expected_flashinfer_direct_output
     ):
@@ -289,6 +303,7 @@ def main() -> None:
         choices=("deep_gemm", "flashinfer_trtllm"),
         default="deep_gemm",
     )
+    parser.add_argument("--expected-graph-v2-max-push-blocks", default="auto")
     parser.add_argument("--require-cached-context", action="store_true")
     parser.add_argument(
         "--context-build",
@@ -320,6 +335,9 @@ def main() -> None:
                 ),
                 expected_custom_all_reduce=args.expected_custom_all_reduce,
                 expected_fp8_gemm_backend=args.expected_fp8_gemm_backend,
+                expected_graph_v2_max_push_blocks=(
+                    args.expected_graph_v2_max_push_blocks
+                ),
             ),
             sort_keys=True,
         )
